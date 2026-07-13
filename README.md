@@ -224,7 +224,10 @@ python scripts/prepare_ms_swift_rl.py opsd \
 
 ```bash
 export RL_MANIFEST_SHA256='<copy manifest_sha256 from trusted prepare output>'
+export RISK_PLUGIN_SHA256="$(sha256sum plugins/ms_swift_risk_rewards.py | awk '{print $1}')"
 ```
+
+`RISK_PLUGIN_SHA256` 也应进入可信作业配置；真实启动会按该外部摘要验证单次安全读取的 plugin exact bytes，不能在启动时对一个未知 plugin 现算现信。
 
 ### GRPO：先 dry-run，再训练
 
@@ -236,6 +239,7 @@ python scripts/launch_ms_swift_rl.py outputs/track_a_grpo_bundle \
   --adapter outputs/runs/qwen3-1.7b-track-a/checkpoint-100 \
   --plugin plugins/ms_swift_risk_rewards.py \
   --expected-manifest-sha256 "$RL_MANIFEST_SHA256" \
+  --expected-plugin-sha256 "$RISK_PLUGIN_SHA256" \
   --device 0 --dry-run
 ```
 
@@ -255,7 +259,7 @@ python scripts/launch_ms_swift_rl.py outputs/track_a_opsd_bundle \
 
 该配置遵循 ms-swift 4.3 的 GKD/OPSD 接口：`rlhf_type: gkd`、`lmbda: 1.0`、`teacher_prompt` 特权列、Top-K logits；不设置 `teacher_model`，因此教师是随训练更新的同一模型，不加载第二个模型。因为 `lmbda > 0` 需要 student on-policy rollout，本基线明确启用单卡 colocate vLLM，并使用较低 GPU utilization、sleep level 1、model/optimizer offload；它不再是纯 Transformers 配方。smoke 必须确认 rollout 实际发生，而不只是 trainer 成功初始化。它不是固定教师实验，也没有声称在 H20 上完成训练。
 
-真实启动会重验可信 manifest 摘要与 bundle exact bytes，把数据、配置和经 `O_NOFOLLOW`/`fstat` 验证的 GRPO plugin 写入 0600 私有临时快照，再以 `shell=False` 启动。launcher 在 exec 前以 0700 独占创建 output reservation，并复核目录 identity；空目录失败会安全清理，有训练/审计文件时保留。这个边界只能防启动前的路径替换，无法阻止拥有同一系统账号权限的进程在 trainer 运行期间修改 output。
+真实启动会重验可信 manifest/plugin 摘要与 bundle exact bytes，把数据、配置和经 `O_NOFOLLOW`、读前后 `fstat` 验证的 GRPO plugin 写入 0600 私有临时快照，再以 `shell=False` 启动。launcher 会先绑定 output parent 的目录句柄与 identity，再通过 parent `dir_fd` 以 0700 独占创建 leaf reservation；exec 前同时复核 parent 与 leaf。Windows 没有相同的目录相对创建接口，因此使用 parent/leaf stat 双重路径复验。空目录失败会安全清理，有训练/审计文件时保留。这个边界只能防启动前的路径替换，无法阻止拥有同一系统账号权限的进程在 trainer 运行期间主动修改 output。
 
 建议先把 train 缩到 16～64 条，`max_completion_length` 降到 128，仅验证首个 logging step 和 checkpoint；再逐步恢复默认长度。若 GRPO 4 completions 或 OPSD teacher/student logits 超出显存，先缩 prompt/completion 与样本 batch，不要直接宣称配方失败或效果成立。
 

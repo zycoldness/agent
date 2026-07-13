@@ -63,6 +63,22 @@ class _Bundle:
     split_bytes: dict[str, bytes]
 
 
+@dataclass(frozen=True)
+class _ParentBinding:
+    path: Path
+    identity: os.stat_result
+    descriptor: int | None
+
+
+@dataclass(frozen=True)
+class _OutputReservation:
+    parent: _ParentBinding
+    path: Path
+    leaf_name: str
+    leaf_identity: os.stat_result
+    leaf_descriptor: int | None
+
+
 def _is_int(value: object, minimum: int = 1) -> bool:
     return (
         not isinstance(value, bool)
@@ -112,7 +128,16 @@ def load_rl_config(path: Path) -> dict[str, Any]:
     if not _is_float(document["warmup_ratio"], low=0, high=1, high_open=True):
         raise ValueError("invalid RL config values or types")
     epochs = document["num_train_epochs"]
-    if isinstance(epochs, bool) or not isinstance(epochs, (int, float)) or not math.isfinite(float(epochs)) or epochs <= 0:
+    try:
+        epochs_invalid = (
+            isinstance(epochs, bool)
+            or not isinstance(epochs, (int, float))
+            or not math.isfinite(float(epochs))
+            or epochs <= 0
+        )
+    except (OverflowError, TypeError, ValueError):
+        epochs_invalid = True
+    if epochs_invalid:
         raise ValueError("invalid RL config values or types")
     if rlhf_type == "grpo":
         if document["use_vllm"] is not False or document["ref_adapters"] != "__ADAPTER__":
@@ -304,7 +329,9 @@ def _verify_bundle(bundle_dir: Path, expected_manifest_sha256: str) -> _Bundle:
     return _Bundle(root, manifest, split_bytes)
 
 
-def _read_plugin(path: Path) -> tuple[Path, bytes]:
+def _read_plugin(path: Path, expected_sha256: str | None) -> tuple[Path, bytes]:
+    if not isinstance(expected_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+        raise ValueError("expected trusted plugin digest must be 64 lowercase hex characters")
     if path.is_symlink():
         raise ValueError("external plugin must not be a symbolic link")
     try:
@@ -325,14 +352,31 @@ def _read_plugin(path: Path) -> tuple[Path, bytes]:
             raise ValueError("external plugin identity changed or is unsafe")
         if held.st_size > 1024 * 1024:
             raise ValueError("external plugin exceeds one MiB")
-        with os.fdopen(descriptor, "rb") as handle:
-            descriptor = -1
-            payload = handle.read()
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        held_fingerprint = (
+            held.st_dev, held.st_ino, held.st_mode, held.st_size,
+            held.st_mtime_ns, held.st_ctime_ns,
+        )
+        after_fingerprint = (
+            after.st_dev, after.st_ino, after.st_mode, after.st_size,
+            after.st_mtime_ns, after.st_ctime_ns,
+        )
+        if held_fingerprint != after_fingerprint:
+            raise ValueError("external plugin changed while being read")
         if len(payload) != held.st_size:
             raise ValueError("external plugin changed while being read")
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise ValueError("external plugin does not match the trusted plugin digest")
     return resolved, payload
 
 
@@ -372,6 +416,7 @@ def prepare_rl_launch(
     model: str,
     adapter: str,
     expected_manifest_sha256: str,
+    expected_plugin_sha256: str | None = None,
     plugin: Path | None = None,
     device: str = "0",
 ) -> LaunchPlan:
@@ -379,40 +424,141 @@ def prepare_rl_launch(
     template = load_rl_config(config_path)
     if template["rlhf_type"] == "grpo" and plugin is None:
         raise ValueError("GRPO requires an external reward plugin")
-    plugin_path = _read_plugin(plugin)[0] if plugin is not None and template["rlhf_type"] == "grpo" else None
+    plugin_path = (
+        _read_plugin(plugin, expected_plugin_sha256)[0]
+        if plugin is not None and template["rlhf_type"] == "grpo"
+        else None
+    )
     return _render(bundle, template, output_dir, model=model, adapter=adapter,
                    plugin_path=plugin_path, train=bundle.root / "train.jsonl",
                    dev=bundle.root / "dev.jsonl", device=device)
 
 
-def _reserve_output(output_dir: Path) -> os.stat_result:
-    output_dir.parent.mkdir(parents=True, exist_ok=True)
+def _bind_output_parent(output_dir: Path) -> _ParentBinding:
+    parent = output_dir.absolute().parent
+    parent.mkdir(parents=True, exist_ok=True)
+    if parent.is_symlink():
+        raise ValueError("training output parent must not be a symbolic link")
+    if os.name == "posix":
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(parent, flags)
+        except OSError as error:
+            raise ValueError("cannot safely open training output parent") from error
+        identity = os.fstat(descriptor)
+        try:
+            current = os.stat(parent, follow_symlinks=False)
+            if not stat.S_ISDIR(identity.st_mode) or not os.path.samestat(identity, current):
+                raise ValueError("training output parent identity changed or is unsafe")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return _ParentBinding(parent, identity, descriptor)
+    identity = os.stat(parent, follow_symlinks=False)
+    if not stat.S_ISDIR(identity.st_mode):
+        raise ValueError("training output parent must be a directory")
+    return _ParentBinding(parent, identity, None)
+
+
+def _close_parent(binding: _ParentBinding) -> None:
+    if binding.descriptor is not None:
+        os.close(binding.descriptor)
+
+
+def _require_parent_identity(binding: _ParentBinding) -> None:
     try:
-        output_dir.mkdir(mode=0o700, exist_ok=False)
+        path_stat = os.stat(binding.path, follow_symlinks=False)
+        if binding.descriptor is not None:
+            held_stat = os.fstat(binding.descriptor)
+            matches = os.path.samestat(binding.identity, held_stat) and os.path.samestat(
+                binding.identity, path_stat
+            )
+        else:
+            second_path_stat = os.stat(binding.path, follow_symlinks=False)
+            matches = os.path.samestat(binding.identity, path_stat) and os.path.samestat(
+                binding.identity, second_path_stat
+            )
+    except OSError:
+        matches = False
+    if not matches:
+        raise RuntimeError("training output parent reservation identity changed")
+
+
+def _reserve_output(binding: _ParentBinding, output_dir: Path) -> _OutputReservation:
+    if output_dir.parent != binding.path or output_dir.name in ("", ".", ".."):
+        raise ValueError("training output must be one leaf under the bound parent")
+    _require_parent_identity(binding)
+    try:
+        if binding.descriptor is not None:
+            os.mkdir(output_dir.name, mode=0o700, dir_fd=binding.descriptor)
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            leaf_descriptor = os.open(output_dir.name, flags, dir_fd=binding.descriptor)
+            os.fchmod(leaf_descriptor, 0o700)
+            leaf_identity = os.fstat(leaf_descriptor)
+        else:
+            output_dir.mkdir(mode=0o700, exist_ok=False)
+            leaf_identity = os.stat(output_dir, follow_symlinks=False)
+            leaf_descriptor = None
     except FileExistsError as error:
         raise ValueError("training output directory must not exist") from error
-    identity = os.stat(output_dir, follow_symlinks=False)
-    if os.name == "posix":
-        output_dir.chmod(0o700)
-    return identity
+    _require_parent_identity(binding)
+    if not os.path.samestat(leaf_identity, os.stat(output_dir, follow_symlinks=False)):
+        raise RuntimeError("training output reservation identity changed")
+    return _OutputReservation(binding, output_dir, output_dir.name, leaf_identity, leaf_descriptor)
 
 
-def _require_output_identity(output_dir: Path, identity: os.stat_result) -> None:
+def _require_output_identity(reservation: _OutputReservation) -> None:
+    _require_parent_identity(reservation.parent)
     try:
-        matches = os.path.samestat(identity, os.stat(output_dir, follow_symlinks=False))
+        path_stat = os.stat(reservation.path, follow_symlinks=False)
+        if reservation.parent.descriptor is not None:
+            assert reservation.leaf_descriptor is not None
+            held_fd_stat = os.fstat(reservation.leaf_descriptor)
+            held_path_stat = os.stat(
+                reservation.leaf_name,
+                dir_fd=reservation.parent.descriptor,
+                follow_symlinks=False,
+            )
+            matches = (
+                os.path.samestat(reservation.leaf_identity, held_fd_stat)
+                and os.path.samestat(reservation.leaf_identity, held_path_stat)
+                and os.path.samestat(reservation.leaf_identity, path_stat)
+            )
+        else:
+            second_path_stat = os.stat(reservation.path, follow_symlinks=False)
+            matches = os.path.samestat(reservation.leaf_identity, path_stat) and os.path.samestat(
+                reservation.leaf_identity, second_path_stat
+            )
     except OSError:
         matches = False
     if not matches:
         raise RuntimeError("training output reservation identity changed")
 
 
-def _cleanup_empty_reservation(output_dir: Path, identity: os.stat_result) -> None:
+def _cleanup_empty_reservation(reservation: _OutputReservation) -> None:
     try:
-        _require_output_identity(output_dir, identity)
-        output_dir.rmdir()
+        if reservation.parent.descriptor is not None:
+            held_path_stat = os.stat(
+                reservation.leaf_name,
+                dir_fd=reservation.parent.descriptor,
+                follow_symlinks=False,
+            )
+            if not os.path.samestat(reservation.leaf_identity, held_path_stat):
+                return
+            os.rmdir(reservation.leaf_name, dir_fd=reservation.parent.descriptor)
+        else:
+            _require_output_identity(reservation)
+            reservation.path.rmdir()
     except (OSError, RuntimeError):
         # Preserve any path that changed identity or gained trainer/audit files.
         return
+
+
+def _close_reservation(reservation: _OutputReservation) -> None:
+    if reservation.leaf_descriptor is not None:
+        os.close(reservation.leaf_descriptor)
 
 
 def run_rl_launch(
@@ -423,6 +569,7 @@ def run_rl_launch(
     model: str,
     adapter: str,
     expected_manifest_sha256: str,
+    expected_plugin_sha256: str | None = None,
     plugin: Path | None = None,
     device: str = "0",
     version_reader: Callable[[str], str] = importlib.metadata.version,
@@ -434,32 +581,43 @@ def run_rl_launch(
     template = load_rl_config(config_path)
     if template["rlhf_type"] == "grpo" and plugin is None:
         raise ValueError("GRPO requires an external reward plugin")
-    plugin_payload = _read_plugin(plugin)[1] if plugin is not None and template["rlhf_type"] == "grpo" else None
+    plugin_payload = (
+        _read_plugin(plugin, expected_plugin_sha256)[1]
+        if plugin is not None and template["rlhf_type"] == "grpo"
+        else None
+    )
     executable = validate_ms_swift_runtime(version_reader, executable_finder)
-    with tempfile.TemporaryDirectory(prefix="risk-agent-ms-swift-rl-") as temporary:
-        root = Path(temporary)
-        train, dev = root / "train.jsonl", root / "dev.jsonl"
-        _write_private_file(train, bundle.split_bytes["train.jsonl"])
-        _write_private_file(dev, bundle.split_bytes["dev.jsonl"])
-        plugin_snapshot = None
-        if plugin_payload is not None:
-            plugin_snapshot = root / "risk_rewards.py"
-            _write_private_file(plugin_snapshot, plugin_payload)
-        plan = _render(bundle, template, output_dir, model=model, adapter=adapter,
-                       plugin_path=plugin_snapshot, train=train, dev=dev, device=device)
-        config_snapshot = root / "rlhf.yaml"
-        _write_private_file(config_snapshot, yaml.safe_dump(plan.config, allow_unicode=True,
-                                                            sort_keys=False).encode("utf-8"))
-        argv = [executable, "rlhf", str(config_snapshot)]
-        execution = {"argv": argv, "env": plan.env, "rendered_config": plan.config}
-        identity = _reserve_output(Path(plan.config["output_dir"]))
-        try:
-            if on_execute:
-                on_execute(execution)
-            _require_output_identity(Path(plan.config["output_dir"]), identity)
-            environment = os.environ.copy()
-            environment.update(plan.env)
-            return runner(argv, env=environment, text=True, check=True, shell=False)
-        except BaseException:
-            _cleanup_empty_reservation(Path(plan.config["output_dir"]), identity)
-            raise
+    binding = _bind_output_parent(output_dir)
+    try:
+        with tempfile.TemporaryDirectory(prefix="risk-agent-ms-swift-rl-") as temporary:
+            root = Path(temporary)
+            train, dev = root / "train.jsonl", root / "dev.jsonl"
+            _write_private_file(train, bundle.split_bytes["train.jsonl"])
+            _write_private_file(dev, bundle.split_bytes["dev.jsonl"])
+            plugin_snapshot = None
+            if plugin_payload is not None:
+                plugin_snapshot = root / "risk_rewards.py"
+                _write_private_file(plugin_snapshot, plugin_payload)
+            plan = _render(bundle, template, output_dir, model=model, adapter=adapter,
+                           plugin_path=plugin_snapshot, train=train, dev=dev, device=device)
+            config_snapshot = root / "rlhf.yaml"
+            _write_private_file(config_snapshot, yaml.safe_dump(plan.config, allow_unicode=True,
+                                                                sort_keys=False).encode("utf-8"))
+            argv = [executable, "rlhf", str(config_snapshot)]
+            execution = {"argv": argv, "env": plan.env, "rendered_config": plan.config}
+            reservation = _reserve_output(binding, Path(plan.config["output_dir"]))
+            try:
+                try:
+                    if on_execute:
+                        on_execute(execution)
+                    _require_output_identity(reservation)
+                    environment = os.environ.copy()
+                    environment.update(plan.env)
+                    return runner(argv, env=environment, text=True, check=True, shell=False)
+                except BaseException:
+                    _cleanup_empty_reservation(reservation)
+                    raise
+            finally:
+                _close_reservation(reservation)
+    finally:
+        _close_parent(binding)
