@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import risk_agent.ms_swift_sft as ms_swift_sft
 from risk_agent.contracts import Oracle, PolicyRule, Task
 from risk_agent.ms_swift_sft import SplitRatios, prepare_sft_bundle
 
@@ -189,19 +190,19 @@ def test_prepare_bundle_publish_failure_never_leaves_a_complete_manifest(
 ) -> None:
     tasks, oracles = _write_track_a_sources(tmp_path, [("asset-1", "policy-v1")])
     output = tmp_path / "bundle"
-    original_write_bytes = Path.write_bytes
+    original_write = ms_swift_sft._write_exclusive
 
-    def fail_during_split_write(path: Path, payload: bytes) -> int:
+    def fail_during_split_write(path: Path, payload: bytes) -> None:
         if path.name == "dev.jsonl":
             raise OSError("simulated disk failure")
-        return original_write_bytes(path, payload)
+        original_write(path, payload)
 
-    monkeypatch.setattr(Path, "write_bytes", fail_during_split_write)
+    monkeypatch.setattr(ms_swift_sft, "_write_exclusive", fail_during_split_write)
     with pytest.raises(OSError, match="simulated disk failure"):
         prepare_sft_bundle("track_a", tasks, oracles, output)
 
     assert not (output / "manifest.json").exists()
-    assert not output.exists()
+    assert output.is_dir()
 
 
 def test_prepare_track_b_uses_validated_stores_and_only_emits_messages(tmp_path: Path) -> None:

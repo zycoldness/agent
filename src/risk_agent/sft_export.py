@@ -29,6 +29,27 @@ def _compact_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
+def _reject_duplicate_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant is forbidden: {value}")
+
+
+def _strict_json_loads(value: str) -> Any:
+    return json.loads(
+        value,
+        object_pairs_hook=_reject_duplicate_json_pairs,
+        parse_constant=_reject_nonfinite_json_constant,
+    )
+
+
 def _system(task: Task) -> str:
     return f"{render_active_policy(task.active_policy)}\n\n{SYSTEM_SUFFIX}"
 
@@ -93,7 +114,7 @@ def _parse_tool_action(action_text: object) -> Action:
     if not isinstance(action_text, str):
         raise ValueError("trajectory actions must be JSON strings")
     try:
-        payload = json.loads(action_text)
+        payload = _strict_json_loads(action_text)
     except json.JSONDecodeError as error:
         raise ValueError("trajectory actions must be valid JSON action objects") from error
     if not isinstance(payload, dict) or set(payload) != {"tool", "arguments"}:
@@ -123,7 +144,7 @@ def _parse_json_observation(observation: object) -> object:
     if not isinstance(observation, str):
         raise ValueError("trajectory observations must be strings")
     try:
-        return json.loads(observation)
+        return _strict_json_loads(observation)
     except json.JSONDecodeError as error:
         raise ValueError("tool observation must be valid JSON") from error
 

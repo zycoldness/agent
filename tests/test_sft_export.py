@@ -282,6 +282,27 @@ def test_trajectory_rejects_invalid_action_or_turn_shape(steps, message):
         export_trajectory(_task(max_turns=2), _oracle(), steps)
 
 
+def test_trajectory_rejects_duplicate_keys_in_embedded_action_json():
+    action = '{"tool":"get_rule_detail","tool":"search_case","arguments":{"rule_id":"AD-001"}}'
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        export_trajectory(_task(), _oracle(), [(action, _rule_observation())])
+
+
+def test_trajectory_rejects_duplicate_keys_in_embedded_observation_json():
+    observation = (
+        '{"rule_id":"AD-001","rule_id":"AD-999","title":"Absolute efficacy claim",'
+        '"text":"Do not guarantee a weight-loss result.","exceptions":[],"priority":100}'
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        export_trajectory(
+            _task(),
+            _oracle(),
+            [(_action("get_rule_detail", {"rule_id": "AD-001"}), observation)],
+        )
+
+
 def test_export_rejects_misaligned_task_and_oracle():
     with pytest.raises(ValueError, match="oracle must match"):
         export_track_a(

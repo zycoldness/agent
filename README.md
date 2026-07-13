@@ -154,7 +154,7 @@ python scripts/prepare_ms_swift_sft.py \
   --seed 42
 ```
 
-切分以 `asset_id` 为组：同一素材的不同 policy 版本和反事实变体不会跨 train/dev/holdout。小数据允许 dev 或 holdout 为空，`manifest.json` 会明确记录每个 split 的样本数与素材组数。三份训练文件每行只有标准 `messages`，不会附带 `asset_id`、Oracle 或分组元数据；这些信息只参与切分和最终监督。输出目录必须不存在，完整校验后才独占发布。
+切分以 `asset_id` 为组：同一素材的不同 policy 版本和反事实变体不会跨 train/dev/holdout。小数据允许 dev 或 holdout 为空，`manifest.json` 会明确记录每个 split 的样本数与素材组数。三份训练文件每行只有标准 `messages`，不会附带 `asset_id`、Oracle 或分组元数据；这些信息只参与切分和最终监督。输出目录必须不存在；发布器先独占创建目录，最后才写入 complete manifest。若中途失败，会保留没有 manifest 的不完整目录供审计，需要人工确认后清理。
 
 Track B 使用同一命令并增加闭世界底库：
 
@@ -192,7 +192,7 @@ python scripts/launch_ms_swift_sft.py \
   --device 0
 ```
 
-基线为 `Qwen/Qwen3-1.7B`、`tuner_type: lora`、bf16、`max_length: 4096`、batch size 1 加梯度累积和 gradient checkpointing；默认不启用 DeepSpeed、vLLM 或 4-bit。launcher 固定单进程单卡，通过 argv 调用而不使用 shell，并在进程结束后清理临时渲染配置。可用 `--model /path/to/local/model` 覆盖模型。
+基线为 `Qwen/Qwen3-1.7B`、`tuner_type: lora`、bf16、`max_length: 4096`、batch size 1 加梯度累积和 gradient checkpointing；默认不启用 DeepSpeed、vLLM 或 4-bit。真实启动会重新读取并验证 bundle，把已经验明哈希和 messages schema 的 train/dev 精确字节写入私有临时快照，再用官方 argv 形式 `swift sft <rendered.yaml>` 启动；YAML 只引用快照，不再引用可被并发替换的原文件。launcher 固定单进程单卡、不使用 shell，并在进程结束后清理快照和临时配置。可用 `--model /path/to/local/model` 覆盖模型。
 
 ## Gemini teacher 合成
 
@@ -289,7 +289,7 @@ python -m pytest -q
 当前基线为：
 
 ```text
-223 passed, 8 skipped
+266 passed, 8 skipped
 ```
 
 8 个 skip 来自 Windows 环境缺少稳定的符号链接权限、POSIX FIFO API 或 `dir_fd/openat` 语义，对应 crawler 与输出发布的 symlink/FIFO/路径替换防护测试；在支持相应能力的平台上会执行。测试不访问 Gemini，也不运行真实训练。

@@ -42,7 +42,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             _print_plan(plan.as_dict())
             return 0
-        run_sft_launch(plan, on_execute=_print_plan)
+        run_sft_launch(
+            args.bundle_dir,
+            args.config,
+            args.output_dir,
+            model=args.model,
+            device=args.device,
+            on_execute=_print_plan,
+        )
     except (OSError, RuntimeError, subprocess.CalledProcessError, ValueError) as error:
         parser.error(str(error))
     return 0

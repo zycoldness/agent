@@ -6,8 +6,6 @@ import hashlib
 import json
 import math
 import os
-import shutil
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -47,6 +45,10 @@ def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _reject_nonfinite_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant is forbidden: {value}")
+
+
 def _read_jsonl(path: Path, name: str) -> tuple[list[dict[str, Any]], bytes]:
     try:
         payload = path.read_bytes()
@@ -64,7 +66,11 @@ def _read_jsonl(path: Path, name: str) -> tuple[list[dict[str, Any]], bytes]:
         if not line.strip():
             raise ValueError(f"{name} line {number} must not be blank")
         try:
-            record = json.loads(line, object_pairs_hook=_reject_duplicate_pairs)
+            record = json.loads(
+                line,
+                object_pairs_hook=_reject_duplicate_pairs,
+                parse_constant=_reject_nonfinite_constant,
+            )
         except json.JSONDecodeError as error:
             raise ValueError(f"{name} line {number} is not valid JSON") from error
         if not isinstance(record, dict):
@@ -348,17 +354,26 @@ def prepare_sft_bundle(
     ).encode("utf-8")
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
-    staged = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.", dir=output_dir.parent))
-    published = False
     try:
-        for name, payload in payloads.items():
-            (staged / name).write_bytes(payload)
-        (staged / "manifest.json").write_bytes(manifest_payload)
-        os.rename(staged, output_dir)
-        published = True
+        output_dir.mkdir(exist_ok=False)
     except FileExistsError as error:
         raise ValueError("output directory must not exist") from error
-    finally:
-        if not published:
-            shutil.rmtree(staged, ignore_errors=True)
+    if os.name == "posix":
+        output_dir.chmod(0o700)
+    for name, payload in payloads.items():
+        _write_exclusive(output_dir / name, payload)
+    _write_exclusive(output_dir / "manifest.json", manifest_payload)
     return manifest
+
+
+def _write_exclusive(path: Path, payload: bytes) -> None:
+    """Create one bundle member without following or replacing another entry."""
+
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(payload)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
