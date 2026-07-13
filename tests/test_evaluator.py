@@ -3,7 +3,8 @@
 import pytest
 
 from risk_agent.contracts import Oracle, PolicyRule, Task
-from risk_agent.evaluator import evaluate_decisions
+from risk_agent.counterfactuals import PolicyOutcome, build_policy_shift_rows
+from risk_agent.evaluator import EvaluationRow, evaluate_decisions
 
 
 def make_task_and_oracle() -> tuple[Task, Oracle]:
@@ -117,3 +118,54 @@ def test_policy_following_for_singleton_assets_falls_back_to_label_correctness()
 
     assert report["label_accuracy"] == 0.0
     assert report["policy_following_accuracy"] == 0.0
+
+
+def test_policy_following_rejects_a_fully_inverted_counterfactual_pair() -> None:
+    unsafe_task, unsafe_oracle = make_task_and_oracle()
+    safe_task = unsafe_task.model_copy(update={"policy_version": "v2", "active_policy": ()})
+    safe_oracle = unsafe_oracle.model_copy(
+        update={"policy_version": "v2", "label": "safe", "rule_id": None, "evidence_ids": ()}
+    )
+
+    report = evaluate_decisions(
+        [
+            (unsafe_task, unsafe_oracle, {"label": "safe", "rule_id": None, "evidence_ids": []}, "pair-1"),
+            (safe_task, safe_oracle, {"label": "unsafe", "rule_id": "AD-1", "evidence_ids": []}, "pair-1"),
+        ]
+    )
+
+    assert report["label_accuracy"] == 0.0
+    assert report["policy_following_accuracy"] == 0.0
+
+
+def test_explicit_groups_keep_independent_same_asset_transformations_separate() -> None:
+    rule = PolicyRule(rule_id="AD-1", title="Claims", text="Do not guarantee weight loss")
+    first_pair = build_policy_shift_rows(
+        "a1",
+        "OCR",
+        before_policy=(rule,),
+        after_policy=(),
+        before_outcome=PolicyOutcome(label="unsafe", rule_id="AD-1"),
+        after_outcome=PolicyOutcome(label="safe"),
+        transformation="rule_removal",
+    )
+    second_pair = build_policy_shift_rows(
+        "a1",
+        "OCR",
+        before_policy=(rule,),
+        after_policy=(),
+        before_outcome=PolicyOutcome(label="unsafe", rule_id="AD-1"),
+        after_outcome=PolicyOutcome(label="safe"),
+        transformation="exemption",
+    )
+
+    report = evaluate_decisions(
+        [
+            EvaluationRow.from_policy_shift(first_pair[0], {"label": "safe", "evidence_ids": []}),
+            EvaluationRow.from_policy_shift(first_pair[1], {"label": "unsafe", "evidence_ids": []}),
+            EvaluationRow.from_policy_shift(second_pair[0], {"label": "unsafe", "evidence_ids": []}),
+            EvaluationRow.from_policy_shift(second_pair[1], {"label": "safe", "evidence_ids": []}),
+        ]
+    )
+
+    assert report["policy_following_accuracy"] == 0.5

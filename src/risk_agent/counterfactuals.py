@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -32,7 +32,9 @@ class PolicyOutcome:
             raise ValueError("outcome label must be 'safe' or 'unsafe'")
         if self.rule_id is not None and not isinstance(self.rule_id, str):
             raise TypeError("outcome rule_id must be a string or None")
-        if isinstance(self.evidence_ids, (str, bytes)) or not isinstance(self.evidence_ids, Iterable):
+        if isinstance(self.evidence_ids, (Mapping, str, bytes)) or not isinstance(
+            self.evidence_ids, Iterable
+        ):
             raise TypeError("outcome evidence_ids must be an iterable of string IDs")
         evidence_ids = tuple(self.evidence_ids)
         if any(not isinstance(evidence_id, str) for evidence_id in evidence_ids):
@@ -48,6 +50,7 @@ class PolicyShiftRow:
     oracle: Oracle
     transformation: PolicyTransformation = "rule_removal"
     variant: Literal["before", "after"] = "before"
+    group_id: str | None = None
 
 
 def _normalize_policy(policy: Iterable[PolicyRule], *, field_name: str) -> tuple[PolicyRule, ...]:
@@ -108,6 +111,39 @@ def _resolve_policy_version(
     return supplied_version
 
 
+def _group_id(
+    *,
+    asset_id: str,
+    observation: str,
+    transformation: PolicyTransformation,
+    before_policy: tuple[PolicyRule, ...],
+    after_policy: tuple[PolicyRule, ...],
+    before_outcome: PolicyOutcome,
+    after_outcome: PolicyOutcome,
+) -> str:
+    """Return one reproducible identity joining exactly this before/after pair."""
+
+    payload = {
+        "asset_id": asset_id,
+        "observation": observation,
+        "transformation": transformation,
+        "before_policy": [rule.model_dump(mode="json") for rule in before_policy],
+        "after_policy": [rule.model_dump(mode="json") for rule in after_policy],
+        "before_outcome": {
+            "label": before_outcome.label,
+            "rule_id": before_outcome.rule_id,
+            "evidence_ids": before_outcome.evidence_ids,
+        },
+        "after_outcome": {
+            "label": after_outcome.label,
+            "rule_id": after_outcome.rule_id,
+            "evidence_ids": after_outcome.evidence_ids,
+        },
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return f"{transformation}-group-{hashlib.sha256(encoded.encode('utf-8')).hexdigest()[:16]}"
+
+
 def _build_row(
     *,
     asset_id: str,
@@ -117,6 +153,7 @@ def _build_row(
     outcome: PolicyOutcome,
     transformation: PolicyTransformation,
     variant: Literal["before", "after"],
+    group_id: str,
 ) -> PolicyShiftRow:
     task = Task(
         asset_id=asset_id,
@@ -131,7 +168,13 @@ def _build_row(
         rule_id=outcome.rule_id,
         evidence_ids=outcome.evidence_ids,
     )
-    return PolicyShiftRow(task, oracle, transformation=transformation, variant=variant)
+    return PolicyShiftRow(
+        task,
+        oracle,
+        transformation=transformation,
+        variant=variant,
+        group_id=group_id,
+    )
 
 
 def build_policy_shift_rows(
@@ -165,6 +208,15 @@ def build_policy_shift_rows(
     after_version = _resolve_policy_version(after_policy_version, transformation, "after", after)
     if before_version == after_version:
         raise ValueError("before and after policy versions must differ")
+    group_id = _group_id(
+        asset_id=asset_id,
+        observation=observation,
+        transformation=transformation,
+        before_policy=before,
+        after_policy=after,
+        before_outcome=before_outcome,
+        after_outcome=after_outcome,
+    )
     return (
         _build_row(
             asset_id=asset_id,
@@ -174,6 +226,7 @@ def build_policy_shift_rows(
             outcome=before_outcome,
             transformation=transformation,
             variant="before",
+            group_id=group_id,
         ),
         _build_row(
             asset_id=asset_id,
@@ -183,6 +236,7 @@ def build_policy_shift_rows(
             outcome=after_outcome,
             transformation=transformation,
             variant="after",
+            group_id=group_id,
         ),
     )
 
@@ -305,19 +359,22 @@ def build_policy_shift_tasks(
     asset_id: str,
     observation: str,
     matching_rule: PolicyRule,
+    *,
+    legacy_policy_versions: bool = False,
 ) -> tuple[PolicyShiftRow, PolicyShiftRow]:
     """Return the legacy removal pair with the plan's fixed version names.
 
-    This compatibility wrapper deliberately retains ``with-rule`` and
-    ``without-rule`` for existing plan examples.  New datasets should use
-    :func:`build_rule_removal_tasks` or :func:`build_policy_shift_rows`, whose
-    default versions include a deterministic policy fingerprint.
+    By default this wrapper uses the same deterministic policy fingerprints as
+    the newer builders.  Set ``legacy_policy_versions=True`` only when loading
+    an older fixture that requires ``with-rule`` and ``without-rule``.
     """
 
-    return build_rule_removal_tasks(
-        asset_id,
-        observation,
-        matching_rule,
-        before_policy_version="with-rule",
-        after_policy_version="without-rule",
-    )
+    if legacy_policy_versions:
+        return build_rule_removal_tasks(
+            asset_id,
+            observation,
+            matching_rule,
+            before_policy_version="with-rule",
+            after_policy_version="without-rule",
+        )
+    return build_rule_removal_tasks(asset_id, observation, matching_rule)
