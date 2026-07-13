@@ -42,7 +42,6 @@ regulatory_cases:
       source_type: public_regulatory_case
       license: RIGHTS-REVIEW-REQUIRED
       terms_review: review_required
-
   - input_type: crawler_artifact
     crawler_output_dir: data/raw
     source_dataset: CAC-public-cases
@@ -58,4 +57,3 @@ regulatory_cases:
       source_type: public_regulatory_case
       license: RIGHTS-REVIEW-REQUIRED
       terms_review: review_required
-
