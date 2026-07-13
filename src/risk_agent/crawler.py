@@ -154,36 +154,85 @@ class ReadBudget:
     max_total_bytes: int
     total_bytes: int = 0
 
-    def read(self, path: Path) -> bytes:
-        """Open a regular file once and charge every consumed byte."""
+    def read(self, path: Path, *, trusted_root: Path | None = None) -> bytes:
+        """Read a confined regular file once and charge every consumed byte.
+
+        POSIX opens a trusted root directory and resolves every relative
+        component with ``dir_fd`` + ``O_NOFOLLOW``. Windows lacks equivalent
+        Python directory-handle traversal, so it instead fails closed when
+        lstat/open/fstat identities disagree; it cannot offer the same strong
+        ancestor-swap guarantee.
+        """
 
         if self.max_file_bytes <= 0 or self.max_total_bytes <= 0:
             raise ValueError("byte limits must be positive")
-        if _has_symlinked_ancestor(path.parent):
+        root, relative_parts, absolute_target = _confined_read_target(path, trusted_root)
+        if os.name == "nt":
+            descriptor = self._open_windows(absolute_target)
+        else:
+            descriptor = self._open_posix(root, relative_parts)
+        return self._read_descriptor(descriptor)
+
+    @staticmethod
+    def _open_posix(root: Path, relative_parts: tuple[str, ...]) -> int:
+        directory_flags = os.O_RDONLY
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            current_fd = os.open(root, directory_flags)
+        except OSError as error:
+            raise ValueError("trusted root must be a non-symlink directory") from error
+        try:
+            for component in relative_parts[:-1]:
+                try:
+                    next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+                except OSError as error:
+                    raise ValueError(
+                        "artifact path components must be non-symlink directories"
+                    ) from error
+                os.close(current_fd)
+                current_fd = next_fd
+            file_flags = os.O_RDONLY
+            file_flags |= getattr(os, "O_CLOEXEC", 0)
+            file_flags |= getattr(os, "O_NONBLOCK", 0)
+            file_flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                return os.open(relative_parts[-1], file_flags, dir_fd=current_fd)
+            except OSError as error:
+                raise ValueError("artifact input must be a regular non-symlink file") from error
+        finally:
+            os.close(current_fd)
+
+    @staticmethod
+    def _open_windows(absolute_target: Path) -> int:
+        if _has_symlinked_ancestor(absolute_target.parent):
             raise ValueError("artifact input must be a regular non-symlink file")
         flags = os.O_RDONLY
         flags |= getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NONBLOCK", 0)
         flags |= getattr(os, "O_BINARY", 0)
-        before_open = None
-        if os.name == "nt":
-            try:
-                before_open = os.lstat(path)
-            except OSError as error:
-                raise ValueError("artifact input must be a regular non-symlink file") from error
-            if stat.S_ISLNK(before_open.st_mode):
-                raise ValueError("artifact input must be a regular non-symlink file")
-        else:
-            flags |= getattr(os, "O_NOFOLLOW", 0)
-
         try:
-            descriptor = os.open(path, flags)
+            before_open = os.lstat(absolute_target)
+        except OSError as error:
+            raise ValueError("artifact input must be a regular non-symlink file") from error
+        if stat.S_ISLNK(before_open.st_mode):
+            raise ValueError("artifact input must be a regular non-symlink file")
+        try:
+            descriptor = os.open(absolute_target, flags)
         except OSError as error:
             raise ValueError("artifact input must be a regular non-symlink file") from error
         try:
-            opened = os.fstat(descriptor)
-            if before_open is not None and not os.path.samestat(before_open, opened):
+            if not os.path.samestat(before_open, os.fstat(descriptor)):
                 raise ValueError("artifact input identity changed while opening")
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def _read_descriptor(self, descriptor: int) -> bytes:
+        try:
+            opened = os.fstat(descriptor)
             if not stat.S_ISREG(opened.st_mode):
                 raise ValueError("artifact input must be a regular non-symlink file")
             if opened.st_size > self.max_file_bytes:
@@ -201,6 +250,21 @@ class ReadBudget:
             return b"".join(chunks)
         finally:
             os.close(descriptor)
+
+
+def _confined_read_target(
+    path: Path, trusted_root: Path | None
+) -> tuple[Path, tuple[str, ...], Path]:
+    absolute_target = Path(path).absolute()
+    root = Path(trusted_root if trusted_root is not None else absolute_target.parent).absolute()
+    try:
+        relative = absolute_target.relative_to(root)
+    except ValueError as error:
+        raise ValueError("artifact input must stay inside its trusted root") from error
+    parts = tuple(relative.parts)
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("artifact input must name a file below its trusted root")
+    return root, parts, absolute_target
 
 
 def validate_source(source: Source) -> str:
@@ -301,9 +365,9 @@ def read_complete_artifact(
     metadata_path = metadata_path_for(source, output_dir)
     marker_path = completion_path_for(source, output_dir)
     read_budget = budget or ReadBudget(max_file_bytes, max_total_bytes)
-    marker_bytes = read_budget.read(marker_path)
-    metadata_bytes = read_budget.read(metadata_path)
-    raw_bytes = read_budget.read(raw_path)
+    marker_bytes = read_budget.read(marker_path, trusted_root=output_dir)
+    metadata_bytes = read_budget.read(metadata_path, trusted_root=output_dir)
+    raw_bytes = read_budget.read(raw_path, trusted_root=output_dir)
     marker = _load_strict_artifact_json(marker_bytes, "completion marker")
     metadata = _load_strict_artifact_json(metadata_bytes, "metadata")
     if not isinstance(marker, Mapping) or not isinstance(metadata, Mapping):
@@ -414,7 +478,9 @@ def load_manifest(path: Path) -> tuple[Source, ...]:
     """Load and fully validate a YAML manifest before fetching any source."""
 
     try:
-        manifest_bytes = ReadBudget(MAX_MANIFEST_BYTES, MAX_MANIFEST_BYTES).read(path)
+        manifest_bytes = ReadBudget(MAX_MANIFEST_BYTES, MAX_MANIFEST_BYTES).read(
+            path, trusted_root=path.parent
+        )
         document = yaml.load(manifest_bytes.decode("utf-8"), Loader=_UniqueKeyLoader)
     except (UnicodeDecodeError, yaml.YAMLError) as error:
         raise ValueError(f"invalid YAML source manifest: {error}") from error

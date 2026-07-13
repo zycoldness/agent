@@ -319,6 +319,62 @@ def test_read_budget_does_not_use_a_stat_then_open_path_race(tmp_path, monkeypat
     assert not raced
 
 
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX dir_fd/openat semantics")
+def test_read_budget_keeps_trusted_root_fd_when_root_path_is_replaced(tmp_path, monkeypatch):
+    from risk_agent import crawler
+    from risk_agent.crawler import ReadBudget
+
+    trusted_root = tmp_path / "trusted"
+    trusted_root.mkdir()
+    (trusted_root / "nested").mkdir()
+    target = trusted_root / "nested" / "artifact.raw"
+    target.write_bytes(b"original")
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    (replacement / "nested").mkdir()
+    (replacement / "nested" / "artifact.raw").write_bytes(b"competitor")
+    displaced = tmp_path / "displaced"
+    original_open = crawler.os.open
+    swapped = False
+
+    def swap_after_root_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == trusted_root and kwargs.get("dir_fd") is None:
+            descriptor = original_open(path, flags, *args, **kwargs)
+            trusted_root.rename(displaced)
+            replacement.rename(trusted_root)
+            swapped = True
+            return descriptor
+        if Path(path) == target and not swapped:
+            trusted_root.rename(displaced)
+            replacement.rename(trusted_root)
+            swapped = True
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(crawler.os, "open", swap_after_root_open)
+
+    assert ReadBudget(1024, 1024).read(target, trusted_root=trusted_root) == b"original"
+    assert swapped
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlink and openat semantics")
+def test_read_budget_rejects_symlinked_intermediate_component(tmp_path):
+    from risk_agent.crawler import ReadBudget
+
+    trusted_root = tmp_path / "trusted"
+    trusted_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "artifact.raw").write_bytes(b"outside")
+    (trusted_root / "nested").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="regular non-symlink|directory"):
+        ReadBudget(1024, 1024).read(
+            trusted_root / "nested" / "artifact.raw",
+            trusted_root=trusted_root,
+        )
+
+
 @pytest.mark.skipif(os.name == "nt", reason="named pipes use different Windows APIs")
 def test_read_budget_rejects_fifo_without_blocking(tmp_path):
     from risk_agent.crawler import ReadBudget

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -16,6 +17,7 @@ import yaml
 from risk_agent.crawler import Source, completion_path_for, fetch, metadata_path_for
 from risk_agent.public_data import (
     MAX_IMPORT_RECORDS,
+    MM_SAFETY_BENCH_RESTRICTIONS,
     PublicAsset,
     SanitizedCase,
     import_mm_safety_bench,
@@ -771,9 +773,9 @@ def test_public_data_bundle_publishes_completion_manifest_last(tmp_path: Path, m
     original_replace = public_data.os.replace
     published: list[str] = []
 
-    def record_replace(source, destination):
+    def record_replace(source, destination, **kwargs):
         published.append(Path(destination).name)
-        return original_replace(source, destination)
+        return original_replace(source, destination, **kwargs)
 
     monkeypatch.setattr(public_data.os, "replace", record_replace)
     run_public_data_import(config, output)
@@ -855,6 +857,40 @@ def test_public_data_import_applies_global_record_cap_incrementally(tmp_path: Pa
         (tmp_path / "normalized" / "import_manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["truncation"]["truncated"] is True
+
+
+def test_mm_only_bundle_reports_mm_safety_bench_truncation(tmp_path: Path) -> None:
+    repo = tmp_path / "MM-SafetyBench"
+    _write_mm_fixture(repo)
+    config = tmp_path / "public-sources.yaml"
+    document = {
+        "version": 2,
+        "max_records": 1,
+        "max_file_bytes": 1048576,
+        "max_total_bytes": 8388608,
+        "mm_safety_bench": {
+            "repo_root": str(repo),
+            "use_tiny": True,
+            "allow_missing_media": False,
+            "scenario_allowlist": ["01-Illegal_Activitiy"],
+            "source_url": MM_SOURCE_URL,
+            "retrieved_at": RETRIEVED_AT,
+            "license_id": "CC-BY-NC-4.0",
+            "license_restrictions": list(MM_SAFETY_BENCH_RESTRICTIONS),
+            "usage_scope": "smoke_only",
+        },
+        "regulatory_cases": [],
+    }
+    config.write_text(yaml.safe_dump(document), encoding="utf-8")
+    output = tmp_path / "normalized"
+
+    report = run_public_data_import(config, output)
+
+    assert report["public_asset_count"] == 1
+    assert report["truncated"] is True
+    assert report["truncated_sources"] == ["MM-SafetyBench"]
+    manifest = json.loads((output / "import_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["truncation"]["truncated_sources"] == ["MM-SafetyBench"]
 
 
 def test_public_data_import_rejects_duplicate_yaml_keys_and_unknown_source_fields(tmp_path: Path) -> None:
@@ -942,6 +978,42 @@ def test_output_reservation_race_never_deletes_competing_directory(tmp_path: Pat
         run_public_data_import(config, output)
 
     assert (output / "competitor.txt").read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX dir_fd rename semantics")
+def test_output_fd_never_writes_or_deletes_path_swapped_after_identity_check(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "MM-SafetyBench"
+    _write_mm_fixture(repo)
+    html_path = tmp_path / "samr.html"
+    html_path.write_text(REGULATORY_HTML, encoding="utf-8")
+    config = tmp_path / "public-sources.yaml"
+    _write_import_config(config, repo, html_path)
+    output = tmp_path / "normalized"
+    displaced = tmp_path / "owned-reservation"
+
+    from risk_agent import public_data
+
+    original_samestat = public_data.os.path.samestat
+    swapped = False
+
+    def swap_after_samestat(first, second):
+        nonlocal swapped
+        result = original_samestat(first, second)
+        if result and not swapped:
+            output.rename(displaced)
+            output.mkdir()
+            (output / "competitor.txt").write_text("keep", encoding="utf-8")
+            swapped = True
+        return result
+
+    monkeypatch.setattr(public_data.os.path, "samestat", swap_after_samestat)
+    with pytest.raises(RuntimeError, match="reservation path identity changed"):
+        run_public_data_import(config, output)
+
+    assert (output / "competitor.txt").read_text(encoding="utf-8") == "keep"
+    assert sorted(path.name for path in output.iterdir()) == ["competitor.txt"]
 
 
 def test_public_data_cli_reports_sanitized_validation_error_without_traceback(tmp_path: Path) -> None:

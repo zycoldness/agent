@@ -36,7 +36,9 @@ import_report.json
 import_manifest.json
 ```
 
-The command reserves a destination with an exclusive directory create, moves staged payloads into it, and publishes `import_manifest.json` last as the completion marker. `import_manifest.json` records counts, output hashes, missing media, license status, and any source truncated or skipped by the global record cap. Consumers should require `status == "complete"` and verify the hashes.
+The command reserves a destination with an exclusive directory create, moves staged payloads into it, and publishes `import_manifest.json` last as the completion marker. On POSIX, both staging and destination directories remain open and every move is relative to those directory descriptors, so replacing the destination path cannot redirect writes. A failed reservation is deliberately left in place without path-based cleanup; inspect it and remove it manually before retrying with a new destination. On Windows, Python does not expose equivalent directory-relative rename handles: the implementation checks lstat/open/fstat or path identities and fails closed when a change is observed, but cannot promise the stronger POSIX ancestor-swap guarantee.
+
+`import_manifest.json` records counts, output hashes, missing media, license status, and any source truncated or skipped by the global record cap. This includes `MM-SafetyBench` when additional candidate records exist after its cap. Consumers should require `status == "complete"` and verify the hashes.
 
 Every public asset records:
 
@@ -63,7 +65,7 @@ python scripts/import_public_data.py \
   data/processed/public_seed
 ```
 
-The command rejects path overlap, placeholder governance, invalid record/byte caps, duplicate YAML/JSON keys and records, noncanonical URLs, symlinked/escaping MM paths, missing images unless explicitly allowed, any existing destination, and incomplete/tampered artifacts. Every JSON, HTML, and media read is charged to per-file and aggregate byte budgets. It performs no network requests.
+The command rejects path overlap, placeholder governance, invalid record/byte caps, duplicate YAML/JSON keys and records, noncanonical URLs, symlinked/escaping MM paths, missing images unless explicitly allowed, any existing destination, and incomplete/tampered artifacts. Every JSON, HTML, and media read is charged to per-file and aggregate byte budgets. POSIX reads open a trusted root directory and traverse each component with `dir_fd`/`O_NOFOLLOW`; Windows uses identity checks and the fail-closed limitation described above. It performs no network requests.
 
 ## Intended and prohibited uses
 

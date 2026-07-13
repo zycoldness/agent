@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
@@ -10,7 +11,6 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
-import stat
 import tempfile
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -161,6 +161,24 @@ class SanitizedCase(BaseModel):
         ):
             raise ValueError("published cases require approved license, terms, and content review")
         return self
+
+
+@dataclass(frozen=True)
+class MMSafetyBenchImportResult:
+    """Bounded MM import records plus an explicit cap/audit signal."""
+
+    records: tuple[PublicAsset, ...]
+    truncated: bool
+    has_more: bool
+
+    def __iter__(self):
+        return iter(self.records)
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index):
+        return self.records[index]
 
 
 def import_regulatory_html(
@@ -350,6 +368,8 @@ def run_public_data_import(config_path: Path, output_dir: Path) -> dict[str, Any
     _reject_existing_bundle_outputs(output_dir)
 
     assets: list[PublicAsset] = []
+    truncated_sources: list[str] = []
+    skipped_sources: list[str] = []
     mm_config = document.get("mm_safety_bench")
     if mm_config is not None:
         mm = _require_mapping(mm_config, "mm_safety_bench")
@@ -385,26 +405,25 @@ def run_public_data_import(config_path: Path, output_dir: Path) -> dict[str, Any
             raise ValueError("scenario_allowlist must be a list of scenario names")
         if scenario_rows is not None and len(set(scenario_rows)) != len(scenario_rows):
             raise ValueError("duplicate scenario in scenario_allowlist")
-        assets.extend(
-            import_mm_safety_bench(
-                Path(_required_string(mm, "repo_root")),
-                source_url=_required_string(mm, "source_url"),
-                retrieved_at=_required_string(mm, "retrieved_at"),
-                use_tiny=_optional_bool(mm, "use_tiny", True),
-                scenario_allowlist=set(scenario_rows) if scenario_rows is not None else None,
-                allow_missing_media=_optional_bool(mm, "allow_missing_media", False),
-                license_id=license_id,
-                usage_scope=usage_scope,
-                max_file_bytes=max_file_bytes,
-                max_total_bytes=max_total_bytes,
-                budget=read_budget,
-                max_records=max_records,
-            )
+        mm_result = import_mm_safety_bench(
+            Path(_required_string(mm, "repo_root")),
+            source_url=_required_string(mm, "source_url"),
+            retrieved_at=_required_string(mm, "retrieved_at"),
+            use_tiny=_optional_bool(mm, "use_tiny", True),
+            scenario_allowlist=set(scenario_rows) if scenario_rows is not None else None,
+            allow_missing_media=_optional_bool(mm, "allow_missing_media", False),
+            license_id=license_id,
+            usage_scope=usage_scope,
+            max_file_bytes=max_file_bytes,
+            max_total_bytes=max_total_bytes,
+            budget=read_budget,
+            max_records=max_records,
         )
+        assets.extend(mm_result.records)
+        if mm_result.truncated:
+            truncated_sources.append("MM-SafetyBench")
 
     cases: list[SanitizedCase] = []
-    truncated_sources: list[str] = []
-    skipped_sources: list[str] = []
     for index, value in enumerate(regulatory_rows):
         remaining_records = max_records - len(assets) - len(cases)
         if remaining_records <= 0:
@@ -451,7 +470,7 @@ def run_public_data_import(config_path: Path, output_dir: Path) -> dict[str, Any
             html_path = Path(_required_string(row, "local_html_path"))
             cases.extend(
                 import_regulatory_html(
-                    read_budget.read(html_path),
+                    read_budget.read(html_path, trusted_root=html_path.parent),
                     source_url=_required_string(row, "source_url"),
                     allowed_domains=_required_string_tuple(row, "allowed_domains"),
                     retrieved_at=_required_string(row, "retrieved_at"),
@@ -529,7 +548,7 @@ def import_mm_safety_bench(
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
     budget: ReadBudget | None = None,
     max_records: int,
-) -> tuple[PublicAsset, ...]:
+) -> MMSafetyBenchImportResult:
     """Import a bounded local MM-SafetyBench checkout without downloading media."""
 
     _validate_record_cap(max_records)
@@ -547,6 +566,7 @@ def import_mm_safety_bench(
         _load_tiny_ids(
             _confined_path(repo_root, Path("TinyVersion_ID_List.json"), require="file"),
             read_budget,
+            repo_root,
         )
         if use_tiny
         else None
@@ -566,7 +586,7 @@ def import_mm_safety_bench(
     assets: list[PublicAsset] = []
     for scenario in sorted(selected_scenarios):
         questions_path = question_files[scenario]
-        rows = _read_json_mapping(questions_path, read_budget)
+        rows = _read_json_mapping(questions_path, read_budget, repo_root)
         for row_item_id in rows:
             _validate_mm_item_id(row_item_id)
         if tiny_ids is not None and scenario not in tiny_ids:
@@ -582,6 +602,10 @@ def import_mm_safety_bench(
                 ("SD_TYPO", "Rephrased Question"),
                 ("TYPO", "Rephrased Question"),
             ):
+                if len(assets) == max_records:
+                    return MMSafetyBenchImportResult(
+                        records=tuple(assets), truncated=True, has_more=True
+                    )
                 media_path = Path("data") / "imgs" / scenario / variant / f"{item_id}.jpg"
                 absolute_media_path = _confined_path(
                     repo_root,
@@ -590,7 +614,9 @@ def import_mm_safety_bench(
                 )
                 if absolute_media_path.is_file():
                     media_status = "available"
-                    media_sha256: str | None = hashlib.sha256(read_budget.read(absolute_media_path)).hexdigest()
+                    media_sha256: str | None = hashlib.sha256(
+                        read_budget.read(absolute_media_path, trusted_root=repo_root)
+                    ).hexdigest()
                 elif allow_missing_media:
                     media_status = "missing"
                     media_sha256 = None
@@ -627,13 +653,13 @@ def import_mm_safety_bench(
                         split_group=f"MM-SafetyBench:{scenario}:{item_id}",
                     )
                 )
-                if len(assets) == max_records:
-                    return tuple(assets)
-    return tuple(assets)
+    return MMSafetyBenchImportResult(records=tuple(assets), truncated=False, has_more=False)
 
 
-def _load_tiny_ids(path: Path, budget: ReadBudget) -> dict[str, tuple[str, ...]]:
-    rows = _load_strict_json(path, budget)
+def _load_tiny_ids(
+    path: Path, budget: ReadBudget, trusted_root: Path
+) -> dict[str, tuple[str, ...]]:
+    rows = _load_strict_json(path, budget, trusted_root)
     if not isinstance(rows, list):
         raise ValueError("TinyVersion_ID_List.json must contain a list")
     result: dict[str, tuple[str, ...]] = {}
@@ -658,16 +684,21 @@ def _load_tiny_ids(path: Path, budget: ReadBudget) -> dict[str, tuple[str, ...]]
     return result
 
 
-def _read_json_mapping(path: Path, budget: ReadBudget) -> dict[str, Any]:
-    rows = _load_strict_json(path, budget)
+def _read_json_mapping(
+    path: Path, budget: ReadBudget, trusted_root: Path
+) -> dict[str, Any]:
+    rows = _load_strict_json(path, budget, trusted_root)
     if not isinstance(rows, dict):
         raise ValueError(f"MM-SafetyBench question file must contain a mapping: {path.name}")
     return rows
 
 
-def _load_strict_json(path: Path, budget: ReadBudget) -> Any:
+def _load_strict_json(path: Path, budget: ReadBudget, trusted_root: Path) -> Any:
     try:
-        return json.loads(budget.read(path), object_pairs_hook=_reject_duplicate_json_pairs)
+        return json.loads(
+            budget.read(path, trusted_root=trusted_root),
+            object_pairs_hook=_reject_duplicate_json_pairs,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError(f"invalid JSON input: {path.name}") from error
 
@@ -739,7 +770,9 @@ def _canonical_hash(value: object) -> str:
 
 def _load_public_data_config(path: Path) -> dict[str, Any]:
     try:
-        config_bytes = ReadBudget(1024 * 1024, 1024 * 1024).read(path)
+        config_bytes = ReadBudget(1024 * 1024, 1024 * 1024).read(
+            path, trusted_root=path.parent
+        )
         document = yaml.load(config_bytes.decode("utf-8"), Loader=_UniqueKeyLoader)
     except (UnicodeDecodeError, yaml.YAMLError) as error:
         raise ValueError(f"invalid public data YAML: {error}") from error
@@ -1053,13 +1086,6 @@ def _publish_public_data_bundle(
     output_dir = output_dir.absolute()
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     staged_dir = Path(tempfile.mkdtemp(prefix=".public-data-", dir=output_dir.parent))
-    reserved_identity: os.stat_result | None = None
-    owned_filenames = {
-        "public_assets.jsonl",
-        "sanitized_cases.jsonl",
-        "import_report.json",
-        "import_manifest.json",
-    }
     try:
         payloads = {
             "public_assets.jsonl": _jsonl_bytes(assets),
@@ -1095,50 +1121,90 @@ def _publish_public_data_bundle(
         # The mkdir itself is the no-replace reservation.  The early existence
         # check is only a friendly error; it is never the authority here.
         os.mkdir(output_dir)
-        reserved_identity = os.stat(output_dir, follow_symlinks=False)
-        for filename in (
+        created_identity = os.stat(output_dir, follow_symlinks=False)
+        filenames = (
             "public_assets.jsonl",
             "sanitized_cases.jsonl",
             "import_report.json",
             "import_manifest.json",
-        ):
-            os.replace(staged_dir / filename, output_dir / filename)
-    except BaseException:
-        if reserved_identity is not None:
-            _cleanup_owned_output_reservation(
-                output_dir,
-                reserved_identity,
-                owned_filenames,
+        )
+        if os.name == "nt":
+            _publish_staged_files_windows(
+                staged_dir, output_dir, created_identity, filenames
             )
-        raise
+        else:
+            _publish_staged_files_posix(
+                staged_dir, output_dir, created_identity, filenames
+            )
     finally:
         if staged_dir.exists():
             shutil.rmtree(staged_dir, ignore_errors=True)
 
 
-def _cleanup_owned_output_reservation(
+def _publish_staged_files_posix(
+    staged_dir: Path,
     output_dir: Path,
-    reserved_identity: os.stat_result,
-    owned_filenames: set[str],
+    created_identity: os.stat_result,
+    filenames: tuple[str, ...],
 ) -> None:
-    """Remove only a reservation that is still ours and contains no foreign entry."""
+    """Publish relative to held directory fds and commit the manifest last."""
 
+    directory_flags = os.O_RDONLY
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    output_fd = -1
+    staged_fd = -1
     try:
-        current_identity = os.stat(output_dir, follow_symlinks=False)
-        if not stat.S_ISDIR(current_identity.st_mode) or not os.path.samestat(
-            reserved_identity, current_identity
-        ):
-            return
-        entries = list(output_dir.iterdir())
-        if any(entry.name not in owned_filenames for entry in entries):
-            return
-        for entry in entries:
-            entry.unlink()
-        os.rmdir(output_dir)
+        output_fd = os.open(output_dir, directory_flags)
+        if not os.path.samestat(created_identity, os.fstat(output_fd)):
+            raise RuntimeError("public data reservation path identity changed")
+        staged_fd = os.open(staged_dir, directory_flags)
+        for filename in filenames:
+            os.replace(
+                filename,
+                filename,
+                src_dir_fd=staged_fd,
+                dst_dir_fd=output_fd,
+            )
+        if not _reservation_path_matches(output_dir, os.fstat(output_fd)):
+            raise RuntimeError("public data reservation path identity changed")
+    finally:
+        if staged_fd >= 0:
+            os.close(staged_fd)
+        if output_fd >= 0:
+            os.close(output_fd)
+
+
+def _publish_staged_files_windows(
+    staged_dir: Path,
+    output_dir: Path,
+    created_identity: os.stat_result,
+    filenames: tuple[str, ...],
+) -> None:
+    """Best-effort Windows publication with identity fail-closed checks.
+
+    Python on Windows does not expose POSIX directory-relative rename handles;
+    therefore this detects path replacement between operations but cannot
+    provide the POSIX same-directory-handle guarantee.
+    """
+
+    for filename in filenames:
+        if not _reservation_path_matches(output_dir, created_identity):
+            raise RuntimeError("public data reservation path identity changed")
+        os.replace(staged_dir / filename, output_dir / filename)
+    if not _reservation_path_matches(output_dir, created_identity):
+        raise RuntimeError("public data reservation path identity changed")
+
+
+def _reservation_path_matches(output_dir: Path, identity: os.stat_result) -> bool:
+    try:
+        return os.path.samestat(
+            identity,
+            os.stat(output_dir, follow_symlinks=False),
+        )
     except OSError:
-        # Cleanup is best-effort and fail-closed: a directory whose identity or
-        # contents changed is left in place without a completion manifest.
-        return
+        return False
 
 
 def _validate_record_cap(max_records: Any) -> None:
