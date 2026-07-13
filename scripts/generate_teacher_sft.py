@@ -256,11 +256,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-records", type=int, default=1000)
     parser.add_argument("--max-requests", type=int, default=2000)
-    parser.add_argument("--max-estimated-cost", type=float)
+    parser.add_argument(
+        "--max-estimated-cost",
+        type=float,
+        help="hard USD cap enforced by worst-case input/output cost reservation",
+    )
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--initial-backoff-seconds", type=float, default=1.0)
     parser.add_argument("--max-backoff-seconds", type=float, default=30.0)
     parser.add_argument("--request-timeout-seconds", type=float, default=60.0)
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=2048,
+        help="finite per-request generation limit used in cost reservation",
+    )
     parser.add_argument("--input-cost-per-million", type=float)
     parser.add_argument("--output-cost-per-million", type=float)
     return parser
@@ -298,6 +308,7 @@ def main(argv: list[str] | None = None) -> int:
             initial_backoff_seconds=args.initial_backoff_seconds,
             max_backoff_seconds=args.max_backoff_seconds,
             request_timeout_seconds=args.request_timeout_seconds,
+            max_output_tokens=args.max_output_tokens,
             input_cost_per_million=args.input_cost_per_million,
             output_cost_per_million=args.output_cost_per_million,
             budget=budget,

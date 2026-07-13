@@ -222,7 +222,7 @@ def test_teacher_usage_rejects_invalid_accounting_values(kwargs):
 
 def test_cost_budget_fails_closed_when_provider_usage_has_no_cost():
     budget = TeacherBudget(max_estimated_cost_usd=1.0)
-    budget.reserve_request()
+    reservation = budget.reserve_request(worst_case_cost_usd=0.5)
 
     with pytest.raises(TeacherBudgetExceeded, match="cost_accounting_incomplete"):
         budget.record_attempt(
@@ -234,5 +234,218 @@ def test_cost_budget_fails_closed_when_provider_usage_has_no_cost():
                 output_tokens=2,
                 estimated_cost_usd=None,
                 accounting_complete=True,
-            )
+            ),
+            reserved_cost_usd=reservation,
         )
+
+
+def test_client_initialization_failure_is_sanitized_and_counts_zero_requests():
+    secret = "client-init-secret"
+    teacher = GeminiTeacher(
+        model="gemini-test",
+        client_factory=lambda: (_ for _ in ()).throw(RuntimeError(secret)),
+    )
+
+    with pytest.raises(TeacherRequestError) as caught:
+        teacher.generate({"phase": "first"})
+
+    assert caught.value.usage.request_count == 0
+    assert caught.value.usage.accounting_complete is False
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert secret not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("input_tokens", "output_tokens"),
+    [
+        (True, 1),
+        ("1", 1),
+        (-1, 1),
+        (float("nan"), 1),
+        (1_000_000_001, 1),
+        (1, False),
+    ],
+)
+def test_malformed_provider_usage_records_one_incomplete_attempt(input_tokens, output_tokens):
+    response = SimpleNamespace(
+        text='{"tool":"final_decision","arguments":{"label":"safe","confidence":1.0}}',
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=input_tokens,
+            candidates_token_count=output_tokens,
+        ),
+    )
+    calls = 0
+
+    def generate_content(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return response
+
+    budget = TeacherBudget(max_requests=2)
+    teacher = GeminiTeacher(
+        model="gemini-test",
+        client_factory=lambda: SimpleNamespace(
+            models=SimpleNamespace(generate_content=generate_content)
+        ),
+        max_attempts=1,
+        budget=budget,
+    )
+
+    reply = teacher.generate({"phase": "first"})
+
+    assert calls == 1
+    assert reply.usage.request_count == 1
+    assert reply.usage.input_tokens == 0
+    assert reply.usage.output_tokens == 0
+    assert reply.usage.accounting_complete is False
+    assert budget.as_dict()["request_count"] == 1
+    assert budget.as_dict()["accounting_complete"] is False
+
+
+def test_cost_cap_fails_closed_on_malformed_usage_without_zero_cost_success():
+    calls = 0
+
+    def generate_content(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(
+            text='{"tool":"final_decision","arguments":{"label":"safe","confidence":1.0}}',
+            usage_metadata=SimpleNamespace(prompt_token_count=True, candidates_token_count=1),
+        )
+
+    budget = TeacherBudget(max_estimated_cost_usd=10.0)
+    teacher = GeminiTeacher(
+        model="gemini-test",
+        client_factory=lambda: SimpleNamespace(
+            models=SimpleNamespace(generate_content=generate_content)
+        ),
+        input_cost_per_million=1.0,
+        output_cost_per_million=1.0,
+        max_output_tokens=10,
+        budget=budget,
+    )
+
+    with pytest.raises(TeacherBudgetExceeded, match="cost_accounting_incomplete"):
+        teacher.generate({"phase": "first"})
+
+    assert calls == 1
+    assert budget.as_dict()["request_count"] == 1
+    assert budget.as_dict()["accounting_complete"] is False
+
+
+@pytest.mark.parametrize(
+    ("input_price", "output_price"),
+    [(None, None), (0.0, 1.0), (1.0, 0.0)],
+)
+def test_cost_cap_rejects_unknown_or_zero_pricing_before_provider_call(input_price, output_price):
+    calls = 0
+
+    def generate_content(**_kwargs):
+        nonlocal calls
+        calls += 1
+
+    budget = TeacherBudget(max_estimated_cost_usd=0.1)
+    teacher = GeminiTeacher(
+        model="gemini-test",
+        client_factory=lambda: SimpleNamespace(
+            models=SimpleNamespace(generate_content=generate_content)
+        ),
+        input_cost_per_million=input_price,
+        output_cost_per_million=output_price,
+        budget=budget,
+    )
+
+    with pytest.raises(TeacherBudgetExceeded, match="cost_accounting_incomplete"):
+        teacher.generate({"phase": "first"})
+
+    assert calls == 0
+    assert budget.as_dict()["request_count"] == 0
+
+
+def test_hard_cost_cap_prevents_request_when_worst_case_reservation_is_too_large():
+    calls = 0
+
+    def generate_content(**_kwargs):
+        nonlocal calls
+        calls += 1
+
+    budget = TeacherBudget(max_estimated_cost_usd=0.1)
+    teacher = GeminiTeacher(
+        model="gemini-test",
+        client_factory=lambda: SimpleNamespace(
+            models=SimpleNamespace(generate_content=generate_content)
+        ),
+        input_cost_per_million=1_000_000.0,
+        output_cost_per_million=1_000_000.0,
+        max_output_tokens=1,
+        budget=budget,
+    )
+
+    with pytest.raises(TeacherBudgetExceeded, match="max_estimated_cost"):
+        teacher.generate({"phase": "first"})
+
+    assert calls == 0
+    assert budget.as_dict()["request_count"] == 0
+
+
+def test_retry_reservation_cannot_overshoot_cost_cap():
+    calls = 0
+    seen_configs = []
+
+    def generate_content(**kwargs):
+        nonlocal calls
+        calls += 1
+        seen_configs.append(kwargs["config"])
+        return SimpleNamespace(
+            text="not-json",
+            usage_metadata=SimpleNamespace(prompt_token_count=1, candidates_token_count=1),
+        )
+
+    budget = TeacherBudget(max_estimated_cost_usd=0.1)
+    teacher = GeminiTeacher(
+        model="gemini-test",
+        client_factory=lambda: SimpleNamespace(
+            models=SimpleNamespace(generate_content=generate_content)
+        ),
+        max_attempts=3,
+        initial_backoff_seconds=0,
+        sleep=lambda _seconds: None,
+        input_cost_per_million=0.000001,
+        output_cost_per_million=60_000.0,
+        max_output_tokens=1,
+        budget=budget,
+    )
+
+    with pytest.raises(TeacherBudgetExceeded, match="max_estimated_cost"):
+        teacher.generate({"phase": "first"})
+
+    assert calls == 1
+    assert seen_configs[0]["max_output_tokens"] == 1
+    assert budget.as_dict()["request_count"] == 1
+    assert budget.as_dict()["estimated_cost_usd"] == pytest.approx(0.06)
+
+
+def test_usage_metadata_accessor_failure_is_treated_as_incomplete_without_raw_error():
+    secret = "usage-property-secret"
+
+    class Response:
+        text = '{"tool":"final_decision","arguments":{"label":"safe","confidence":1.0}}'
+
+        @property
+        def usage_metadata(self):
+            raise RuntimeError(secret)
+
+    teacher = GeminiTeacher(
+        model="gemini-test",
+        client_factory=lambda: SimpleNamespace(
+            models=SimpleNamespace(generate_content=lambda **_kwargs: Response())
+        ),
+        max_attempts=1,
+    )
+
+    reply = teacher.generate({"phase": "first"})
+
+    assert reply.usage.request_count == 1
+    assert reply.usage.accounting_complete is False
+    assert secret not in repr(reply)

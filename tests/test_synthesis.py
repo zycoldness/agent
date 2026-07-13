@@ -459,7 +459,11 @@ def test_batch_known_cost_budget_stops_before_the_next_request(tmp_path: Path):
     tasks, oracles, cases, evidence = _write_batch_inputs(tmp_path)
     output = tmp_path / "out.jsonl"
     budget = TeacherBudget(max_requests=10, max_estimated_cost_usd=0.1)
-    teacher = CallableTeacher(lambda request: _direct_reply(request, cost=0.1), budget=budget)
+    teacher = CallableTeacher(
+        lambda request: _direct_reply(request, cost=0.1),
+        budget=budget,
+        worst_case_cost_usd=0.1,
+    )
 
     outcome = run_batch(
         tasks,

@@ -169,19 +169,38 @@ class TeacherBudget:
         self.input_tokens = 0
         self.output_tokens = 0
         self.estimated_cost_usd = 0.0
+        self.reserved_cost_usd = 0.0
         self.accounting_complete = True
 
-    def reserve_request(self) -> None:
+    def reserve_request(self, *, worst_case_cost_usd: float | None = None) -> float:
         if self.max_requests is not None and self.request_count >= self.max_requests:
             raise TeacherBudgetExceeded("max_requests")
+        reservation = 0.0
         if self.max_estimated_cost_usd is not None:
             if not self.accounting_complete:
                 raise TeacherBudgetExceeded("cost_accounting_incomplete")
-            if self.estimated_cost_usd >= self.max_estimated_cost_usd:
+            if worst_case_cost_usd is None:
+                raise TeacherBudgetExceeded("cost_accounting_incomplete")
+            reservation = _finite_nonnegative(worst_case_cost_usd, "worst_case_cost_usd")
+            if reservation == 0:
+                raise TeacherBudgetExceeded("cost_accounting_incomplete")
+            if (
+                self.estimated_cost_usd + self.reserved_cost_usd + reservation
+                > self.max_estimated_cost_usd
+            ):
                 raise TeacherBudgetExceeded("max_estimated_cost")
         self.request_count += 1
+        self.reserved_cost_usd += reservation
+        return reservation
 
-    def record_attempt(self, usage: TeacherUsage) -> None:
+    def record_attempt(
+        self,
+        usage: TeacherUsage,
+        *,
+        reserved_cost_usd: float = 0.0,
+    ) -> None:
+        reserved_cost_usd = _finite_nonnegative(reserved_cost_usd, "reserved_cost_usd")
+        self.reserved_cost_usd = max(0.0, self.reserved_cost_usd - reserved_cost_usd)
         self.input_tokens += usage.input_tokens
         self.output_tokens += usage.output_tokens
         self.accounting_complete = self.accounting_complete and usage.accounting_complete
@@ -191,6 +210,12 @@ class TeacherBudget:
                 raise TeacherBudgetExceeded("cost_accounting_incomplete")
         else:
             self.estimated_cost_usd += usage.estimated_cost_usd
+            if (
+                self.max_estimated_cost_usd is not None
+                and usage.estimated_cost_usd > reserved_cost_usd
+            ):
+                self.accounting_complete = False
+                raise TeacherBudgetExceeded("cost_reservation_exceeded")
         if (
             self.max_estimated_cost_usd is not None
             and self.estimated_cost_usd > self.max_estimated_cost_usd
@@ -203,6 +228,7 @@ class TeacherBudget:
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "estimated_cost_usd": self.estimated_cost_usd,
+            "reserved_cost_usd": self.reserved_cost_usd,
             "accounting_complete": self.accounting_complete,
         }
 
@@ -228,15 +254,24 @@ class CallableTeacher:
         provider: str = "callable",
         model: str = "injected",
         budget: TeacherBudget | None = None,
+        worst_case_cost_usd: float | None = None,
     ) -> None:
         self._call = call
         self._provider = provider
         self._model = model
         self._budget = budget
+        self._worst_case_cost_usd = (
+            None
+            if worst_case_cost_usd is None
+            else _finite_nonnegative(worst_case_cost_usd, "worst_case_cost_usd")
+        )
 
     def generate(self, request: Mapping[str, Any]) -> TeacherReply:
+        reservation = 0.0
         if self._budget is not None:
-            self._budget.reserve_request()
+            reservation = self._budget.reserve_request(
+                worst_case_cost_usd=self._worst_case_cost_usd
+            )
         provider_failed = False
         try:
             value = self._call(request)
@@ -247,18 +282,18 @@ class CallableTeacher:
         if provider_failed:
             usage = TeacherUsage(provider=self._provider, model=self._model)
             if self._budget is not None:
-                self._budget.record_attempt(usage)
+                self._budget.record_attempt(usage, reserved_cost_usd=reservation)
             raise TeacherRequestError("teacher request failed after 1 attempt", usage) from None
         if not isinstance(value, TeacherReply):
             usage = TeacherUsage(provider=self._provider, model=self._model)
             if self._budget is not None:
-                self._budget.record_attempt(usage)
+                self._budget.record_attempt(usage, reserved_cost_usd=reservation)
             return TeacherReply(payload=_parse_object(value), usage=usage)
         reply = value
         if reply.usage.request_count != 1:
             raise ValueError("CallableTeacher replies must account for exactly one request")
         if self._budget is not None:
-            self._budget.record_attempt(reply.usage)
+            self._budget.record_attempt(reply.usage, reserved_cost_usd=reservation)
         return reply
 
 
@@ -274,6 +309,8 @@ _ACTION_SCHEMA: dict[str, object] = {
     "required": ["tool", "arguments"],
     "additionalProperties": False,
 }
+_MAX_USAGE_TOKENS = 1_000_000_000
+_PROMPT_OVERHEAD_TOKENS = 4096
 
 
 class GeminiTeacher:
@@ -291,6 +328,7 @@ class GeminiTeacher:
         sleep: Callable[[float], None] = time.sleep,
         input_cost_per_million: float | None = None,
         output_cost_per_million: float | None = None,
+        max_output_tokens: int = 2048,
         budget: TeacherBudget | None = None,
     ) -> None:
         if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or not 1 <= max_attempts <= 5:
@@ -322,6 +360,13 @@ class GeminiTeacher:
         )
         if (self._input_cost_per_million is None) != (self._output_cost_per_million is None):
             raise ValueError("input and output prices must be supplied together")
+        if (
+            isinstance(max_output_tokens, bool)
+            or not isinstance(max_output_tokens, int)
+            or not 1 <= max_output_tokens <= 65_536
+        ):
+            raise ValueError("max_output_tokens must be an integer from 1 to 65536")
+        self._max_output_tokens = max_output_tokens
         self._budget = budget
 
     def _new_client(self) -> object:
@@ -342,18 +387,36 @@ class GeminiTeacher:
         return genai.Client(**kwargs)
 
     def generate(self, request: Mapping[str, Any]) -> TeacherReply:
-        client = self._new_client()
         prompt = json.dumps(request, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        worst_case_cost = self._worst_case_cost(prompt)
         aggregate = _UsageAccumulator(
             "gemini",
             self.model,
             self._input_cost_per_million,
             self._output_cost_per_million,
         )
+        client_failed = False
+        try:
+            client = self._new_client()
+        except Exception:
+            client_failed = True
+        if client_failed:
+            raise TeacherRequestError(
+                "teacher client initialization failed",
+                TeacherUsage(
+                    provider="gemini",
+                    model=self.model,
+                    request_count=0,
+                    accounting_complete=False,
+                ),
+            ) from None
         for attempt in range(1, self._max_attempts + 1):
+            reservation = 0.0
             if self._budget is not None:
-                self._budget.reserve_request()
-            response_received = False
+                reservation = self._budget.reserve_request(
+                    worst_case_cost_usd=worst_case_cost
+                )
+            provider_failed = False
             try:
                 response = client.models.generate_content(
                     model=self.model,
@@ -363,65 +426,101 @@ class GeminiTeacher:
                         "candidate_count": 1,
                         "response_mime_type": "application/json",
                         "response_schema": _ACTION_SCHEMA,
+                        "max_output_tokens": self._max_output_tokens,
                     },
                 )
-                response_received = True
-                metadata = getattr(response, "usage_metadata", None)
-                attempt_usage = TeacherUsage(
-                    provider="gemini",
-                    model=self.model,
-                    request_count=1,
-                    input_tokens=getattr(metadata, "prompt_token_count", 0) or 0,
-                    output_tokens=getattr(metadata, "candidates_token_count", 0) or 0,
-                    estimated_cost_usd=self._attempt_cost(metadata),
-                    accounting_complete=self._has_usage(metadata),
-                )
-                aggregate.add(
-                    attempt_usage.input_tokens if attempt_usage.accounting_complete else None,
-                    attempt_usage.output_tokens if attempt_usage.accounting_complete else None,
-                )
-                if self._budget is not None:
-                    self._budget.record_attempt(attempt_usage)
-                payload = _parse_object(response.text or "")
-                return TeacherReply(payload=payload, usage=aggregate.snapshot())
-            except TeacherBudgetExceeded:
-                raise
             except Exception:
-                if not response_received:
-                    missing = TeacherUsage(provider="gemini", model=self.model)
-                    aggregate.add(None, None)
-                    if self._budget is not None:
-                        self._budget.record_attempt(missing)
-                if attempt < self._max_attempts:
-                    delay = min(
-                        self._max_backoff_seconds,
-                        self._initial_backoff_seconds * (2 ** (attempt - 1)),
+                provider_failed = True
+            if provider_failed:
+                missing = TeacherUsage(provider="gemini", model=self.model)
+                aggregate.add(None, None)
+                if self._budget is not None:
+                    self._budget.record_attempt(
+                        missing,
+                        reserved_cost_usd=reservation,
                     )
-                    self._sleep(delay)
+                if attempt < self._max_attempts:
+                    self._sleep(self._retry_delay(attempt))
+                continue
+
+            attempt_usage = self._normalize_response_usage(response)
+            aggregate.add(
+                attempt_usage.input_tokens if attempt_usage.accounting_complete else None,
+                attempt_usage.output_tokens if attempt_usage.accounting_complete else None,
+            )
+            if self._budget is not None:
+                self._budget.record_attempt(
+                    attempt_usage,
+                    reserved_cost_usd=reservation,
+                )
+            parse_failed = False
+            try:
+                payload = _parse_object(response.text or "")
+            except Exception:
+                parse_failed = True
+            if not parse_failed:
+                return TeacherReply(payload=payload, usage=aggregate.snapshot())
+            if attempt < self._max_attempts:
+                self._sleep(self._retry_delay(attempt))
         raise TeacherRequestError(
             f"teacher request failed after {self._max_attempts} attempts",
             aggregate.snapshot(),
         ) from None
 
-    @staticmethod
-    def _has_usage(metadata: object) -> bool:
-        return (
-            isinstance(getattr(metadata, "prompt_token_count", None), int)
-            and not isinstance(getattr(metadata, "prompt_token_count", None), bool)
-            and getattr(metadata, "prompt_token_count") >= 0
-            and isinstance(getattr(metadata, "candidates_token_count", None), int)
-            and not isinstance(getattr(metadata, "candidates_token_count", None), bool)
-            and getattr(metadata, "candidates_token_count") >= 0
+    def _normalize_usage(self, metadata: object) -> TeacherUsage:
+        try:
+            input_tokens = getattr(metadata, "prompt_token_count")
+            output_tokens = getattr(metadata, "candidates_token_count")
+        except Exception:
+            input_tokens = output_tokens = None
+        valid = all(
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 <= value <= _MAX_USAGE_TOKENS
+            for value in (input_tokens, output_tokens)
+        )
+        if not valid:
+            return TeacherUsage(provider="gemini", model=self.model, accounting_complete=False)
+        cost = None
+        if self._input_cost_per_million is not None and self._output_cost_per_million is not None:
+            cost = (
+                input_tokens * self._input_cost_per_million
+                + output_tokens * self._output_cost_per_million
+            ) / 1_000_000
+        return TeacherUsage(
+            provider="gemini",
+            model=self.model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            estimated_cost_usd=cost,
+            accounting_complete=True,
         )
 
-    def _attempt_cost(self, metadata: object) -> float | None:
-        if (
-            not self._has_usage(metadata)
-            or self._input_cost_per_million is None
-            or self._output_cost_per_million is None
-        ):
+    def _normalize_response_usage(self, response: object) -> TeacherUsage:
+        try:
+            metadata = getattr(response, "usage_metadata", None)
+        except Exception:
+            metadata = None
+        return self._normalize_usage(metadata)
+
+    def _worst_case_cost(self, prompt: str) -> float | None:
+        if self._budget is None or self._budget.max_estimated_cost_usd is None:
             return None
+        if (
+            self._input_cost_per_million is None
+            or self._output_cost_per_million is None
+            or self._input_cost_per_million <= 0
+            or self._output_cost_per_million <= 0
+        ):
+            raise TeacherBudgetExceeded("cost_accounting_incomplete")
+        input_upper_bound = len(prompt.encode("utf-8")) + _PROMPT_OVERHEAD_TOKENS
         return (
-            metadata.prompt_token_count * self._input_cost_per_million
-            + metadata.candidates_token_count * self._output_cost_per_million
+            input_upper_bound * self._input_cost_per_million
+            + self._max_output_tokens * self._output_cost_per_million
         ) / 1_000_000
+
+    def _retry_delay(self, attempt: int) -> float:
+        return min(
+            self._max_backoff_seconds,
+            self._initial_backoff_seconds * (2 ** (attempt - 1)),
+        )
