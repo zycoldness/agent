@@ -11,7 +11,9 @@ import pytest
 from risk_agent.crawler import (
     MAX_RESPONSE_BYTES,
     Source,
+    completion_path_for,
     fetch,
+    is_complete_artifact,
     load_manifest,
     validate_source,
 )
@@ -42,12 +44,17 @@ def test_source_requires_https_and_exact_allowlisted_hostname():
         "https://127.0.0.1/case/1",
         "https://[::1]/case/1",
         "https://[2001:4860:4860::8888]/case/1",
+        "https://127.1/case/1",
+        "https://2130706433/case/1",
+        "https://0177.0.0.1/case/1",
+        "https://0x7f000001/case/1",
+        "https://0x7f.0x0.0x0.0x1/case/1",
     ],
 )
 def test_source_rejects_non_allowlisted_or_dangerous_urls(url: str):
     source = Source(url=url, allowed_domains=("example.gov.cn",))
 
-    with pytest.raises(ValueError, match="allowlisted|HTTPS|credentials|port|user-account|local|IP-literal"):
+    with pytest.raises(ValueError, match="allowlisted|HTTPS|credentials|port|user-account|local|IP-literal|canonical"):
         validate_source(source)
 
 
@@ -84,6 +91,7 @@ def test_source_allows_ordinary_public_query_parameters():
         "https://example.gov.cn/%75ser/alice",
         "https://example.gov.cn/%61ccount",
         "https://example.gov.cn/%50%72%6f%46%69%6c%65/alice",
+        "https://example.gov.cn/foo%EF%BC%8Flogin",
     ],
 )
 def test_source_normalizes_encoded_account_route_segments(url: str):
@@ -131,6 +139,8 @@ def test_fetch_obeys_robots_and_writes_raw_bytes_and_metadata(tmp_path):
         "terms_review": "reviewed",
         "url": source.url,
     }
+    assert is_complete_artifact(source, tmp_path)
+    assert completion_path_for(source, tmp_path).is_file()
 
 
 def test_fetch_rejects_robots_denial_before_requesting_source(tmp_path):
@@ -227,3 +237,32 @@ def test_fetch_rejects_preexisting_symlinked_raw_or_metadata_file(tmp_path, targ
     with pytest.raises(ValueError, match="symlink"):
         fetch(source, tmp_path)
     assert raw_target.read_text(encoding="utf-8") == "do not overwrite"
+
+
+def test_second_commit_failure_never_exposes_a_completed_artifact(tmp_path, monkeypatch):
+    source = Source(url="https://example.gov.cn/case/1", allowed_domains=("example.gov.cn",))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+        return httpx.Response(200, content=b"raw document")
+
+    from risk_agent import crawler
+
+    original_replace = crawler.os.replace
+    calls = 0
+
+    def fail_metadata_replace(source_path: Path, target_path: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected metadata commit failure")
+        original_replace(source_path, target_path)
+
+    monkeypatch.setattr(crawler.os, "replace", fail_metadata_replace)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(OSError, match="injected metadata"):
+            fetch(source, tmp_path, client=client)
+
+    assert not completion_path_for(source, tmp_path).exists()
+    assert not is_complete_artifact(source, tmp_path)

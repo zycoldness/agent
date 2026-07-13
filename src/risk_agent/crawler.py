@@ -10,6 +10,7 @@ from ipaddress import ip_address
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 from typing import Any
 from unicodedata import normalize
@@ -64,6 +65,8 @@ _SENSITIVE_QUERY_PARAMETER_NAMES = frozenset(
         "token",
     }
 )
+_DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", re.ASCII)
+_NUMERIC_IP_LABEL = re.compile(r"(?:0x[0-9a-f]+|0[0-7]*|[0-9]+)", re.ASCII)
 
 
 @dataclass(frozen=True)
@@ -104,6 +107,10 @@ def validate_source(source: Source) -> str:
         raise ValueError("source must use HTTPS")
     if not hostname or _is_local_or_ip_literal(hostname):
         raise ValueError("source must not use a local or IP-literal hostname")
+    if not _is_strict_dns_hostname(hostname):
+        raise ValueError("source must use a canonical DNS hostname")
+    if _looks_like_numeric_ip(hostname):
+        raise ValueError("source must not use a numeric IP-literal hostname")
     if not hostname or hostname.casefold() not in allowed_domains:
         raise ValueError("source must use an exact allowlisted hostname")
     if parsed.username is not None or parsed.password is not None:
@@ -131,15 +138,56 @@ def validate_source(source: Source) -> str:
 def raw_path_for(source: Source, output_dir: Path) -> Path:
     """Return a filename derived only from the approved URL, not its path."""
 
-    digest = hashlib.sha256(validate_source(source).encode("utf-8")).hexdigest()
+    digest = _source_digest(source)
     return _safe_child(output_dir, f"{digest}.raw")
 
 
 def metadata_path_for(source: Source, output_dir: Path) -> Path:
     """Return the controlled provenance sidecar path for a source."""
 
-    digest = hashlib.sha256(validate_source(source).encode("utf-8")).hexdigest()
+    digest = _source_digest(source)
     return _safe_child(output_dir / "metadata", f"{digest}.json")
+
+
+def completion_path_for(source: Source, output_dir: Path) -> Path:
+    """Return the transaction marker required before a raw artifact is usable."""
+
+    digest = _source_digest(source)
+    return _safe_child(output_dir / "metadata", f"{digest}.complete.json")
+
+
+def is_complete_artifact(source: Source, output_dir: Path) -> bool:
+    """Check that a raw file and provenance sidecar form a committed pair.
+
+    Consumers must use this check (or an equivalent marker/hash verification)
+    before reading a raw crawler artifact.  An unmarked raw file is incomplete.
+    """
+
+    try:
+        url = validate_source(source)
+        raw_path = raw_path_for(source, output_dir)
+        metadata_path = metadata_path_for(source, output_dir)
+        marker_path = completion_path_for(source, output_dir)
+        if any(path.is_symlink() or not path.is_file() for path in (raw_path, metadata_path, marker_path)):
+            return False
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        metadata_bytes = metadata_path.read_bytes()
+        metadata = json.loads(metadata_bytes)
+        if not isinstance(marker, Mapping) or not isinstance(metadata, Mapping):
+            return False
+        if marker.get("raw_path") != raw_path.name or marker.get("metadata_path") != metadata_path.name:
+            return False
+        if marker.get("metadata_sha256") != hashlib.sha256(metadata_bytes).hexdigest():
+            return False
+        raw_hash = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+        return (
+            marker.get("content_sha256") == raw_hash
+            and metadata.get("content_sha256") == raw_hash
+            and metadata.get("url") == url
+            and metadata.get("raw_path") == raw_path.name
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def fetch(
@@ -158,10 +206,12 @@ def fetch(
 
     url = validate_source(source)
     output_dir, metadata_dir = _prepare_output_directories(output_dir)
-    raw_path = raw_path_for(source, output_dir)
-    metadata_path = _safe_child(metadata_dir, metadata_path_for(source, output_dir).name)
-    _reject_symlink(raw_path)
-    _reject_symlink(metadata_path)
+    digest = _source_digest(source)
+    raw_path = _safe_child(output_dir, f"{digest}.raw")
+    metadata_path = _safe_child(metadata_dir, f"{digest}.json")
+    marker_path = _safe_child(metadata_dir, f"{digest}.complete.json")
+    for path in (raw_path, metadata_path, marker_path):
+        _reject_symlink(path)
     owns_client = client is None
     if client is None:
         client = httpx.Client(timeout=TIMEOUT_SECONDS, follow_redirects=False, trust_env=False)
@@ -181,10 +231,18 @@ def fetch(
         terms_review=source.terms_review,
         raw_path=raw_path.name,
     )
-    # Both files are staged in their verified direct directories and atomically
-    # replaced, so a failed write cannot leave a truncated raw or sidecar file.
-    _atomic_write(raw_path, body)
-    _atomic_write(metadata_path, (json.dumps(asdict(metadata), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"))
+    metadata_bytes = (json.dumps(asdict(metadata), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    marker_bytes = json.dumps(
+        {
+            "content_sha256": metadata.content_sha256,
+            "metadata_path": metadata_path.name,
+            "metadata_sha256": hashlib.sha256(metadata_bytes).hexdigest(),
+            "raw_path": raw_path.name,
+        },
+        sort_keys=True,
+        indent=2,
+    ).encode("utf-8") + b"\n"
+    _commit_transaction(raw_path, body, metadata_path, metadata_bytes, marker_path, marker_bytes)
     return raw_path
 
 
@@ -288,6 +346,23 @@ def _is_local_or_ip_literal(hostname: str) -> bool:
     return True
 
 
+def _is_strict_dns_hostname(hostname: str) -> bool:
+    """Allow canonical ASCII DNS names only; manifests can use IDNA punycode."""
+
+    normalized_hostname = hostname.casefold()
+    return (
+        len(normalized_hostname) <= 253
+        and not normalized_hostname.endswith(".")
+        and all(_DNS_LABEL.fullmatch(label) for label in normalized_hostname.split("."))
+    )
+
+
+def _looks_like_numeric_ip(hostname: str) -> bool:
+    """Catch inet_aton-compatible decimal, octal, and hexadecimal spellings."""
+
+    return all(_NUMERIC_IP_LABEL.fullmatch(label) for label in hostname.casefold().split("."))
+
+
 def _normalized_path_segments(path: str) -> tuple[str, ...]:
     """Decode and normalize route segments before matching account surfaces."""
 
@@ -299,7 +374,8 @@ def _normalized_path_segments(path: str) -> tuple[str, ...]:
         if next_decoded == decoded:
             break
         decoded = next_decoded
-    return tuple(normalize("NFKC", segment).casefold() for segment in decoded.split("/") if segment)
+    normalized_path = normalize("NFKC", decoded).casefold()
+    return tuple(segment for segment in normalized_path.split("/") if segment)
 
 
 def _prepare_output_directories(output_dir: Path) -> tuple[Path, Path]:
@@ -337,12 +413,11 @@ def _reject_symlink(path: Path) -> None:
         raise ValueError("crawler output files must not be symlinks")
 
 
-def _atomic_write(path: Path, content: bytes) -> None:
-    """Write one output file atomically without following an existing link."""
+def _stage_bytes(directory: Path, filename: str, content: bytes) -> Path:
+    """Write a complete temporary file in a verified direct directory."""
 
-    _reject_symlink(path)
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        prefix=f".{filename}.", suffix=".tmp", dir=directory
     )
     temporary_path = Path(temporary_name)
     try:
@@ -350,9 +425,57 @@ def _atomic_write(path: Path, content: bytes) -> None:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        _reject_symlinked_ancestors(path.parent)
-        _reject_symlink(path)
-        os.replace(temporary_path, path)
     except BaseException:
         temporary_path.unlink(missing_ok=True)
         raise
+    return temporary_path
+
+
+def _commit_transaction(
+    raw_path: Path,
+    raw_bytes: bytes,
+    metadata_path: Path,
+    metadata_bytes: bytes,
+    marker_path: Path,
+    marker_bytes: bytes,
+) -> None:
+    """Commit raw+metadata, then publish their completion marker last."""
+
+    staged_paths: list[Path] = []
+    try:
+        staged_raw = _stage_bytes(raw_path.parent, raw_path.name, raw_bytes)
+        staged_paths.append(staged_raw)
+        staged_metadata = _stage_bytes(metadata_path.parent, metadata_path.name, metadata_bytes)
+        staged_paths.append(staged_metadata)
+        # An old marker must not certify files while this transaction is in flight.
+        _remove_completion_marker(marker_path)
+        _replace_staged(staged_raw, raw_path)
+        staged_paths.remove(staged_raw)
+        _replace_staged(staged_metadata, metadata_path)
+        staged_paths.remove(staged_metadata)
+        staged_marker = _stage_bytes(marker_path.parent, marker_path.name, marker_bytes)
+        staged_paths.append(staged_marker)
+        _replace_staged(staged_marker, marker_path)
+        staged_paths.remove(staged_marker)
+    except BaseException:
+        _remove_completion_marker(marker_path)
+        raise
+    finally:
+        for staged_path in staged_paths:
+            staged_path.unlink(missing_ok=True)
+
+
+def _replace_staged(staged_path: Path, final_path: Path) -> None:
+    _reject_symlinked_ancestors(final_path.parent)
+    _reject_symlink(final_path)
+    os.replace(staged_path, final_path)
+
+
+def _remove_completion_marker(marker_path: Path) -> None:
+    _reject_symlink(marker_path)
+    if marker_path.exists():
+        marker_path.unlink()
+
+
+def _source_digest(source: Source) -> str:
+    return hashlib.sha256(validate_source(source).encode("utf-8")).hexdigest()
