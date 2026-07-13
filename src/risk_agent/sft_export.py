@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from risk_agent.contracts import Action, Evidence, Oracle, PolicyRule, Task
 from risk_agent.policy import render_active_policy
+from risk_agent.stores import CaseStore, EvidenceStore
 
 
 SYSTEM_SUFFIX = (
@@ -157,7 +158,7 @@ def _normalize_rule_detail(task: Task, action: Action, observation: object) -> s
     return _compact_json(rule.model_dump(mode="json"))
 
 
-def _normalize_case_results(action: Action, observation: object) -> str:
+def _normalize_case_results(case_store: CaseStore, action: Action, observation: object) -> str:
     if not isinstance(observation, list):
         raise ValueError("tool observation must contain sanitized case records only")
     top_k = action.arguments.get("top_k", 3)
@@ -175,10 +176,18 @@ def _normalize_case_results(action: Action, observation: object) -> str:
             raise ValueError("tool observation must not repeat case_id values")
         case_ids.add(case_id)
         normalized.append({"case_id": case_id, "text": text})
-    return _compact_json(normalized)
+    expected = case_store.search(action.arguments["query"], action.arguments.get("top_k", 3))
+    if normalized != expected:
+        raise ValueError("tool observation must match the deterministic case-store result")
+    return _compact_json(expected)
 
 
-def _normalize_evidence(task: Task, action: Action, observation: object) -> str:
+def _normalize_evidence(
+    task: Task,
+    evidence_store: EvidenceStore,
+    action: Action,
+    observation: object,
+) -> str:
     expected_keys = {"evidence_id", "asset_id", "kind", "content"}
     if not isinstance(observation, list):
         raise ValueError("tool observation evidence must match requested asset and kinds")
@@ -200,19 +209,31 @@ def _normalize_evidence(task: Task, action: Action, observation: object) -> str:
             raise ValueError("tool observation must not repeat evidence_id values")
         evidence_ids.add(evidence.evidence_id)
         normalized.append(evidence.model_dump(mode="json"))
-    return _compact_json(normalized)
+    expected = [
+        item.model_dump(mode="json")
+        for item in evidence_store.inspect(task.asset_id, set(action.arguments["kinds"]))
+    ]
+    if normalized != expected:
+        raise ValueError("tool observation must match the deterministic evidence-store result")
+    return _compact_json(expected)
 
 
-def _normalize_observation(task: Task, action: Action, raw_observation: object) -> str:
+def _normalize_observation(
+    task: Task,
+    case_store: CaseStore,
+    evidence_store: EvidenceStore,
+    action: Action,
+    raw_observation: object,
+) -> str:
     observation = _parse_json_observation(raw_observation)
     if _contains_forbidden_observation_field(observation):
         raise ValueError("tool observation must not contain an oracle field")
     if action.tool == "get_rule_detail":
         return _normalize_rule_detail(task, action, observation)
     if action.tool == "search_case":
-        return _normalize_case_results(action, observation)
+        return _normalize_case_results(case_store, action, observation)
     if action.tool == "inspect_evidence":
-        return _normalize_evidence(task, action, observation)
+        return _normalize_evidence(task, evidence_store, action, observation)
     raise ValueError("trajectory tool actions must not be final_decision")
 
 
@@ -234,16 +255,20 @@ def export_track_b(
     oracle: Oracle,
     action: str,
     observation: str,
+    case_store: CaseStore,
+    evidence_store: EvidenceStore,
 ) -> dict[str, list[dict[str, str]]]:
     """Export a one-tool-turn trajectory; retained for simple data generators."""
 
-    return export_trajectory(task, oracle, [(action, observation)])
+    return export_trajectory(task, oracle, [(action, observation)], case_store, evidence_store)
 
 
 def export_trajectory(
     task: Task,
     oracle: Oracle,
     steps: Sequence[tuple[str, str]],
+    case_store: CaseStore,
+    evidence_store: EvidenceStore,
 ) -> dict[str, list[dict[str, str]]]:
     """Export a bounded tool trajectory followed by exactly one final action."""
 
@@ -264,7 +289,13 @@ def export_trajectory(
         action = _parse_tool_action(action_text)
         messages.append({"role": "assistant", "content": _compact_json(action.model_dump(mode="json"))})
         messages.append(
-            {"role": "user", "content": f"Tool observation: {_normalize_observation(task, action, observation)}"}
+            {
+                "role": "user",
+                "content": (
+                    "Tool observation: "
+                    f"{_normalize_observation(task, case_store, evidence_store, action, observation)}"
+                ),
+            }
         )
     messages.append({"role": "assistant", "content": _final_action(oracle)})
     return {"messages": messages}

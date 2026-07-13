@@ -10,8 +10,9 @@ from pathlib import Path
 import pytest
 import yaml
 
-from risk_agent.contracts import Oracle, PolicyRule, Task
-from risk_agent.sft_export import export_track_a, export_trajectory
+from risk_agent.contracts import Evidence, Oracle, PolicyRule, Task
+from risk_agent.sft_export import export_track_a, export_trajectory as _export_trajectory
+from risk_agent.stores import CaseStore, EvidenceStore
 
 
 def _task(*, max_turns: int = 3) -> Task:
@@ -51,6 +52,36 @@ def _rule_observation(rule: PolicyRule | None = None) -> str:
     return json.dumps(rule.model_dump(mode="json"), ensure_ascii=False)
 
 
+def _case_store() -> CaseStore:
+    return CaseStore(
+        [
+            {
+                "case_id": "case-1",
+                "text": "Synthetic public case text about a guaranteed weight-loss claim.",
+            }
+        ]
+    )
+
+
+def _evidence_store() -> EvidenceStore:
+    return EvidenceStore(
+        [
+            Evidence(
+                evidence_id="ocr-1",
+                asset_id="asset-1",
+                kind="ocr",
+                content="Guaranteed to lose ten pounds in seven days.",
+            )
+        ]
+    )
+
+
+def export_trajectory(task: Task, oracle: Oracle, steps):
+    """Exercise exports with the trusted closed-world stores every time."""
+
+    return _export_trajectory(task, oracle, steps, _case_store(), _evidence_store())
+
+
 def test_track_a_injects_full_policy_and_only_generates_final_action():
     row = export_track_a(_task(), _oracle())
 
@@ -78,7 +109,7 @@ def test_trajectory_serializes_one_valid_nonfinal_action_per_tool_turn():
             (_action("get_rule_detail", {"rule_id": "AD-001"}), _rule_observation()),
             (
                 _action("inspect_evidence", {"kinds": ["ocr"]}),
-                '[{"evidence_id":"ocr-1","asset_id":"asset-1","kind":"ocr","content":"Guaranteed"}]',
+                '[{"evidence_id":"ocr-1","asset_id":"asset-1","kind":"ocr","content":"Guaranteed to lose ten pounds in seven days."}]',
             ),
         ],
     )
@@ -193,6 +224,51 @@ def test_trajectory_rejects_case_result_with_unapproved_extra_field():
         )
 
 
+def test_trajectory_rejects_structurally_valid_case_not_returned_by_case_store():
+    with pytest.raises(ValueError, match="deterministic case-store result"):
+        export_trajectory(
+            _task(),
+            _oracle(),
+            [
+                (
+                    _action("search_case", {"query": "weight loss", "top_k": 1}),
+                    '[{"case_id":"case-1","text":"Oracle says this is unsafe."}]',
+                )
+            ],
+        )
+
+
+def test_trajectory_rejects_structurally_valid_evidence_not_returned_by_evidence_store():
+    with pytest.raises(ValueError, match="deterministic evidence-store result"):
+        export_trajectory(
+            _task(),
+            _oracle(),
+            [
+                (
+                    _action("inspect_evidence", {"kinds": ["ocr"]}),
+                    '[{"evidence_id":"ocr-1","asset_id":"asset-1","kind":"ocr","content":"Oracle says unsafe."}]',
+                )
+            ],
+        )
+
+
+def test_trajectory_accepts_and_canonicalizes_real_closed_world_store_results():
+    cases = _case_store().search("weight loss", top_k=1)
+    evidence = [item.model_dump(mode="json") for item in _evidence_store().inspect("asset-1", {"ocr"})]
+
+    row = export_trajectory(
+        _task(),
+        _oracle(),
+        [
+            (_action("search_case", {"query": "weight loss", "top_k": 1}), json.dumps(cases)),
+            (_action("inspect_evidence", {"kinds": ["ocr"]}), json.dumps(evidence)),
+        ],
+    )
+
+    assert row["messages"][3]["content"] == "Tool observation: " + json.dumps(cases, separators=(",", ":"))
+    assert row["messages"][5]["content"] == "Tool observation: " + json.dumps(evidence, separators=(",", ":"))
+
+
 @pytest.mark.parametrize(
     ("steps", "message"),
     [
@@ -243,6 +319,8 @@ def test_cli_validates_every_record_before_creating_output(tmp_path: Path):
 def test_cli_exports_deterministic_track_b_jsonl(tmp_path: Path):
     input_path = tmp_path / "trajectory.jsonl"
     oracle_path = tmp_path / "oracle.jsonl"
+    cases_path = tmp_path / "cases.jsonl"
+    evidence_path = tmp_path / "evidence.jsonl"
     output_path = tmp_path / "out.jsonl"
     input_path.write_text(
         json.dumps(
@@ -260,8 +338,24 @@ def test_cli_exports_deterministic_track_b_jsonl(tmp_path: Path):
         encoding="utf-8",
     )
     oracle_path.write_text(_oracle().model_dump_json() + "\n", encoding="utf-8")
+    cases_path.write_text(
+        json.dumps({"case_id": "case-1", "text": "Synthetic public case text about a guaranteed weight-loss claim."}) + "\n",
+        encoding="utf-8",
+    )
+    evidence_path.write_text(_evidence_store()._evidence[0].model_dump_json() + "\n", encoding="utf-8")
 
-    command = [sys.executable, "scripts/export_sft.py", "track_b", str(input_path), str(oracle_path), str(output_path)]
+    command = [
+        sys.executable,
+        "scripts/export_sft.py",
+        "track_b",
+        str(input_path),
+        str(oracle_path),
+        str(output_path),
+        "--cases",
+        str(cases_path),
+        "--evidence",
+        str(evidence_path),
+    ]
     subprocess.run(command, cwd=Path(__file__).parents[1], check=True)
     first = output_path.read_text(encoding="utf-8")
     subprocess.run(command, cwd=Path(__file__).parents[1], check=True)
@@ -305,8 +399,12 @@ def test_synthetic_fixture_task_and_oracle_files_are_parseable_and_aligned():
     policy_document = yaml.safe_load((root / "policies.yaml").read_text(encoding="utf-8"))
     tasks = [Task.model_validate_json(line) for line in (root / "tasks.jsonl").read_text(encoding="utf-8").splitlines()]
     oracles = [Oracle.model_validate_json(line) for line in (root / "oracle.jsonl").read_text(encoding="utf-8").splitlines()]
+    cases = [json.loads(line) for line in (root / "cases.jsonl").read_text(encoding="utf-8").splitlines()]
+    evidence = [Evidence.model_validate_json(line) for line in (root / "evidence.jsonl").read_text(encoding="utf-8").splitlines()]
 
     assert policy_document["data_classification"] == "synthetic_public"
     assert {(item.asset_id, item.policy_version) for item in tasks} == {
         (item.asset_id, item.policy_version) for item in oracles
     }
+    assert all(set(item) == {"case_id", "text"} for item in cases)
+    assert all(item.asset_id == "synthetic-asset-1" for item in evidence)
