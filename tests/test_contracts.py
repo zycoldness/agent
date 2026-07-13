@@ -1,6 +1,7 @@
 """Bootstrap package contract tests."""
 
 import json
+import math
 
 import pytest
 from pydantic import ValidationError
@@ -66,6 +67,12 @@ def test_action_rejects_non_object_arguments() -> None:
 def test_action_rejects_non_json_mutable_argument_values() -> None:
     with pytest.raises(ValidationError):
         Action.model_validate({"tool": "search_case", "arguments": {"bad": {1}}})
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_action_rejects_nonfinite_float_argument_values(value: float) -> None:
+    with pytest.raises(ValidationError):
+        Action.model_validate({"tool": "search_case", "arguments": {"score": value}})
 
 
 def test_decision_preserves_evidence_ids() -> None:

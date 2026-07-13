@@ -1,5 +1,6 @@
 """Immutable data contracts for policy-driven content-risk assessment."""
 
+import math
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, Literal
@@ -10,7 +11,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_valid
 def _freeze(value: Any) -> Any:
     """Recursively freeze JSON-compatible tool arguments."""
 
-    if value is None or isinstance(value, (str, int, float, bool)):
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        raise TypeError("Action arguments must contain finite floating-point values")
+    if value is None or isinstance(value, (str, int, bool)):
         return value
     if isinstance(value, Mapping):
         return MappingProxyType({key: _freeze(item) for key, item in value.items()})
