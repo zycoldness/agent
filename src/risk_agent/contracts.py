@@ -2,7 +2,35 @@
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class FrozenDict(dict[str, Any]):
+    """A dictionary that cannot be mutated after it is constructed."""
+
+    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("FrozenDict is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __ior__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+
+def _freeze(value: Any) -> Any:
+    """Recursively replace mutable containers with immutable equivalents."""
+
+    if isinstance(value, dict):
+        return FrozenDict({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze(item) for item in value)
+    return value
 
 
 class PolicyRule(BaseModel):
@@ -61,6 +89,13 @@ class Action(BaseModel):
 
     tool: Literal["get_rule_detail", "search_case", "inspect_evidence", "final_decision"]
     arguments: dict[str, Any]
+
+    @field_validator("arguments", mode="after")
+    @classmethod
+    def freeze_arguments(cls, arguments: dict[str, Any]) -> FrozenDict:
+        """Make tool arguments deeply immutable after type validation."""
+
+        return _freeze(arguments)
 
 
 class Decision(BaseModel):

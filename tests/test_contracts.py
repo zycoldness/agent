@@ -21,6 +21,23 @@ def test_action_parses_case_search_json() -> None:
     assert action.arguments == {"query": "减肥"}
 
 
+def test_action_arguments_are_immutable() -> None:
+    action = Action(tool="search_case", arguments={"query": "减肥"})
+
+    with pytest.raises(TypeError):
+        action.arguments["query"] = "changed"
+
+
+def test_action_rejects_unknown_tool() -> None:
+    with pytest.raises(ValidationError):
+        Action(tool="unknown", arguments={})
+
+
+def test_action_rejects_non_object_arguments() -> None:
+    with pytest.raises(ValidationError):
+        Action(tool="search_case", arguments="减肥")
+
+
 def test_decision_preserves_evidence_ids() -> None:
     decision = Decision(
         label="unsafe",
