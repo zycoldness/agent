@@ -100,6 +100,20 @@ def test_trajectory_rejects_oracle_fields_in_a_tool_observation():
         )
 
 
+def test_trajectory_rejects_nested_oracle_object_in_a_tool_observation():
+    with pytest.raises(ValueError, match="oracle field"):
+        export_trajectory(
+            _task(),
+            _oracle(),
+            [
+                (
+                    _action("search_case", {"query": "weight loss", "top_k": 1}),
+                    '{"case_id":"case-1","oracle":{}}',
+                ),
+            ],
+        )
+
+
 @pytest.mark.parametrize(
     ("steps", "message"),
     [

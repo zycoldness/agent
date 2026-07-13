@@ -16,7 +16,9 @@ SYSTEM_SUFFIX = (
     "Return exactly one JSON action on every assistant turn. "
     'The only valid format is {"tool": "...", "arguments": {...}}.'
 )
-_ORACLE_ONLY_OBSERVATION_KEYS = frozenset({"label", "evidence_ids", "risk_level", "next_action"})
+_ORACLE_ONLY_OBSERVATION_KEYS = frozenset(
+    {"oracle", "label", "evidence_ids", "risk_level", "next_action"}
+)
 _ALLOWED_EVIDENCE_KINDS = frozenset({"ocr", "asr", "frame", "metadata", "case"})
 
 
