@@ -201,6 +201,38 @@ def test_final_decision_scores_label_rule_and_evidence_overlap() -> None:
     assert result.reward == 2.0
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {
+            "label": "unsafe",
+            "rule_id": "AD-1",
+            "evidence_ids": [],
+            "confidence": True,
+        },
+        {
+            "label": "unsafe",
+            "rule_id": "AD-1",
+            "evidence_ids": [],
+            "confidence": "0.5",
+        },
+        {
+            "label": "unsafe",
+            "rule_id": "AD-1",
+            "evidence_ids": [],
+            "confidence": 0.5,
+            "unexpected": "must be rejected",
+        },
+    ],
+)
+def test_final_decision_rejects_coercions_and_unknown_fields(arguments: dict[str, object]) -> None:
+    result = make_env().step(action("final_decision", arguments))
+
+    assert result.done is True
+    assert result.info["status"] == "invalid_action"
+    assert_no_oracle_contents(result)
+
+
 def test_tool_on_last_turn_ends_with_deterministic_non_oracle_status() -> None:
     env = make_env(max_turns=2)
     env.reset()

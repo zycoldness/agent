@@ -30,6 +30,17 @@ class RiskEnvironment:
     _TOOL_COST = -0.08
     _INVALID_ACTION_COST = -0.5
     _ALLOWED_EVIDENCE_KINDS = frozenset({"ocr", "asr", "frame", "metadata", "case"})
+    _DECISION_ARGUMENT_KEYS = frozenset(
+        {
+            "label",
+            "rule_id",
+            "evidence_ids",
+            "confidence",
+            "risk_level",
+            "route",
+            "next_action",
+        }
+    )
 
     def __init__(
         self,
@@ -138,8 +149,10 @@ class RiskEnvironment:
         )
 
     def _finalize(self, arguments: Mapping[str, Any]) -> StepResult:
+        if not set(arguments).issubset(self._DECISION_ARGUMENT_KEYS):
+            return self._invalid_action()
         try:
-            decision = Decision.model_validate(arguments)
+            decision = Decision.model_validate(dict(arguments), strict=True)
         except ValidationError:
             return self._invalid_action()
 
