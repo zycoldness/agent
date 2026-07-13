@@ -37,6 +37,7 @@
 | 规则新增、删除、改写、豁免反事实对 | 已实现 | `src/risk_agent/counterfactuals.py` |
 | label、policy-following、rule、evidence 评测 | 已实现 | `src/risk_agent/evaluator.py` |
 | 受控公开来源采集与原子落盘 | 已实现 | `src/risk_agent/crawler.py` |
+| MM-SafetyBench / 监管案例公开素材规范化与审计清单 | 已实现 | `src/risk_agent/public_data.py`、`docs/public-data-card.md` |
 | Track A / Track B messages JSONL 导出 | 已实现 | `src/risk_agent/sft_export.py` |
 | 有预算、可审计的 Gemini teacher 候选生成 | 已实现 | `src/risk_agent/teacher.py`、`synthesis.py` |
 | 官方 SingGuard 模型 inference / fast、fast-slow、slow 适配 | **尚未实现** | 路线图 |
@@ -202,10 +203,20 @@ python scripts/fetch_sources.py configs/sources.example.yaml \
 ```text
 data/raw/<source-hash>.raw
 data/raw/metadata/<source-hash>.json
-data/raw/<source-hash>.complete.json
+data/raw/metadata/<source-hash>.complete.json
 ```
 
 下游必须用 `risk_agent.crawler.is_complete_artifact(...)` 校验完成标记和哈希。下载结果仍处于隔离区，不能未经条款审查、去标识化、结构化转换和人工批准就进入 SFT/RL 数据。
+
+要先用公开数据跑通素材链路，可复制 `configs/public_sources.example.yaml`，手工准备 MM-SafetyBench 本地 checkout/图片，并将监管页面先交给上面的受控 crawler：
+
+```bash
+python scripts/import_public_data.py \
+  configs/public_sources.local.yaml \
+  data/processed/public_seed
+```
+
+该命令不访问网络，输出 `public_assets.jsonl`、`sanitized_cases.jsonl`、`import_report.json` 和最后提交的 `import_manifest.json`。MM-SafetyBench 默认仅作 `smoke_only` 研究用途，不把 scenario 转成业务标签；监管案例在条款和 license 均获批前保持 `quarantined`。这批公开数据只用于跑通 pipeline/OOD 检查，不直接生成 `Task` 或 `Oracle`，更不等于 SingGuard 官方训练集。完整字段、许可证边界和校验方式见 `docs/public-data-card.md`。
 
 ## 测试
 
@@ -216,7 +227,7 @@ python -m pytest -q
 当前基线为：
 
 ```text
-175 passed, 4 skipped
+199 passed, 4 skipped
 ```
 
 4 个 skip 来自 Windows 环境缺少稳定的符号链接权限，对应 crawler 的 symlink 防护测试；在具备 symlink 权限的平台上会执行。测试不访问 Gemini，也不运行真实训练。

@@ -1,0 +1,61 @@
+# Copy this file, replace every local path, and record the actual retrieval time.
+# This importer never downloads MM-SafetyBench images or regulatory pages.
+version: 1
+max_records: 1000
+
+mm_safety_bench:
+  repo_root: /path/to/MM-SafetyBench
+  source_url: https://github.com/isXinLiu/MM-SafetyBench
+  retrieved_at: "2026-07-13T00:00:00Z"
+  license_id: CC-BY-NC-4.0
+  usage_scope: smoke_only
+  use_tiny: true
+  allow_missing_media: true
+  scenario_allowlist:
+    - 01-Illegal_Activitiy
+    - 02-HateSpeech
+    - 03-Malware_Generation
+    - 04-Physical_Harm
+    - 05-EconomicHarm
+    - 06-Fraud
+    - 07-Sex
+    - 08-Political_Lobbying
+    - 09-Privacy_Violence
+    - 10-Legal_Opinion
+    - 11-Financial_Advice
+    - 12-Health_Consultation
+    - 13-Gov_Decision
+
+regulatory_cases:
+  - input_type: crawler_artifact
+    crawler_output_dir: data/raw
+    source_dataset: SAMR-public-cases
+    license_id: RIGHTS-REVIEW-REQUIRED
+    usage_scope: research_only
+    license_review_status: review_required
+    terms_review_status: review_required
+    max_records: 100
+    source:
+      url: https://www.samr.gov.cn/xw/zj/art/2026/art_b7802ad0a4dc407ea1b10a8a53a5792f.html
+      allowed_domains:
+        - www.samr.gov.cn
+      source_type: public_regulatory_case
+      license: RIGHTS-REVIEW-REQUIRED
+      terms_review: review_required
+
+  - input_type: crawler_artifact
+    crawler_output_dir: data/raw
+    source_dataset: CAC-public-cases
+    license_id: RIGHTS-REVIEW-REQUIRED
+    usage_scope: research_only
+    license_review_status: review_required
+    terms_review_status: review_required
+    max_records: 100
+    source:
+      url: https://www.cac.gov.cn/2024-10/09/c_1730163316422064.htm
+      allowed_domains:
+        - www.cac.gov.cn
+      source_type: public_regulatory_case
+      license: RIGHTS-REVIEW-REQUIRED
+      terms_review: review_required
+
