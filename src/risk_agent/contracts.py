@@ -1,36 +1,22 @@
 """Immutable data contracts for policy-driven content-risk assessment."""
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-class FrozenDict(dict[str, Any]):
-    """A dictionary that cannot be mutated after it is constructed."""
-
-    def _immutable(self, *args: Any, **kwargs: Any) -> None:
-        raise TypeError("FrozenDict is immutable")
-
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    __ior__ = _immutable
-    clear = _immutable
-    pop = _immutable
-    popitem = _immutable
-    setdefault = _immutable
-    update = _immutable
-
-
 def _freeze(value: Any) -> Any:
-    """Recursively replace mutable containers with immutable equivalents."""
+    """Recursively freeze JSON-compatible tool arguments."""
 
-    if isinstance(value, dict):
-        return FrozenDict({key: _freeze(item) for key, item in value.items()})
-    if isinstance(value, list):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
         return tuple(_freeze(item) for item in value)
-    if isinstance(value, tuple):
-        return tuple(_freeze(item) for item in value)
-    return value
+    raise TypeError(f"Action arguments must contain JSON-compatible values, not {type(value).__name__}")
 
 
 class PolicyRule(BaseModel):
@@ -88,14 +74,17 @@ class Action(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     tool: Literal["get_rule_detail", "search_case", "inspect_evidence", "final_decision"]
-    arguments: dict[str, Any]
+    arguments: Mapping[str, Any]
 
     @field_validator("arguments", mode="after")
     @classmethod
-    def freeze_arguments(cls, arguments: dict[str, Any]) -> FrozenDict:
+    def freeze_arguments(cls, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
         """Make tool arguments deeply immutable after type validation."""
 
-        return _freeze(arguments)
+        try:
+            return _freeze(arguments)
+        except TypeError as error:
+            raise ValueError(str(error)) from error
 
 
 class Decision(BaseModel):

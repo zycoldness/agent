@@ -28,6 +28,20 @@ def test_action_arguments_are_immutable() -> None:
         action.arguments["query"] = "changed"
 
 
+def test_action_nested_arguments_are_immutable() -> None:
+    action = Action(tool="search_case", arguments={"filters": {"query": "减肥"}})
+
+    with pytest.raises(TypeError):
+        action.arguments["filters"]["query"] = "changed"
+
+
+def test_action_list_arguments_are_immutable_tuples() -> None:
+    action = Action(tool="search_case", arguments={"queries": ["减肥"]})
+
+    with pytest.raises(AttributeError):
+        action.arguments["queries"].append("美容")
+
+
 def test_action_rejects_unknown_tool() -> None:
     with pytest.raises(ValidationError):
         Action(tool="unknown", arguments={})
@@ -36,6 +50,11 @@ def test_action_rejects_unknown_tool() -> None:
 def test_action_rejects_non_object_arguments() -> None:
     with pytest.raises(ValidationError):
         Action(tool="search_case", arguments="减肥")
+
+
+def test_action_rejects_non_json_mutable_argument_values() -> None:
+    with pytest.raises(ValidationError):
+        Action.model_validate({"tool": "search_case", "arguments": {"bad": {1}}})
 
 
 def test_decision_preserves_evidence_ids() -> None:
