@@ -10,6 +10,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 import tempfile
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -40,6 +41,8 @@ _MM_ITEM_ID_PATTERN = re.compile(r"[0-9]+\Z")
 _PLACEHOLDER_LICENSE_IDS = frozenset({"", "unknown", "not_reviewed", "not-reviewed", "tbd"})
 _REVIEW_STATUSES = frozenset({"pending", "approved", "review_required", "rejected"})
 _CONTENT_REVIEW_STATUSES = frozenset({"pending", "approved", "rejected"})
+ReviewStatus = Literal["pending", "approved", "review_required", "rejected"]
+ContentReviewStatus = Literal["pending", "approved", "rejected"]
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -67,7 +70,7 @@ _UniqueKeyLoader.add_constructor(
 class PublicAsset(BaseModel):
     """A public source item without an inferred risk label or Oracle."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     source_dataset: str
     source_type: str = "benchmark"
@@ -115,7 +118,7 @@ class PublicAsset(BaseModel):
 class SanitizedCase(BaseModel):
     """A factual public-case snippet with source and release provenance."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     case_id: str
     text: str
@@ -129,9 +132,9 @@ class SanitizedCase(BaseModel):
     data_classification: Literal["public"] = "public"
     license_id: str
     usage_scope: Literal["smoke_only", "research_only"]
-    license_review_status: Literal["pending", "approved", "review_required", "rejected"]
-    terms_review_status: Literal["pending", "approved", "review_required", "rejected"]
-    content_review_status: Literal["pending", "approved", "rejected"]
+    license_review_status: ReviewStatus
+    terms_review_status: ReviewStatus
+    content_review_status: ContentReviewStatus
     publication_status: Literal["published", "quarantined"]
 
     @field_validator("content_hash", "source_content_hash", "source_item_id")
@@ -169,9 +172,9 @@ def import_regulatory_html(
     retrieved_at: str,
     license_id: str,
     usage_scope: Literal["smoke_only", "research_only"],
-    license_review_status: Literal["approved", "review_required", "rejected"],
-    terms_review_status: Literal["approved", "review_required", "rejected"],
-    content_review_status: Literal["pending", "approved", "rejected"] = "pending",
+    license_review_status: ReviewStatus,
+    terms_review_status: ReviewStatus,
+    content_review_status: ContentReviewStatus = "pending",
     source_type: str = "public_regulatory_case",
     max_records: int,
 ) -> tuple[SanitizedCase, ...]:
@@ -248,9 +251,9 @@ def import_regulatory_crawler_artifact(
     source_dataset: str,
     license_id: str | None = None,
     usage_scope: Literal["smoke_only", "research_only"] | None = None,
-    license_review_status: Literal["approved", "review_required", "rejected"] | None = None,
-    terms_review_status: Literal["approved", "review_required", "rejected"] | None = None,
-    content_review_status: Literal["pending", "approved", "rejected"] | None = None,
+    license_review_status: ReviewStatus | None = None,
+    terms_review_status: ReviewStatus | None = None,
+    content_review_status: ContentReviewStatus | None = None,
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
     budget: ReadBudget | None = None,
@@ -340,6 +343,7 @@ def run_public_data_import(config_path: Path, output_dir: Path) -> dict[str, Any
     max_total_bytes = _validate_byte_limit(document.get("max_total_bytes"), "max_total_bytes")
     if max_file_bytes > max_total_bytes:
         raise ValueError("max_file_bytes must not exceed max_total_bytes")
+    regulatory_rows = _validate_regulatory_config_rows(document.get("regulatory_cases", []))
     read_budget = ReadBudget(max_file_bytes, max_total_bytes)
     input_paths = _config_input_paths(config_path, document)
     _reject_input_output_overlap(input_paths, output_dir)
@@ -399,13 +403,13 @@ def run_public_data_import(config_path: Path, output_dir: Path) -> dict[str, Any
         )
 
     cases: list[SanitizedCase] = []
-    regulatory_rows = document.get("regulatory_cases", [])
-    if not isinstance(regulatory_rows, list):
-        raise ValueError("regulatory_cases must be a list")
+    truncated_sources: list[str] = []
+    skipped_sources: list[str] = []
     for index, value in enumerate(regulatory_rows):
         remaining_records = max_records - len(assets) - len(cases)
         if remaining_records <= 0:
-            break
+            skipped_sources.append(_required_string(value, "source_dataset"))
+            continue
         row = _require_mapping(value, f"regulatory_cases[{index}]")
         _reject_unknown_fields(
             row,
@@ -430,6 +434,8 @@ def run_public_data_import(config_path: Path, output_dir: Path) -> dict[str, Any
         )
         row_limit = row.get("max_records", max_records)
         _validate_record_cap(row_limit)
+        if row_limit > remaining_records:
+            truncated_sources.append(_required_string(row, "source_dataset"))
         row_limit = min(row_limit, remaining_records)
         common = {
             "source_dataset": _required_string(row, "source_dataset"),
@@ -498,7 +504,13 @@ def run_public_data_import(config_path: Path, output_dir: Path) -> dict[str, Any
         raise ValueError("normalized records exceed configured max_records")
     assets.sort(key=lambda item: (item.source_dataset, item.source_item_id))
     cases.sort(key=lambda item: item.case_id)
-    report = _build_import_report(assets, cases)
+    report = _build_import_report(
+        assets,
+        cases,
+        record_limit=max_records,
+        truncated_sources=truncated_sources,
+        skipped_sources=skipped_sources,
+    )
     _publish_public_data_bundle(output_dir, assets, cases, report)
     return report
 
@@ -743,11 +755,135 @@ def _load_public_data_config(path: Path) -> dict[str, Any]:
     }
     if unknown:
         raise ValueError(f"unknown public data config fields: {', '.join(sorted(map(str, unknown)))}")
-    if document.get("version") != 1:
-        raise ValueError("public data config version must be 1")
+    if document.get("version") == 1:
+        raise ValueError(
+            "public data config version 1 is no longer accepted; migrate to version 2 "
+            "with discriminated regulatory input fields"
+        )
+    if document.get("version") != 2:
+        raise ValueError("public data config version must be 2")
     if "max_records" not in document:
         raise ValueError("public data config requires max_records")
     return document
+
+
+_REGULATORY_COMMON_FIELDS = {
+    "input_type",
+    "source_dataset",
+    "license_id",
+    "usage_scope",
+    "license_review_status",
+    "terms_review_status",
+    "content_review_status",
+    "max_records",
+}
+_LOCAL_REGULATORY_FIELDS = _REGULATORY_COMMON_FIELDS | {
+    "local_html_path",
+    "source_type",
+    "source_url",
+    "allowed_domains",
+    "retrieved_at",
+}
+_CRAWLER_REGULATORY_FIELDS = _REGULATORY_COMMON_FIELDS | {
+    "crawler_output_dir",
+    "source",
+}
+_CRAWLER_SOURCE_FIELDS = {
+    "url",
+    "allowed_domains",
+    "source_type",
+    "license",
+    "license_review_status",
+    "terms_review_status",
+    "content_review_status",
+}
+
+
+def _validate_regulatory_config_rows(value: Any) -> tuple[Mapping[str, Any], ...]:
+    """Validate every row before a global record cap can skip its execution."""
+
+    if not isinstance(value, list):
+        raise ValueError("regulatory_cases must be a list")
+    rows: list[Mapping[str, Any]] = []
+    for index, item in enumerate(value):
+        name = f"regulatory_cases[{index}]"
+        row = _require_mapping(item, name)
+        input_type = _required_string(row, "input_type")
+        if input_type == "local_html":
+            forbidden = set(row) - _LOCAL_REGULATORY_FIELDS
+            if forbidden:
+                raise ValueError(
+                    f"fields not allowed for local_html in {name}: "
+                    f"{', '.join(sorted(map(str, forbidden)))}"
+                )
+        elif input_type == "crawler_artifact":
+            forbidden = set(row) - _CRAWLER_REGULATORY_FIELDS
+            if forbidden:
+                raise ValueError(
+                    f"fields not allowed for crawler_artifact in {name}: "
+                    f"{', '.join(sorted(map(str, forbidden)))}"
+                )
+        else:
+            raise ValueError("regulatory input_type must be local_html or crawler_artifact")
+
+        row_limit = row.get("max_records")
+        _validate_record_cap(row_limit)
+        _required_string(row, "source_dataset")
+        license_id = _required_string(row, "license_id")
+        usage_scope = _required_string(row, "usage_scope")
+        license_status = _required_string(row, "license_review_status")
+        terms_status = _required_string(row, "terms_review_status")
+        content_status = _required_string(row, "content_review_status")
+        if license_id.casefold() in _PLACEHOLDER_LICENSE_IDS:
+            raise ValueError("license_id must be explicit and governed")
+        if usage_scope not in {"smoke_only", "research_only"}:
+            raise ValueError("usage_scope must be smoke_only or research_only")
+        if license_status not in _REVIEW_STATUSES or terms_status not in _REVIEW_STATUSES:
+            raise ValueError(f"invalid review status in {name}")
+        if content_status not in _CONTENT_REVIEW_STATUSES:
+            raise ValueError(f"invalid content_review_status in {name}")
+
+        if input_type == "local_html":
+            _required_string(row, "local_html_path")
+            source_url = _required_string(row, "source_url")
+            allowed_domains = _required_string_tuple(row, "allowed_domains")
+            retrieved_at = _required_string(row, "retrieved_at")
+            source_type = row.get("source_type", "public_regulatory_case")
+            if not isinstance(source_type, str) or not source_type.strip():
+                raise ValueError("source_type must be a non-empty string")
+            validate_source(Source(url=source_url, allowed_domains=allowed_domains))
+            _validate_timestamp(retrieved_at)
+        else:
+            _required_string(row, "crawler_output_dir")
+            source_row = _require_mapping(row.get("source"), f"{name}.source")
+            _reject_unknown_fields(source_row, _CRAWLER_SOURCE_FIELDS, f"{name}.source")
+            if set(source_row) != _CRAWLER_SOURCE_FIELDS:
+                missing = _CRAWLER_SOURCE_FIELDS - set(source_row)
+                raise ValueError(
+                    f"missing fields in {name}.source: {', '.join(sorted(missing))}"
+                )
+            source = Source(
+                url=_required_string(source_row, "url"),
+                allowed_domains=_required_string_tuple(source_row, "allowed_domains"),
+                source_type=_required_string(source_row, "source_type"),
+                license=_required_string(source_row, "license"),
+                license_review_status=_required_string(source_row, "license_review_status"),
+                terms_review_status=_required_string(source_row, "terms_review_status"),
+                content_review_status=_required_string(source_row, "content_review_status"),
+            )
+            validate_source(source)
+            expected = {
+                "license_id": source.license,
+                "license_review_status": source.license_review_status,
+                "terms_review_status": source.terms_review_status,
+                "content_review_status": source.content_review_status,
+            }
+            if any(row[field] != expected[field] for field in expected):
+                raise ValueError(f"duplicated governance fields disagree in {name}")
+            if usage_scope != "research_only":
+                raise ValueError("crawler_artifact usage_scope must be research_only")
+        rows.append(row)
+    return tuple(rows)
 
 
 def _reject_unknown_fields(
@@ -838,7 +974,12 @@ def _reject_duplicate_records(
 
 
 def _build_import_report(
-    assets: list[PublicAsset], cases: list[SanitizedCase]
+    assets: list[PublicAsset],
+    cases: list[SanitizedCase],
+    *,
+    record_limit: int,
+    truncated_sources: list[str],
+    skipped_sources: list[str],
 ) -> dict[str, Any]:
     licenses = {
         (
@@ -851,6 +992,8 @@ def _build_import_report(
         )
         for item in [*assets, *cases]
     }
+    unique_truncated = list(dict.fromkeys(truncated_sources))
+    unique_skipped = list(dict.fromkeys(skipped_sources))
     return {
         "schema_version": 1,
         "public_asset_count": len(assets),
@@ -858,6 +1001,10 @@ def _build_import_report(
         "missing_media_count": sum(item.media_status == "missing" for item in assets),
         "published_case_count": sum(item.publication_status == "published" for item in cases),
         "quarantined_case_count": sum(item.publication_status == "quarantined" for item in cases),
+        "record_limit": record_limit,
+        "truncated": bool(unique_truncated or unique_skipped),
+        "truncated_sources": unique_truncated,
+        "skipped_sources": unique_skipped,
         "official_evaluation_split": False,
         "split_note": (
             "split_group is deterministic leakage-control metadata; it is not an official "
@@ -906,6 +1053,13 @@ def _publish_public_data_bundle(
     output_dir = output_dir.absolute()
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     staged_dir = Path(tempfile.mkdtemp(prefix=".public-data-", dir=output_dir.parent))
+    reserved_identity: os.stat_result | None = None
+    owned_filenames = {
+        "public_assets.jsonl",
+        "sanitized_cases.jsonl",
+        "import_report.json",
+        "import_manifest.json",
+    }
     try:
         payloads = {
             "public_assets.jsonl": _jsonl_bytes(assets),
@@ -930,16 +1084,61 @@ def _publish_public_data_bundle(
             "files": files,
             "missing_media_count": report["missing_media_count"],
             "license_statuses": report["licenses"],
+            "truncation": {
+                "record_limit": report["record_limit"],
+                "truncated": report["truncated"],
+                "truncated_sources": report["truncated_sources"],
+                "skipped_sources": report["skipped_sources"],
+            },
         }
         (staged_dir / "import_manifest.json").write_bytes(_json_bytes(manifest))
-        if output_dir.exists() or output_dir.is_symlink():
-            raise FileExistsError("public data destination already exists")
-        os.rename(staged_dir, output_dir)
+        # The mkdir itself is the no-replace reservation.  The early existence
+        # check is only a friendly error; it is never the authority here.
+        os.mkdir(output_dir)
+        reserved_identity = os.stat(output_dir, follow_symlinks=False)
+        for filename in (
+            "public_assets.jsonl",
+            "sanitized_cases.jsonl",
+            "import_report.json",
+            "import_manifest.json",
+        ):
+            os.replace(staged_dir / filename, output_dir / filename)
     except BaseException:
+        if reserved_identity is not None:
+            _cleanup_owned_output_reservation(
+                output_dir,
+                reserved_identity,
+                owned_filenames,
+            )
         raise
     finally:
         if staged_dir.exists():
             shutil.rmtree(staged_dir, ignore_errors=True)
+
+
+def _cleanup_owned_output_reservation(
+    output_dir: Path,
+    reserved_identity: os.stat_result,
+    owned_filenames: set[str],
+) -> None:
+    """Remove only a reservation that is still ours and contains no foreign entry."""
+
+    try:
+        current_identity = os.stat(output_dir, follow_symlinks=False)
+        if not stat.S_ISDIR(current_identity.st_mode) or not os.path.samestat(
+            reserved_identity, current_identity
+        ):
+            return
+        entries = list(output_dir.iterdir())
+        if any(entry.name not in owned_filenames for entry in entries):
+            return
+        for entry in entries:
+            entry.unlink()
+        os.rmdir(output_dir)
+    except OSError:
+        # Cleanup is best-effort and fail-closed: a directory whose identity or
+        # contents changed is left in place without a completion manifest.
+        return
 
 
 def _validate_record_cap(max_records: Any) -> None:

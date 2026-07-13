@@ -15,6 +15,7 @@ from risk_agent.crawler import (
     fetch,
     is_complete_artifact,
     load_manifest,
+    metadata_path_for,
     read_complete_artifact,
     validate_source,
 )
@@ -174,6 +175,159 @@ def test_complete_artifact_reader_enforces_file_and_total_byte_limits(tmp_path):
         read_complete_artifact(source, tmp_path, max_file_bytes=8, max_total_bytes=1024)
     with pytest.raises(ValueError, match="total byte limit"):
         read_complete_artifact(source, tmp_path, max_file_bytes=1024, max_total_bytes=32)
+
+
+def _rewrite_metadata_and_marker(source: Source, output_dir: Path, metadata_bytes: bytes) -> None:
+    digest = hashlib.sha256(source.url.encode("utf-8")).hexdigest()
+    metadata_path = output_dir / "metadata" / f"{digest}.json"
+    marker_path = completion_path_for(source, output_dir)
+    metadata_path.write_bytes(metadata_bytes)
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["metadata_sha256"] = hashlib.sha256(metadata_bytes).hexdigest()
+    marker_path.write_text(json.dumps(marker, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+
+def test_complete_reader_binds_source_governance_to_hash_bound_metadata(tmp_path):
+    source = Source(
+        url="https://example.gov.cn/case/1",
+        allowed_domains=("example.gov.cn",),
+        source_type="public_case",
+        license="PUBLIC-NOTICE",
+        license_review_status="approved",
+        terms_review_status="approved",
+        content_review_status="approved",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+        return httpx.Response(200, content=b"governed body")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        fetch(source, tmp_path, client=client, retrieved_at="2026-07-13T00:00:00Z")
+
+    mismatched = Source(
+        url=source.url,
+        allowed_domains=source.allowed_domains,
+        source_type="different_type",
+        license=source.license,
+        license_review_status=source.license_review_status,
+        terms_review_status=source.terms_review_status,
+        content_review_status=source.content_review_status,
+    )
+    with pytest.raises(ValueError, match="governance.*mismatch"):
+        read_complete_artifact(mismatched, tmp_path)
+    assert not is_complete_artifact(mismatched, tmp_path)
+
+
+def test_complete_reader_rejects_extra_and_duplicate_metadata_keys(tmp_path):
+    source = Source(
+        url="https://example.gov.cn/case/1",
+        allowed_domains=("example.gov.cn",),
+        source_type="public_case",
+        license="PUBLIC-NOTICE",
+        license_review_status="pending",
+        terms_review_status="pending",
+        content_review_status="pending",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+        return httpx.Response(200, content=b"governed body")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        fetch(source, tmp_path, client=client, retrieved_at="2026-07-13T00:00:00Z")
+
+    metadata_path = metadata_path_for(source, tmp_path)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["unexpected"] = "not allowed"
+    _rewrite_metadata_and_marker(
+        source,
+        tmp_path,
+        (json.dumps(metadata, sort_keys=True) + "\n").encode("utf-8"),
+    )
+    with pytest.raises(ValueError, match="metadata schema"):
+        read_complete_artifact(source, tmp_path)
+
+    metadata.pop("unexpected")
+    normal = json.dumps(metadata, sort_keys=True)
+    duplicate = normal.replace(
+        '"url": ',
+        f'"url": {json.dumps(source.url)}, "url": ',
+        1,
+    )
+    _rewrite_metadata_and_marker(source, tmp_path, (duplicate + "\n").encode("utf-8"))
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        read_complete_artifact(source, tmp_path)
+
+
+def test_complete_reader_rejects_extra_and_duplicate_marker_keys(tmp_path):
+    source = Source(url="https://example.gov.cn/case/1", allowed_domains=("example.gov.cn",))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+        return httpx.Response(200, content=b"governed body")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        fetch(source, tmp_path, client=client, retrieved_at="2026-07-13T00:00:00Z")
+
+    marker_path = completion_path_for(source, tmp_path)
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["unexpected"] = "not allowed"
+    marker_path.write_text(json.dumps(marker) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="completion marker.*schema"):
+        read_complete_artifact(source, tmp_path)
+
+    marker.pop("unexpected")
+    normal = json.dumps(marker, sort_keys=True)
+    duplicate = normal.replace(
+        '"raw_path": ',
+        f'"raw_path": {json.dumps(marker["raw_path"])}, "raw_path": ',
+        1,
+    )
+    marker_path.write_text(duplicate + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        read_complete_artifact(source, tmp_path)
+
+
+def test_read_budget_does_not_use_a_stat_then_open_path_race(tmp_path, monkeypatch):
+    from risk_agent.crawler import ReadBudget
+
+    target = tmp_path / "target.raw"
+    replacement = tmp_path / "replacement.raw"
+    backup = tmp_path / "backup.raw"
+    target.write_bytes(b"original")
+    replacement.write_bytes(b"replacement")
+    original_stat = Path.stat
+    raced = False
+
+    def racing_stat(path: Path, *args, **kwargs):
+        nonlocal raced
+        result = original_stat(path, *args, **kwargs)
+        if path == target and not raced:
+            raced = True
+            target.rename(backup)
+            replacement.rename(target)
+        return result
+
+    monkeypatch.setattr(Path, "stat", racing_stat)
+    consumed = ReadBudget(1024, 1024).read(target)
+
+    assert consumed == b"original"
+    assert not raced
+
+
+@pytest.mark.skipif(os.name == "nt", reason="named pipes use different Windows APIs")
+def test_read_budget_rejects_fifo_without_blocking(tmp_path):
+    from risk_agent.crawler import ReadBudget
+
+    fifo = tmp_path / "artifact.fifo"
+    os.mkfifo(fifo)
+
+    with pytest.raises(ValueError, match="regular non-symlink"):
+        ReadBudget(1024, 1024).read(fifo)
 
 
 def test_fetch_rejects_robots_denial_before_requesting_source(tmp_path):

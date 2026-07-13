@@ -36,7 +36,7 @@ import_report.json
 import_manifest.json
 ```
 
-The command creates a complete sibling staging directory, then renames it into a destination that must not exist. `import_manifest.json` records counts, output hashes, missing media, and license status. Consumers should require `status == "complete"` and verify the hashes.
+The command reserves a destination with an exclusive directory create, moves staged payloads into it, and publishes `import_manifest.json` last as the completion marker. `import_manifest.json` records counts, output hashes, missing media, license status, and any source truncated or skipped by the global record cap. Consumers should require `status == "complete"` and verify the hashes.
 
 Every public asset records:
 
@@ -53,7 +53,7 @@ Every sanitized case records the factual snippet, the raw-source and snippet con
 
 ## Reproducible import
 
-1. Copy `configs/public_sources.example.yaml` and replace local paths/timestamps.
+1. Copy the schema-v2 `configs/public_sources.example.yaml` and replace local paths/timestamps. Version 1 is rejected with an explicit migration error because v2 requires mutually exclusive `local_html` and `crawler_artifact` fields.
 2. Review every license, terms, and content field. Leave regulatory records as `pending` until approval is documented.
 3. Run:
 

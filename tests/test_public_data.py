@@ -83,6 +83,11 @@ def test_public_asset_is_immutable_and_contains_no_oracle_contract() -> None:
     with pytest.raises(ValidationError, match="frozen"):
         asset.prompt = "changed"  # type: ignore[misc]
 
+    forbidden = asset.model_dump()
+    forbidden["oracle"] = {"label": "unsafe"}
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        PublicAsset.model_validate(forbidden)
+
 
 @pytest.mark.parametrize(
     ("field", "value"),
@@ -452,6 +457,10 @@ def test_regulatory_html_requires_license_terms_and_content_approval_to_publish(
     invalid_published["publication_status"] = "published"
     with pytest.raises(ValidationError, match="approved license, terms, and content"):
         SanitizedCase.model_validate(invalid_published)
+    forbidden_case = pending_cases[0].model_dump()
+    forbidden_case["label"] = "unsafe"
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        SanitizedCase.model_validate(forbidden_case)
 
     cases = import_regulatory_html(
         REGULATORY_HTML,
@@ -569,7 +578,7 @@ def test_regulatory_crawler_import_rejects_missing_governance_and_caller_launder
     marker["metadata_sha256"] = hashlib.sha256(metadata_bytes).hexdigest()
     marker_path.write_text(json.dumps(marker, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="missing hash-bound governance"):
+    with pytest.raises(ValueError, match="not a complete crawler artifact"):
         import_regulatory_crawler_artifact(
             source,
             tmp_path,
@@ -597,16 +606,18 @@ def test_regulatory_crawler_import_consumes_raw_artifact_once(tmp_path: Path, mo
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
         raw_path = fetch(source, tmp_path, client=client, retrieved_at=RETRIEVED_AT)
 
-    original_open = Path.open
+    from risk_agent import crawler
+
+    original_open = crawler.os.open
     raw_open_count = 0
 
-    def counted_open(path: Path, *args, **kwargs):
+    def counted_open(path, *args, **kwargs):
         nonlocal raw_open_count
-        if path == raw_path:
+        if Path(path) == raw_path:
             raw_open_count += 1
         return original_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", counted_open)
+    monkeypatch.setattr(crawler.os, "open", counted_open)
     cases = import_regulatory_crawler_artifact(
         source,
         tmp_path,
@@ -650,7 +661,7 @@ def _write_import_config(path: Path, repo: Path, html_path: Path) -> None:
     path.write_text(
         yaml.safe_dump(
             {
-                "version": 1,
+                "version": 2,
                 "max_records": 20,
                 "max_file_bytes": 1048576,
                 "max_total_bytes": 8388608,
@@ -746,7 +757,7 @@ def test_public_data_import_refuses_input_output_aliases_and_existing_outputs(tm
         run_public_data_import(config, output)
 
 
-def test_public_data_bundle_renames_one_complete_staged_directory(tmp_path: Path, monkeypatch) -> None:
+def test_public_data_bundle_publishes_completion_manifest_last(tmp_path: Path, monkeypatch) -> None:
     repo = tmp_path / "MM-SafetyBench"
     _write_mm_fixture(repo)
     html_path = tmp_path / "samr.html"
@@ -757,14 +768,18 @@ def test_public_data_bundle_renames_one_complete_staged_directory(tmp_path: Path
 
     from risk_agent import public_data
 
-    monkeypatch.setattr(
-        public_data.os,
-        "replace",
-        lambda *_: (_ for _ in ()).throw(AssertionError("must not merge staged files")),
-    )
+    original_replace = public_data.os.replace
+    published: list[str] = []
+
+    def record_replace(source, destination):
+        published.append(Path(destination).name)
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(public_data.os, "replace", record_replace)
     run_public_data_import(config, output)
 
     assert (output / "import_manifest.json").is_file()
+    assert published[-1] == "import_manifest.json"
 
 
 def test_public_data_import_rejects_duplicate_case_content_before_writing(tmp_path: Path) -> None:
@@ -834,6 +849,12 @@ def test_public_data_import_applies_global_record_cap_incrementally(tmp_path: Pa
 
     assert report["public_asset_count"] == 3
     assert report["sanitized_case_count"] == 1
+    assert report["truncated"] is True
+    assert report["truncated_sources"] == ["SAMR-public-cases"]
+    manifest = json.loads(
+        (tmp_path / "normalized" / "import_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["truncation"]["truncated"] is True
 
 
 def test_public_data_import_rejects_duplicate_yaml_keys_and_unknown_source_fields(tmp_path: Path) -> None:
@@ -848,7 +869,7 @@ def test_public_data_import_rejects_duplicate_yaml_keys_and_unknown_source_field
     config.write_text(
         yaml.safe_dump(
             {
-                "version": 1,
+                "version": 2,
                 "max_records": 3,
                 "max_file_bytes": 1024,
                 "max_total_bytes": 8192,
@@ -866,6 +887,61 @@ def test_public_data_import_rejects_duplicate_yaml_keys_and_unknown_source_field
     )
     with pytest.raises(ValueError, match="unknown.*MM-SafetyBench"):
         run_public_data_import(config, tmp_path / "unknown-output")
+
+
+def test_public_data_config_v1_has_explicit_migration_error(tmp_path: Path) -> None:
+    config = tmp_path / "v1.yaml"
+    config.write_text(
+        "version: 1\nmax_records: 1\nmax_file_bytes: 100\nmax_total_bytes: 100\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="version 1.*migrate.*version 2"):
+        run_public_data_import(config, tmp_path / "out")
+
+
+def test_all_regulatory_rows_use_discriminated_schema_before_record_cap(tmp_path: Path) -> None:
+    repo = tmp_path / "MM-SafetyBench"
+    _write_mm_fixture(repo)
+    html_path = tmp_path / "samr.html"
+    html_path.write_text(REGULATORY_HTML, encoding="utf-8")
+    config = tmp_path / "public-sources.yaml"
+    _write_import_config(config, repo, html_path)
+    document = yaml.safe_load(config.read_text(encoding="utf-8"))
+    document["max_records"] = 3
+    invalid_row = dict(document["regulatory_cases"][0])
+    invalid_row["crawler_output_dir"] = "irrelevant-for-local-html"
+    document["regulatory_cases"].append(invalid_row)
+    config.write_text(yaml.safe_dump(document), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not allowed for local_html"):
+        run_public_data_import(config, tmp_path / "out")
+
+
+def test_output_reservation_race_never_deletes_competing_directory(tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "MM-SafetyBench"
+    _write_mm_fixture(repo)
+    html_path = tmp_path / "samr.html"
+    html_path.write_text(REGULATORY_HTML, encoding="utf-8")
+    config = tmp_path / "public-sources.yaml"
+    _write_import_config(config, repo, html_path)
+    output = tmp_path / "normalized"
+    original_mkdir = __import__("os").mkdir
+
+    def racing_mkdir(path, *args, **kwargs):
+        if Path(path) == output:
+            original_mkdir(path)
+            (output / "competitor.txt").write_text("keep", encoding="utf-8")
+            raise FileExistsError("competitor won")
+        return original_mkdir(path, *args, **kwargs)
+
+    from risk_agent import public_data
+
+    monkeypatch.setattr(public_data.os, "mkdir", racing_mkdir)
+    with pytest.raises(FileExistsError, match="competitor won"):
+        run_public_data_import(config, output)
+
+    assert (output / "competitor.txt").read_text(encoding="utf-8") == "keep"
 
 
 def test_public_data_cli_reports_sanitized_validation_error_without_traceback(tmp_path: Path) -> None:

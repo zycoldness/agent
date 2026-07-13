@@ -1,6 +1,6 @@
 # Copy this file, replace every local path, and record the actual retrieval time.
 # This importer never downloads MM-SafetyBench images or regulatory pages.
-version: 1
+version: 2
 max_records: 1000
 max_file_bytes: 20971520
 max_total_bytes: 2147483648

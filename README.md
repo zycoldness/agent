@@ -216,7 +216,7 @@ python scripts/import_public_data.py \
   data/processed/public_seed
 ```
 
-该命令不访问网络，按单文件/总字节预算读取，并通过完整 staging 目录的独占 rename 输出；目标目录必须不存在。MM-SafetyBench 每条记录同时保留 CC BY-NC 4.0 非商业限制和上游 GPT-4/Stable Diffusion 限制。HTML 清理不等于 PII 脱敏；监管案例只有在 license、条款和内容审查全部获批后才可 `published`。Crawler 导入只信任完成哈希覆盖的治理 metadata，配置不能事后提升旧 artifact。这批公开数据只用于 pipeline/OOD 检查，不生成 `Task` 或 `Oracle`，也不等于 SingGuard 官方训练集。完整说明见 `docs/public-data-card.md`。
+该命令不访问网络，按单文件/总字节预算读取，独占创建目标目录，并最后发布 `import_manifest.json` 完成标记；目标目录必须不存在。配置采用 schema v2，`local_html` 与 `crawler_artifact` 字段互斥，所有来源会在全局记录上限生效前完成校验，报告会列出被截断或跳过的来源。MM-SafetyBench 每条记录同时保留 CC BY-NC 4.0 非商业限制和上游 GPT-4/Stable Diffusion 限制。HTML 清理不等于 PII 脱敏；监管案例只有在 license、条款和内容审查全部获批后才可 `published`。Crawler 导入只信任完成哈希覆盖的治理 metadata，配置不能事后提升旧 artifact。这批公开数据只用于 pipeline/OOD 检查，不生成 `Task` 或 `Oracle`，也不等于 SingGuard 官方训练集。完整说明见 `docs/public-data-card.md`。
 
 ## 测试
 
@@ -227,10 +227,10 @@ python -m pytest -q
 当前基线为：
 
 ```text
-215 passed, 4 skipped
+222 passed, 5 skipped
 ```
 
-4 个 skip 来自 Windows 环境缺少稳定的符号链接权限，对应 crawler 的 symlink 防护测试；在具备 symlink 权限的平台上会执行。测试不访问 Gemini，也不运行真实训练。
+5 个 skip 来自 Windows 环境缺少稳定的符号链接权限或 POSIX FIFO API，对应 crawler 的 symlink/FIFO 防护测试；在支持相应能力的平台上会执行。测试不访问 Gemini，也不运行真实训练。
 
 ## 30 / 60 / 90 天继续或停止门槛
 

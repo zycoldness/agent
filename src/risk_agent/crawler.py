@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
 from typing import Any
 from unicodedata import normalize
@@ -70,6 +71,22 @@ _SENSITIVE_QUERY_PARAMETER_NAMES = frozenset(
 )
 _DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", re.ASCII)
 _NUMERIC_IP_LABEL = re.compile(r"(?:0x[0-9a-f]+|0[0-7]*|[0-9]+)", re.ASCII)
+_ARTIFACT_METADATA_FIELDS = frozenset(
+    {
+        "url",
+        "retrieved_at",
+        "content_sha256",
+        "source_type",
+        "license",
+        "license_review_status",
+        "terms_review_status",
+        "content_review_status",
+        "raw_path",
+    }
+)
+_ARTIFACT_MARKER_FIELDS = frozenset(
+    {"content_sha256", "metadata_path", "metadata_sha256", "raw_path"}
+)
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -142,14 +159,38 @@ class ReadBudget:
 
         if self.max_file_bytes <= 0 or self.max_total_bytes <= 0:
             raise ValueError("byte limits must be positive")
-        if _has_symlinked_ancestor(path.parent) or path.is_symlink() or not path.is_file():
+        if _has_symlinked_ancestor(path.parent):
             raise ValueError("artifact input must be a regular non-symlink file")
-        if path.stat().st_size > self.max_file_bytes:
-            raise ValueError(f"artifact file exceeds byte limit of {self.max_file_bytes}")
-        chunks: list[bytes] = []
-        file_bytes = 0
-        with path.open("rb") as handle:
-            while chunk := handle.read(64 * 1024):
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_BINARY", 0)
+        before_open = None
+        if os.name == "nt":
+            try:
+                before_open = os.lstat(path)
+            except OSError as error:
+                raise ValueError("artifact input must be a regular non-symlink file") from error
+            if stat.S_ISLNK(before_open.st_mode):
+                raise ValueError("artifact input must be a regular non-symlink file")
+        else:
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            raise ValueError("artifact input must be a regular non-symlink file") from error
+        try:
+            opened = os.fstat(descriptor)
+            if before_open is not None and not os.path.samestat(before_open, opened):
+                raise ValueError("artifact input identity changed while opening")
+            if not stat.S_ISREG(opened.st_mode):
+                raise ValueError("artifact input must be a regular non-symlink file")
+            if opened.st_size > self.max_file_bytes:
+                raise ValueError(f"artifact file exceeds byte limit of {self.max_file_bytes}")
+            chunks: list[bytes] = []
+            file_bytes = 0
+            while chunk := os.read(descriptor, 64 * 1024):
                 file_bytes += len(chunk)
                 if file_bytes > self.max_file_bytes:
                     raise ValueError(f"artifact file exceeds byte limit of {self.max_file_bytes}")
@@ -157,7 +198,9 @@ class ReadBudget:
                     raise ValueError(f"artifact reads exceed total byte limit of {self.max_total_bytes}")
                 self.total_bytes += len(chunk)
                 chunks.append(chunk)
-        return b"".join(chunks)
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
 
 
 def validate_source(source: Source) -> str:
@@ -261,10 +304,14 @@ def read_complete_artifact(
     marker_bytes = read_budget.read(marker_path)
     metadata_bytes = read_budget.read(metadata_path)
     raw_bytes = read_budget.read(raw_path)
-    marker = json.loads(marker_bytes)
-    metadata = json.loads(metadata_bytes)
+    marker = _load_strict_artifact_json(marker_bytes, "completion marker")
+    metadata = _load_strict_artifact_json(metadata_bytes, "metadata")
     if not isinstance(marker, Mapping) or not isinstance(metadata, Mapping):
         raise ValueError("artifact marker and metadata must be JSON mappings")
+    if set(marker) != _ARTIFACT_MARKER_FIELDS:
+        raise ValueError("artifact completion marker does not match the required schema")
+    if set(metadata) != _ARTIFACT_METADATA_FIELDS:
+        raise ValueError("artifact metadata schema mismatch")
     if marker.get("raw_path") != raw_path.name or marker.get("metadata_path") != metadata_path.name:
         raise ValueError("artifact marker paths do not match the governed source")
     if marker.get("metadata_sha256") != hashlib.sha256(metadata_bytes).hexdigest():
@@ -277,7 +324,32 @@ def read_complete_artifact(
         and metadata.get("raw_path") == raw_path.name
     ):
         raise ValueError("artifact raw content or provenance hash mismatch")
+    expected_governance = {
+        "source_type": source.source_type,
+        "license": source.license,
+        "license_review_status": source.license_review_status,
+        "terms_review_status": _effective_terms_review_status(source),
+        "content_review_status": source.content_review_status,
+    }
+    if any(metadata.get(field) != value for field, value in expected_governance.items()):
+        raise ValueError("artifact governance metadata mismatch for governed source")
     return raw_bytes, dict(metadata)
+
+
+def _load_strict_artifact_json(payload: bytes, name: str) -> Any:
+    try:
+        return json.loads(payload, object_pairs_hook=_reject_duplicate_json_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid artifact {name} JSON") from error
+
+
+def _reject_duplicate_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
 
 
 def fetch(
