@@ -1,0 +1,2 @@
+{"asset_id":"synthetic-asset-1","policy_version":"synthetic-with-efficacy-rule","active_policy":[{"rule_id":"AD-001","title":"Absolute efficacy claim","text":"Do not guarantee a weight-loss result.","exceptions":[],"priority":100}],"initial_observation":"OCR: Guaranteed to lose ten pounds in seven days.","max_turns":3}
+{"asset_id":"synthetic-asset-1","policy_version":"synthetic-without-efficacy-rule","active_policy":[],"initial_observation":"OCR: Guaranteed to lose ten pounds in seven days.","max_turns":3}

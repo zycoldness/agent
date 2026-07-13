@@ -1,0 +1,12 @@
+data_classification: synthetic_public
+description: Synthetic development policy fixture; it contains no user, merchant, or production moderation data.
+policies:
+  - policy_version: synthetic-with-efficacy-rule
+    active_policy:
+      - rule_id: AD-001
+        title: Absolute efficacy claim
+        text: Do not guarantee a weight-loss result.
+        exceptions: []
+        priority: 100
+  - policy_version: synthetic-without-efficacy-rule
+    active_policy: []
