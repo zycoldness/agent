@@ -20,7 +20,7 @@ from risk_agent.stores import CaseStore, EvidenceStore
 Track = Literal["track_a", "track_b"]
 _SPLITS = ("train", "dev", "holdout")
 _TASK_REQUIRED = frozenset({"asset_id", "policy_version", "active_policy", "initial_observation"})
-_TASK_OPTIONAL = frozenset({"max_turns"})
+_TASK_OPTIONAL = frozenset({"max_turns", "images", "videos"})
 _RULE_REQUIRED = frozenset({"rule_id", "title", "text"})
 _RULE_OPTIONAL = frozenset({"exceptions", "priority"})
 _ORACLE_REQUIRED = frozenset({"asset_id", "policy_version", "label"})

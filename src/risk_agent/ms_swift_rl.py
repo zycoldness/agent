@@ -73,6 +73,9 @@ def prepare_rl_bundle(
                 "messages": prompt,
                 "teacher_prompt": _opsd_teacher_prompt(prompt[1]["content"], solution),
             }
+        for field in ("images", "videos"):
+            if field in sft_row:
+                row[field] = sft_row[field]
         split = _split_for(asset_id, seed, ratios)
         split_rows[split].append(row)
         split_assets[split].add(asset_id)

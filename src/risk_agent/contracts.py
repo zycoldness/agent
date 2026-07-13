@@ -55,6 +55,8 @@ class Task(BaseModel):
     policy_version: str
     active_policy: tuple[PolicyRule, ...]
     initial_observation: str
+    images: tuple[str, ...] = ()
+    videos: tuple[str, ...] = ()
     max_turns: int = Field(default=3, ge=1, le=3)
 
 

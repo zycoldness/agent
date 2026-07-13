@@ -102,6 +102,27 @@ def test_rl_manifest_hashes_exact_bytes_and_contains_policy_metadata_only(tmp_pa
     assert "asset_id" not in row and "policy_version" not in row
 
 
+@pytest.mark.parametrize("mode", ["grpo", "opsd"])
+def test_rl_bundle_preserves_images_for_qwen3_vl(tmp_path: Path, mode: str) -> None:
+    tasks, oracles = _sources(tmp_path, 1)
+    task = json.loads(tasks.read_text(encoding="utf-8"))
+    task["initial_observation"] = "<image>\nReview this advertisement."
+    task["images"] = ["assets/ad.jpg"]
+    tasks.write_text(json.dumps(task) + "\n", encoding="utf-8")
+
+    output = tmp_path / mode
+    prepare_rl_bundle(
+        mode,
+        tasks,
+        oracles,
+        output,
+        ratios=SplitRatios(train=1, dev=0, holdout=0),
+    )
+
+    row = _rows(output / "train.jsonl")[0]
+    assert row["images"] == ["assets/ad.jpg"]
+
+
 def test_rl_bundle_rejects_existing_output_mismatch_and_invalid_mode(tmp_path: Path) -> None:
     tasks, oracles = _sources(tmp_path, 1)
     existing = tmp_path / "existing"

@@ -258,17 +258,27 @@ def _normalize_observation(
     raise ValueError("trajectory tool actions must not be final_decision")
 
 
-def export_track_a(task: Task, oracle: Oracle) -> dict[str, list[dict[str, str]]]:
+def _row(task: Task, messages: list[dict[str, str]]) -> dict[str, object]:
+    row: dict[str, object] = {"messages": messages}
+    if task.images:
+        row["images"] = list(task.images)
+    if task.videos:
+        row["videos"] = list(task.videos)
+    return row
+
+
+def export_track_a(task: Task, oracle: Oracle) -> dict[str, object]:
     """Export a no-tool guard demonstration with an oracle-derived final action."""
 
     _validate_pair(task, oracle)
-    return {
-        "messages": [
+    return _row(
+        task,
+        [
             {"role": "system", "content": _system(task)},
             {"role": "user", "content": task.initial_observation},
             {"role": "assistant", "content": _final_action(oracle)},
-        ]
-    }
+        ],
+    )
 
 
 def export_track_b(
@@ -278,7 +288,7 @@ def export_track_b(
     observation: str,
     case_store: CaseStore,
     evidence_store: EvidenceStore,
-) -> dict[str, list[dict[str, str]]]:
+) -> dict[str, object]:
     """Export a one-tool-turn trajectory; retained for simple data generators."""
 
     return export_trajectory(task, oracle, [(action, observation)], case_store, evidence_store)
@@ -290,7 +300,7 @@ def export_trajectory(
     steps: Sequence[tuple[str, str]],
     case_store: CaseStore,
     evidence_store: EvidenceStore,
-) -> dict[str, list[dict[str, str]]]:
+) -> dict[str, object]:
     """Export a bounded tool trajectory followed by exactly one final action."""
 
     _validate_pair(task, oracle)
@@ -319,4 +329,4 @@ def export_trajectory(
             }
         )
     messages.append({"role": "assistant", "content": _final_action(oracle)})
-    return {"messages": messages}
+    return _row(task, messages)

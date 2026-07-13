@@ -101,6 +101,22 @@ def test_track_a_injects_full_policy_and_only_generates_final_action():
     }
 
 
+def test_track_a_preserves_ms_swift_multimodal_fields():
+    task = _task().model_copy(
+        update={
+            "initial_observation": "<image>\nReview this advertisement.",
+            "images": ("assets/ad.jpg",),
+            "videos": ("assets/ad.mp4",),
+        }
+    )
+
+    row = export_track_a(task, _oracle())
+
+    assert row["images"] == ["assets/ad.jpg"]
+    assert row["videos"] == ["assets/ad.mp4"]
+    assert row["messages"][1]["content"].startswith("<image>")
+
+
 def test_trajectory_serializes_one_valid_nonfinal_action_per_tool_turn():
     row = export_trajectory(
         _task(),

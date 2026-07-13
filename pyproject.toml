@@ -9,14 +9,13 @@ requires-python = ">=3.11"
 dependencies = [
     "beautifulsoup4>=4.12",
     "httpx>=0.27",
-    "packaging>=24.0",
     "pydantic>=2.8",
     "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3"]
-train = ["ms-swift>=4.3,<4.4"]
+train = ["ms-swift>=4.3", "transformers>=4.57", "qwen-vl-utils>=0.0.14"]
 teacher = ["google-genai>=1.0"]
 
 [tool.pytest.ini_options]
