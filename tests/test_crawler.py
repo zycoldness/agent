@@ -266,3 +266,27 @@ def test_second_commit_failure_never_exposes_a_completed_artifact(tmp_path, monk
 
     assert not completion_path_for(source, tmp_path).exists()
     assert not is_complete_artifact(source, tmp_path)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows symlink privileges are not reliably available in CI")
+def test_complete_check_rejects_symlinked_output_or_metadata_ancestors(tmp_path):
+    source = Source(url="https://example.gov.cn/case/1", allowed_domains=("example.gov.cn",))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+        return httpx.Response(200, content=b"raw document")
+
+    output_dir = tmp_path / "output"
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        fetch(source, output_dir, client=client)
+    assert is_complete_artifact(source, output_dir)
+
+    real_metadata = tmp_path / "real-metadata"
+    (output_dir / "metadata").rename(real_metadata)
+    (output_dir / "metadata").symlink_to(real_metadata, target_is_directory=True)
+    assert not is_complete_artifact(source, output_dir)
+
+    linked_output = tmp_path / "linked-output"
+    linked_output.symlink_to(output_dir, target_is_directory=True)
+    assert not is_complete_artifact(source, linked_output)

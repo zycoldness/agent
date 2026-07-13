@@ -168,6 +168,8 @@ def is_complete_artifact(source: Source, output_dir: Path) -> bool:
         raw_path = raw_path_for(source, output_dir)
         metadata_path = metadata_path_for(source, output_dir)
         marker_path = completion_path_for(source, output_dir)
+        if any(_has_symlinked_ancestor(path.parent) for path in (raw_path, metadata_path, marker_path)):
+            return False
         if any(path.is_symlink() or not path.is_file() for path in (raw_path, metadata_path, marker_path)):
             return False
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
@@ -399,12 +401,19 @@ def _verify_direct_directory(directory: Path) -> Path:
 
 
 def _reject_symlinked_ancestors(path: Path) -> None:
-    candidate = path
+    if _has_symlinked_ancestor(path):
+        raise ValueError("crawler output directories must not be symlinks")
+
+
+def _has_symlinked_ancestor(path: Path) -> bool:
+    """Inspect a directory path without resolving or creating any component."""
+
+    candidate = path.absolute()
     while True:
         if candidate.is_symlink():
-            raise ValueError("crawler output directories must not be symlinks")
+            return True
         if candidate == candidate.parent:
-            return
+            return False
         candidate = candidate.parent
 
 
