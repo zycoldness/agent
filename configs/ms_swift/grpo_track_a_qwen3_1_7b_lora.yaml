@@ -1,6 +1,7 @@
 rlhf_type: grpo
 model: __MODEL__
 adapters: __ADAPTER__
+ref_adapters: __ADAPTER__
 tuner_type: lora
 torch_dtype: bfloat16
 dataset: __TRAIN_DATASET__
@@ -12,7 +13,7 @@ reward_funcs:
   - risk_label_exact_v1
   - risk_rule_exact_v1
   - risk_evidence_exact_v1
-reward_weights: [0.2, 0.4, 0.25, 0.15]
+reward_weights: [0.05, 0.6, 0.2, 0.15]
 use_vllm: false
 remove_unused_columns: false
 num_generations: 4

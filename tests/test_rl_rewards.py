@@ -44,6 +44,24 @@ def test_component_rewards_have_explicit_none_and_ordered_evidence_semantics() -
     assert evidence_exact_reward([reversed_evidence], solution=[target_evidence]) == [0.0]
 
 
+def test_rule_and_evidence_rewards_are_gated_by_exact_label() -> None:
+    wrong_label = SOLUTION.replace('"unsafe"', '"safe"')
+    assert rule_exact_reward([wrong_label], solution=[SOLUTION]) == [0.0]
+    assert evidence_exact_reward([wrong_label], solution=[SOLUTION]) == [0.0]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        SOLUTION.replace('["e-1"]', '["e-1","e-1"]'),
+        SOLUTION.replace('["e-1"]', '[""]'),
+    ],
+)
+def test_all_rewards_fail_closed_on_duplicate_or_empty_evidence_ids(bad: str) -> None:
+    for reward in (format_reward, label_exact_reward, rule_exact_reward, evidence_exact_reward):
+        assert reward([bad], solution=[SOLUTION]) == [0.0]
+
+
 @pytest.mark.parametrize("bad_solution", [None, "x", [SOLUTION, SOLUTION], [1]])
 def test_all_rewards_fail_closed_on_bad_kwargs_or_lengths(bad_solution) -> None:
     for reward in (format_reward, label_exact_reward, rule_exact_reward, evidence_exact_reward):

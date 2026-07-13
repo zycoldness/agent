@@ -208,7 +208,9 @@ python scripts/prepare_ms_swift_rl.py grpo \
   --train-ratio 1 --dev-ratio 0 --holdout-ratio 0 --seed 42
 ```
 
-OPSD 每行只有学生 prompt-only `messages` 和教师专用 `teacher_prompt`；后者可含 Oracle 特权终局答案，但不会进入学生 messages：
+命令标准输出是 `{"manifest": {...}, "manifest_sha256": "..."}`。把 `manifest_sha256` 复制到 bundle 之外的可信作业配置或实验记录中；不能从待启动 bundle 现场重新计算后直接信任，否则攻击者可以同时篡改数据和 manifest。
+
+OPSD 每行只有学生 prompt-only `messages` 和教师专用 `teacher_prompt`；后者是严格 JSON，只包含原始 user observation、Oracle 特权终局答案和教师指令，不重复 system policy，也不会进入学生 messages：
 
 ```bash
 python scripts/prepare_ms_swift_rl.py opsd \
@@ -216,7 +218,13 @@ python scripts/prepare_ms_swift_rl.py opsd \
   --train-ratio 1 --dev-ratio 0 --holdout-ratio 0 --seed 42
 ```
 
-两者复用 SFT 的 `sha256(seed + NUL + asset_id)` 分组切分；policy version、asset group 和来源哈希只保存在 manifest，不进入训练列。GRPO 的四个离线 ORM 分别检查 JSON 格式、label、rule 和有序 evidence IDs 的完全匹配；解析拒绝重复 key、NaN、尾随文本、未知字段和缺字段，并在 batch/kwargs 异常时 fail closed。规则反事实的成对方向一致性必须在冻结 holdout 上由 evaluator 计算，不能伪装成单样本 reward。
+两者复用 SFT 的 `sha256(seed + NUL + asset_id)` 分组切分；同一 asset 的多个 policy version 会在 manifest 的 `asset_policy_versions` 中去重排序，并且只占一个 split group。policy version、asset group 和来源哈希不进入训练列。GRPO 的四个离线 ORM 分别检查 JSON 格式、label、rule 和有序 evidence IDs 的完全匹配；rule/evidence 只有 label 完全正确才得分，重复或空 evidence ID 会 fail closed。权重固定为 `0.05 / 0.60 / 0.20 / 0.15`，错误 label 的总分最多只有 format 的 `0.05`。解析拒绝重复 key、NaN、尾随文本、未知字段和缺字段，并在 batch/kwargs 异常时 fail closed。规则反事实的成对方向一致性必须在冻结 holdout 上由 evaluator 计算，不能伪装成单样本 reward。
+
+下面启动命令假设已经把 prepare 输出的摘要写入可信环境变量：
+
+```bash
+export RL_MANIFEST_SHA256='<copy manifest_sha256 from trusted prepare output>'
+```
 
 ### GRPO：先 dry-run，再训练
 
@@ -226,10 +234,12 @@ python scripts/launch_ms_swift_rl.py outputs/track_a_grpo_bundle \
   --output-dir outputs/runs/qwen3-1.7b-track-a-grpo \
   --model Qwen/Qwen3-1.7B \
   --adapter outputs/runs/qwen3-1.7b-track-a/checkpoint-100 \
-  --plugin plugins/ms_swift_risk_rewards.py --device 0 --dry-run
+  --plugin plugins/ms_swift_risk_rewards.py \
+  --expected-manifest-sha256 "$RL_MANIFEST_SHA256" \
+  --device 0 --dry-run
 ```
 
-检查计划后删除 `--dry-run`。配置使用官方 `swift rlhf <yaml>`、`rlhf_type: grpo`、4 个 generations、LoRA/bf16、单卡相容 batch，并以 `use_vllm: false` 作为先跑通的保守基线。
+检查计划后删除 `--dry-run`。配置使用官方 `swift rlhf <yaml>`、`rlhf_type: grpo`、4 个 generations、LoRA/bf16、单卡相容 batch，并以 `use_vllm: false` 作为先跑通的保守基线。SFT checkpoint 同时渲染到 `adapters` 和 `ref_adapters`，策略模型与 reference 都从同一受信 SFT LoRA 起点加载。
 
 ### OPSD：dynamic self-teacher
 
@@ -239,10 +249,13 @@ python scripts/launch_ms_swift_rl.py outputs/track_a_opsd_bundle \
   --output-dir outputs/runs/qwen3-1.7b-track-a-opsd \
   --model Qwen/Qwen3-1.7B \
   --adapter outputs/runs/qwen3-1.7b-track-a/checkpoint-100 \
+  --expected-manifest-sha256 "$RL_MANIFEST_SHA256" \
   --device 0 --dry-run
 ```
 
-该配置遵循 ms-swift 4.3 的 GKD/OPSD 接口：`rlhf_type: gkd`、`lmbda: 1.0`、`teacher_prompt` 特权列、Top-K logits；不设置 `teacher_model`，因此教师是随训练更新的同一模型，不加载第二个模型。它不是固定教师实验，也没有声称在 H20 上完成训练。真实启动与 SFT launcher 相同，会重验 bundle、创建 0600 临时快照、固定单卡环境、`shell=False`，结束后清理临时文件。
+该配置遵循 ms-swift 4.3 的 GKD/OPSD 接口：`rlhf_type: gkd`、`lmbda: 1.0`、`teacher_prompt` 特权列、Top-K logits；不设置 `teacher_model`，因此教师是随训练更新的同一模型，不加载第二个模型。因为 `lmbda > 0` 需要 student on-policy rollout，本基线明确启用单卡 colocate vLLM，并使用较低 GPU utilization、sleep level 1、model/optimizer offload；它不再是纯 Transformers 配方。smoke 必须确认 rollout 实际发生，而不只是 trainer 成功初始化。它不是固定教师实验，也没有声称在 H20 上完成训练。
+
+真实启动会重验可信 manifest 摘要与 bundle exact bytes，把数据、配置和经 `O_NOFOLLOW`/`fstat` 验证的 GRPO plugin 写入 0600 私有临时快照，再以 `shell=False` 启动。launcher 在 exec 前以 0700 独占创建 output reservation，并复核目录 identity；空目录失败会安全清理，有训练/审计文件时保留。这个边界只能防启动前的路径替换，无法阻止拥有同一系统账号权限的进程在 trainer 运行期间修改 output。
 
 建议先把 train 缩到 16～64 条，`max_completion_length` 降到 128，仅验证首个 logging step 和 checkpoint；再逐步恢复默认长度。若 GRPO 4 completions 或 OPSD teacher/student logits 超出显存，先缩 prompt/completion 与样本 batch，不要直接宣称配方失败或效果成立。
 

@@ -23,11 +23,17 @@ RLMode = Literal["grpo", "opsd"]
 _SPLITS = ("train", "dev", "holdout")
 
 
-def _opsd_teacher_prompt(system: str, user: str, solution: str) -> str:
-    return (
-        f"{system}\n\nStudent input:\n{user}\n\n"
-        f"Privileged reference final decision (teacher branch only):\n{solution}\n\n"
-        "Produce the best final_decision JSON action."
+def _opsd_teacher_prompt(user: str, solution: str) -> str:
+    return json.dumps(
+        {
+            "student_observation": user,
+            "privileged_solution": solution,
+            "instruction": "Produce exactly the best final_decision JSON action.",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
     )
 
 
@@ -44,8 +50,8 @@ def prepare_rl_bundle(
 
     if mode not in ("grpo", "opsd"):
         raise ValueError("mode must be grpo or opsd")
-    if isinstance(seed, bool) or not isinstance(seed, int):
-        raise ValueError("seed must be an integer")
+    if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= (2**63 - 1):
+        raise ValueError("seed must be an integer from zero to 2^63-1")
     _validate_ratios(ratios)
     _ensure_distinct_sources([task_path, oracle_path])
     output_dir = output_dir.absolute()
@@ -54,8 +60,9 @@ def prepare_rl_bundle(
 
     exported, sources = _build_rows("track_a", task_path, oracle_path, None, None)
     split_rows: dict[str, list[dict[str, object]]] = {name: [] for name in _SPLITS}
-    split_assets: dict[str, list[str]] = {name: [] for name in _SPLITS}
-    for asset_id, sft_row in exported:
+    split_assets: dict[str, set[str]] = {name: set() for name in _SPLITS}
+    asset_policy_versions: dict[str, set[str]] = {}
+    for asset_id, policy_version, sft_row in exported:
         messages = sft_row["messages"]
         prompt = messages[:2]
         solution = messages[2]["content"]
@@ -64,13 +71,12 @@ def prepare_rl_bundle(
         else:
             row = {
                 "messages": prompt,
-                "teacher_prompt": _opsd_teacher_prompt(
-                    prompt[0]["content"], prompt[1]["content"], solution
-                ),
+                "teacher_prompt": _opsd_teacher_prompt(prompt[1]["content"], solution),
             }
         split = _split_for(asset_id, seed, ratios)
         split_rows[split].append(row)
-        split_assets[split].append(asset_id)
+        split_assets[split].add(asset_id)
+        asset_policy_versions.setdefault(asset_id, set()).add(policy_version)
 
     payloads = {f"{name}.jsonl": _jsonl_bytes(split_rows[name]) for name in _SPLITS}
     files = {
@@ -92,8 +98,11 @@ def prepare_rl_bundle(
         "split_algorithm": "sha256-seed-null-asset-id",
         "sources": sources,
         "split_counts": {name: len(split_rows[name]) for name in _SPLITS},
-        "asset_group_counts": {name: len(set(split_assets[name])) for name in _SPLITS},
+        "asset_group_counts": {name: len(split_assets[name]) for name in _SPLITS},
         "split_asset_ids": {name: sorted(split_assets[name]) for name in _SPLITS},
+        "asset_policy_versions": {
+            asset_id: sorted(versions) for asset_id, versions in sorted(asset_policy_versions.items())
+        },
         "files": files,
     }
     manifest_payload = (
@@ -110,4 +119,7 @@ def prepare_rl_bundle(
     if os.name == "posix":
         output_dir.chmod(0o700)
     _publish_reserved_bundle(output_dir, identity, payloads, manifest_payload)
-    return manifest
+    return {
+        "manifest": manifest,
+        "manifest_sha256": hashlib.sha256(manifest_payload).hexdigest(),
+    }

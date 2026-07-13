@@ -154,7 +154,11 @@ def _validate_ratios(ratios: SplitRatios) -> None:
     values = (ratios.train, ratios.dev, ratios.holdout)
     if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
         raise ValueError("split ratios must be finite numbers")
-    if any(not math.isfinite(float(value)) or value < 0 or value > 1 for value in values):
+    try:
+        invalid = any(not math.isfinite(float(value)) or value < 0 or value > 1 for value in values)
+    except (OverflowError, ValueError):
+        invalid = True
+    if invalid:
         raise ValueError("split ratios must be finite numbers from zero to one")
     if not math.isclose(sum(values), 1.0, rel_tol=0.0, abs_tol=1e-12):
         raise ValueError("split ratios must sum to one")
@@ -208,7 +212,7 @@ def _build_rows(
     oracle_path: Path,
     cases_path: Path | None,
     evidence_path: Path | None,
-) -> tuple[list[tuple[str, dict[str, object]]], dict[str, dict[str, object]]]:
+) -> tuple[list[tuple[str, str, dict[str, object]]], dict[str, dict[str, object]]]:
     oracles, oracle_payload = _load_oracles(oracle_path)
     input_records, input_payload = _read_jsonl(
         input_path, "task input" if track == "track_a" else "trajectory input"
@@ -231,7 +235,7 @@ def _build_rows(
         raise ValueError("cases_path and evidence_path are only valid for track_b")
 
     task_keys: set[tuple[str, str]] = set()
-    rows: list[tuple[str, dict[str, object]]] = []
+    rows: list[tuple[str, str, dict[str, object]]] = []
     for number, record in enumerate(input_records, start=1):
         steps: list[tuple[str, str]] = []
         if track == "track_a":
@@ -267,7 +271,7 @@ def _build_rows(
         else:
             assert case_store is not None and evidence_store is not None
             row = export_trajectory(task, oracle, steps, case_store, evidence_store)
-        rows.append((task.asset_id, row))
+        rows.append((task.asset_id, task.policy_version, row))
 
     unmatched = set(oracles) - task_keys
     if unmatched:
@@ -313,7 +317,7 @@ def prepare_sft_bundle(
     rows, sources = _build_rows(track, input_path, oracle_path, cases_path, evidence_path)
     split_rows: dict[str, list[dict[str, object]]] = {name: [] for name in _SPLITS}
     split_assets: dict[str, set[str]] = {name: set() for name in _SPLITS}
-    for asset_id, row in rows:
+    for asset_id, _policy_version, row in rows:
         split = _split_for(asset_id, seed, ratios)
         split_rows[split].append(row)
         split_assets[split].add(asset_id)

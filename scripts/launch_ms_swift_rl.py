@@ -22,6 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--adapter", required=True)
+    parser.add_argument("--expected-manifest-sha256", required=True)
     parser.add_argument("--plugin", type=Path)
     parser.add_argument("--device", default="0")
     parser.add_argument("--dry-run", action="store_true")
@@ -31,11 +32,13 @@ def main(argv: list[str] | None = None) -> int:
             _print(prepare_rl_launch(
                 args.bundle_dir, args.config, args.output_dir, model=args.model,
                 adapter=args.adapter, plugin=args.plugin, device=args.device,
+                expected_manifest_sha256=args.expected_manifest_sha256,
             ).as_dict())
             return 0
         run_rl_launch(
             args.bundle_dir, args.config, args.output_dir, model=args.model,
             adapter=args.adapter, plugin=args.plugin, device=args.device, on_execute=_print,
+            expected_manifest_sha256=args.expected_manifest_sha256,
         )
     except (OSError, RuntimeError, subprocess.CalledProcessError, ValueError) as error:
         parser.error(str(error))

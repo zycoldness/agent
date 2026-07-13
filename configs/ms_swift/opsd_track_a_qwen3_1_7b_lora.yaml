@@ -6,7 +6,12 @@ torch_dtype: bfloat16
 dataset: __TRAIN_DATASET__
 val_dataset: __VAL_DATASET__
 output_dir: __OUTPUT_DIR__
-use_vllm: false
+use_vllm: true
+vllm_mode: colocate
+vllm_gpu_memory_utilization: 0.35
+sleep_level: 1
+offload_model: true
+offload_optimizer: true
 remove_unused_columns: false
 lmbda: 1.0
 beta: 1.0

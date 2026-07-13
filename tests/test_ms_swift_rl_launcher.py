@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+import risk_agent.ms_swift_rl_launcher as rl_launcher
 from risk_agent.contracts import Oracle, PolicyRule, Task
 from risk_agent.ms_swift_rl import prepare_rl_bundle
 from risk_agent.ms_swift_rl_launcher import load_rl_config, prepare_rl_launch, run_rl_launch
@@ -38,6 +39,10 @@ def _bundle(tmp_path: Path, mode: str) -> Path:
     return output
 
 
+def _digest(bundle: Path) -> str:
+    return hashlib.sha256((bundle / "manifest.json").read_bytes()).hexdigest()
+
+
 def test_official_grpo_config_has_compatible_single_h20_baseline() -> None:
     config = load_rl_config(GRPO)
     assert config["rlhf_type"] == "grpo"
@@ -51,9 +56,12 @@ def test_official_grpo_config_has_compatible_single_h20_baseline() -> None:
         "risk_format_v1", "risk_label_exact_v1", "risk_rule_exact_v1", "risk_evidence_exact_v1"
     ]
     assert len(config["reward_weights"]) == 4
+    assert config["reward_weights"] == [0.05, 0.6, 0.2, 0.15]
+    assert config["reward_weights"][1] > sum(config["reward_weights"][0:1] + config["reward_weights"][2:])
     assert config["dataset"] == "__TRAIN_DATASET__"
     assert config["model"] == "__MODEL__"
     assert config["adapters"] == "__ADAPTER__"
+    assert config["ref_adapters"] == "__ADAPTER__"
     assert config["external_plugins"] == "__EXTERNAL_PLUGIN__"
 
 
@@ -65,13 +73,19 @@ def test_official_opsd_config_is_dynamic_self_teacher_without_second_model() -> 
     assert config["gkd_logits_topk"] == 64
     assert "teacher_model" not in config
     assert "teacher_model_server" not in config
-    assert config["use_vllm"] is False
+    assert config["use_vllm"] is True
     assert config["remove_unused_columns"] is False
+    assert config["vllm_mode"] == "colocate"
+    assert 0 < config["vllm_gpu_memory_utilization"] <= 0.5
+    assert config["sleep_level"] == 1
+    assert config["offload_model"] is True
+    assert config["offload_optimizer"] is True
 
 
 def test_opsd_dry_run_does_not_require_reward_plugin(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path, "opsd")
-    plan = prepare_rl_launch(bundle, OPSD, tmp_path / "run", model="m", adapter="a")
+    plan = prepare_rl_launch(bundle, OPSD, tmp_path / "run", model="m", adapter="a",
+                             expected_manifest_sha256=_digest(bundle))
     assert "external_plugins" not in plan.config
 
 
@@ -84,6 +98,7 @@ def test_dry_run_renders_full_rlhf_plan_without_importing_swift(
     plan = prepare_rl_launch(
         bundle, config, output,
         model="Qwen/Qwen3-1.7B", adapter="/checkpoints/sft", plugin=PLUGIN, device="2",
+        expected_manifest_sha256=_digest(bundle),
     )
     assert plan.argv == ("swift", "rlhf", "<generated-config>")
     assert plan.env == {"CUDA_VISIBLE_DEVICES": "2", "NPROC_PER_NODE": "1"}
@@ -93,6 +108,8 @@ def test_dry_run_renders_full_rlhf_plan_without_importing_swift(
     assert plan.config["model"] == "Qwen/Qwen3-1.7B"
     assert plan.config["adapters"] == ["/checkpoints/sft"]
     if mode == "grpo":
+        assert plan.config["ref_adapters"] == ["/checkpoints/sft"]
+    if mode == "grpo":
         assert plan.config["external_plugins"] == [str(PLUGIN.resolve())]
     else:
         assert "external_plugins" not in plan.config
@@ -100,7 +117,8 @@ def test_dry_run_renders_full_rlhf_plan_without_importing_swift(
 
 def test_launcher_rejects_mode_mismatch_tamper_or_existing_output(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path, "grpo")
-    kwargs = dict(model="m", adapter="a", plugin=PLUGIN)
+    kwargs = dict(model="m", adapter="a", plugin=PLUGIN,
+                  expected_manifest_sha256=_digest(bundle))
     with pytest.raises(ValueError, match="mode"):
         prepare_rl_launch(bundle, OPSD, tmp_path / "x", **kwargs)
     (bundle / "train.jsonl").write_text('{}\n', encoding="utf-8")
@@ -108,6 +126,7 @@ def test_launcher_rejects_mode_mismatch_tamper_or_existing_output(tmp_path: Path
         prepare_rl_launch(bundle, GRPO, tmp_path / "y", **kwargs)
 
     bundle = _bundle(tmp_path / "second", "grpo")
+    kwargs["expected_manifest_sha256"] = _digest(bundle)
     existing = tmp_path / "run"
     existing.mkdir()
     with pytest.raises(ValueError, match="must not exist"):
@@ -133,7 +152,8 @@ def test_launcher_rejects_self_signed_illegal_or_leaking_rows(tmp_path: Path, mo
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="messages"):
         prepare_rl_launch(bundle, GRPO if mode == "grpo" else OPSD, tmp_path / "run",
-                          model="m", adapter="a", plugin=PLUGIN)
+                          model="m", adapter="a", plugin=PLUGIN,
+                          expected_manifest_sha256=_digest(bundle))
 
 
 def test_config_rejects_duplicate_unknown_wrong_types_and_teacher_model(tmp_path: Path) -> None:
@@ -169,6 +189,7 @@ def test_real_run_snapshots_exact_bytes_and_uses_shell_false(tmp_path: Path) -> 
 
     result = run_rl_launch(
         bundle, GRPO, tmp_path / "run", model="m", adapter="a", plugin=PLUGIN,
+        expected_manifest_sha256=_digest(bundle),
         version_reader=lambda _: "4.3.2", executable_finder=lambda _: "C:/bin/swift.exe",
         runner=runner, on_execute=tamper,
     )
@@ -184,8 +205,123 @@ def test_rl_launcher_cli_dry_run_prints_plan(tmp_path: Path) -> None:
     result = subprocess.run(
         [sys.executable, "scripts/launch_ms_swift_rl.py", str(bundle), "--config", str(GRPO),
          "--output-dir", str(tmp_path / "run"), "--model", "m", "--adapter", "a",
-         "--plugin", str(PLUGIN), "--dry-run"],
+         "--plugin", str(PLUGIN), "--expected-manifest-sha256", _digest(bundle), "--dry-run"],
         cwd=ROOT, text=True, capture_output=True, check=False,
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["argv"] == ["swift", "rlhf", "<generated-config>"]
+
+
+def test_external_manifest_digest_rejects_fully_self_signed_tamper(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, "grpo")
+    trusted = _digest(bundle)
+    train = bundle / "train.jsonl"
+    row = json.loads(train.read_text(encoding="utf-8"))
+    row["solution"] = row["solution"].replace('"unsafe"', '"safe"')
+    payload = (json.dumps(row, separators=(",", ":")) + "\n").encode()
+    train.write_bytes(payload)
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"]["train.jsonl"].update(
+        bytes=len(payload), records=1, sha256=hashlib.sha256(payload).hexdigest()
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="trusted manifest digest"):
+        prepare_rl_launch(bundle, GRPO, tmp_path / "run", model="m", adapter="a",
+                          plugin=PLUGIN, expected_manifest_sha256=trusted)
+
+
+def test_opsd_self_signed_teacher_prompt_must_bind_student_and_privileged_solution(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, "opsd")
+    train = bundle / "train.jsonl"
+    row = json.loads(train.read_text(encoding="utf-8"))
+    teacher = json.loads(row["teacher_prompt"])
+    teacher["student_observation"] = "different observation"
+    row["teacher_prompt"] = json.dumps(teacher, separators=(",", ":"))
+    payload = (json.dumps(row, separators=(",", ":")) + "\n").encode()
+    train.write_bytes(payload)
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"]["train.jsonl"].update(
+        bytes=len(payload), records=1, sha256=hashlib.sha256(payload).hexdigest()
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="teacher_prompt"):
+        prepare_rl_launch(bundle, OPSD, tmp_path / "run", model="m", adapter="a",
+                          expected_manifest_sha256=_digest(bundle))
+
+
+def test_plugin_symlink_is_rejected(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, "grpo")
+    link = tmp_path / "plugin.py"
+    try:
+        link.symlink_to(PLUGIN)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+    with pytest.raises(ValueError, match="symbolic link"):
+        prepare_rl_launch(bundle, GRPO, tmp_path / "run", model="m", adapter="a",
+                          plugin=link, expected_manifest_sha256=_digest(bundle))
+
+
+def test_real_run_reserves_output_and_cleans_empty_reservation_on_failure(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, "grpo")
+    output = tmp_path / "run"
+
+    def runner(argv, **kwargs):
+        assert output.is_dir()
+        raise subprocess.CalledProcessError(1, argv)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        run_rl_launch(bundle, GRPO, output, model="m", adapter="a", plugin=PLUGIN,
+                      expected_manifest_sha256=_digest(bundle),
+                      version_reader=lambda _: "4.3.2",
+                      executable_finder=lambda _: "C:/bin/swift.exe", runner=runner)
+    assert not output.exists()
+
+
+def test_output_identity_swap_is_detected_before_exec_and_replacement_preserved(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, "grpo")
+    output, displaced = tmp_path / "run", tmp_path / "reserved"
+    called = False
+
+    def swap(_: dict[str, object]) -> None:
+        output.rename(displaced)
+        output.mkdir()
+        (output / "competitor.txt").write_text("keep", encoding="utf-8")
+
+    def runner(argv, **kwargs):
+        nonlocal called
+        called = True
+        return subprocess.CompletedProcess(argv, 0)
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        run_rl_launch(bundle, GRPO, output, model="m", adapter="a", plugin=PLUGIN,
+                      expected_manifest_sha256=_digest(bundle),
+                      version_reader=lambda _: "4.3.2",
+                      executable_finder=lambda _: "C:/bin/swift.exe", runner=runner,
+                      on_execute=swap)
+    assert called is False
+    assert (output / "competitor.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_huge_manifest_ratio_is_controlled_value_error(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, "grpo")
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["ratios"] = {"train": 10**400, "dev": 0, "holdout": 0}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="ratios"):
+        prepare_rl_launch(bundle, GRPO, tmp_path / "run", model="m", adapter="a",
+                          plugin=PLUGIN, expected_manifest_sha256=_digest(bundle))
+
+
+def test_repository_fixture_prepares_then_dry_runs(tmp_path: Path) -> None:
+    prepared = prepare_rl_bundle(
+        "grpo", ROOT / "data/fixtures/tasks.jsonl", ROOT / "data/fixtures/oracle.jsonl",
+        tmp_path / "bundle", ratios=SplitRatios(train=1, dev=0, holdout=0),
+    )
+    plan = prepare_rl_launch(
+        tmp_path / "bundle", GRPO, tmp_path / "run", model="m", adapter="a", plugin=PLUGIN,
+        expected_manifest_sha256=prepared["manifest_sha256"],
+    )
+    assert plan.argv[:2] == ("swift", "rlhf")

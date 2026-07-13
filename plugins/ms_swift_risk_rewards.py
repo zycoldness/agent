@@ -33,7 +33,13 @@ class RiskEvidenceExactORM(_CoreORM):
     core = staticmethod(evidence_exact_reward)
 
 
-orms["risk_format_v1"] = RiskFormatORM
-orms["risk_label_exact_v1"] = RiskLabelExactORM
-orms["risk_rule_exact_v1"] = RiskRuleExactORM
-orms["risk_evidence_exact_v1"] = RiskEvidenceExactORM
+_REGISTRATIONS = {
+    "risk_format_v1": RiskFormatORM,
+    "risk_label_exact_v1": RiskLabelExactORM,
+    "risk_rule_exact_v1": RiskRuleExactORM,
+    "risk_evidence_exact_v1": RiskEvidenceExactORM,
+}
+_collisions = sorted(set(_REGISTRATIONS) & set(orms))
+if _collisions:
+    raise RuntimeError(f"reward ORM already registered: {', '.join(_collisions)}")
+orms.update(_REGISTRATIONS)

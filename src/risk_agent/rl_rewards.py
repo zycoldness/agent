@@ -43,7 +43,11 @@ def _decision(value: object) -> dict[str, Any] | None:
     if args["rule_id"] is not None and not isinstance(args["rule_id"], str):
         return None
     evidence = args["evidence_ids"]
-    if not isinstance(evidence, list) or any(not isinstance(item, str) for item in evidence):
+    if (
+        not isinstance(evidence, list)
+        or any(not isinstance(item, str) or not item for item in evidence)
+        or len(evidence) != len(set(evidence))
+    ):
         return None
     confidence = args["confidence"]
     if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
@@ -83,8 +87,18 @@ def label_exact_reward(completions: object, *, solution: object = None, **kwargs
 
 
 def rule_exact_reward(completions: object, *, solution: object = None, **kwargs: object) -> list[float]:
-    return _batch(completions, solution, lambda got, want: got["rule_id"] == want["rule_id"])
+    return _batch(
+        completions,
+        solution,
+        lambda got, want: got["label"] == want["label"] and got["rule_id"] == want["rule_id"],
+    )
 
 
 def evidence_exact_reward(completions: object, *, solution: object = None, **kwargs: object) -> list[float]:
-    return _batch(completions, solution, lambda got, want: got["evidence_ids"] == want["evidence_ids"])
+    return _batch(
+        completions,
+        solution,
+        lambda got, want: (
+            got["label"] == want["label"] and got["evidence_ids"] == want["evidence_ids"]
+        ),
+    )

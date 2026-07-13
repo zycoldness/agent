@@ -7,6 +7,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).parents[1]
 PLUGIN = ROOT / "plugins" / "ms_swift_risk_rewards.py"
@@ -39,3 +41,21 @@ def test_plugin_registers_four_unique_orms_and_delegates_to_pure_core(monkeypatc
     assert registry["risk_label_exact_v1"]()([SOLUTION], solution=[SOLUTION]) == [1.0]
     source = PLUGIN.read_text(encoding="utf-8")
     assert "requests" not in source and "open(" not in source and "Oracle" not in source
+
+
+def test_plugin_collision_is_atomic_and_does_not_partially_register(monkeypatch) -> None:
+    existing = object()
+    registry = {"risk_rule_exact_v1": existing}
+    swift = types.ModuleType("swift")
+    rewards = types.ModuleType("swift.rewards")
+    rewards.ORM = type("ORM", (), {})
+    rewards.orms = registry
+    swift.rewards = rewards
+    monkeypatch.setitem(sys.modules, "swift", swift)
+    monkeypatch.setitem(sys.modules, "swift.rewards", rewards)
+    spec = importlib.util.spec_from_file_location("risk_rewards_collision", PLUGIN)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    with pytest.raises(RuntimeError, match="already registered"):
+        spec.loader.exec_module(module)
+    assert registry == {"risk_rule_exact_v1": existing}
