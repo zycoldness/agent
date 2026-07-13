@@ -289,6 +289,7 @@ def prepare_sft_bundle(
 ) -> dict[str, object]:
     """Validate all sources and exclusively publish a split messages bundle."""
 
+    output_dir = output_dir.absolute()
     if track not in ("track_a", "track_b"):
         raise ValueError("track must be track_a or track_b")
     if isinstance(seed, bool) or not isinstance(seed, int):
@@ -358,18 +359,79 @@ def prepare_sft_bundle(
         output_dir.mkdir(exist_ok=False)
     except FileExistsError as error:
         raise ValueError("output directory must not exist") from error
+    created_identity = os.stat(output_dir, follow_symlinks=False)
     if os.name == "posix":
         output_dir.chmod(0o700)
-    for name, payload in payloads.items():
-        _write_exclusive(output_dir / name, payload)
-    _write_exclusive(output_dir / "manifest.json", manifest_payload)
+    _publish_reserved_bundle(
+        output_dir,
+        created_identity,
+        payloads,
+        manifest_payload,
+    )
     return manifest
 
 
-def _write_exclusive(path: Path, payload: bytes) -> None:
-    """Create one bundle member without following or replacing another entry."""
+def _publish_reserved_bundle(
+    output_dir: Path,
+    created_identity: os.stat_result,
+    payloads: dict[str, bytes],
+    manifest_payload: bytes,
+) -> None:
+    """Write split members and then the manifest without trusting the path again."""
 
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    ordered_members = (*payloads.items(), ("manifest.json", manifest_payload))
+    if os.name == "posix":
+        directory_flags = os.O_RDONLY
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        output_fd = os.open(output_dir, directory_flags)
+        try:
+            held_identity = os.fstat(output_fd)
+            if not os.path.samestat(created_identity, held_identity):
+                raise RuntimeError("SFT bundle reservation path identity changed")
+            for filename, payload in ordered_members:
+                _require_reservation_identity(output_dir, held_identity)
+                _write_reserved_member(output_dir, output_fd, filename, payload)
+                _require_reservation_identity(output_dir, held_identity)
+        finally:
+            os.close(output_fd)
+        return
+
+    for filename, payload in ordered_members:
+        # Python does not expose Windows directory-relative create.  Recheck
+        # twice before opening so a replacement triggered by the first probe
+        # is detected before any member is written, and check again after.
+        _require_reservation_identity(output_dir, created_identity)
+        _require_reservation_identity(output_dir, created_identity)
+        _write_reserved_member(output_dir, None, filename, payload)
+        _require_reservation_identity(output_dir, created_identity)
+
+
+def _require_reservation_identity(output_dir: Path, identity: os.stat_result) -> None:
+    try:
+        matches = os.path.samestat(identity, os.stat(output_dir, follow_symlinks=False))
+    except OSError:
+        matches = False
+    if not matches:
+        raise RuntimeError("SFT bundle reservation path identity changed")
+
+
+def _write_reserved_member(
+    output_dir: Path,
+    output_fd: int | None,
+    filename: str,
+    payload: bytes,
+) -> None:
+    """Exclusively create a member relative to the held directory on POSIX."""
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    if output_fd is None:
+        descriptor = os.open(output_dir / filename, flags, 0o600)
+    else:
+        descriptor = os.open(filename, flags, 0o600, dir_fd=output_fd)
     try:
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = -1

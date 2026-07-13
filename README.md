@@ -289,7 +289,7 @@ python -m pytest -q
 当前基线为：
 
 ```text
-266 passed, 8 skipped
+267 passed, 8 skipped
 ```
 
 8 个 skip 来自 Windows 环境缺少稳定的符号链接权限、POSIX FIFO API 或 `dir_fd/openat` 语义，对应 crawler 与输出发布的 symlink/FIFO/路径替换防护测试；在支持相应能力的平台上会执行。测试不访问 Gemini，也不运行真实训练。

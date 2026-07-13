@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -190,19 +191,50 @@ def test_prepare_bundle_publish_failure_never_leaves_a_complete_manifest(
 ) -> None:
     tasks, oracles = _write_track_a_sources(tmp_path, [("asset-1", "policy-v1")])
     output = tmp_path / "bundle"
-    original_write = ms_swift_sft._write_exclusive
+    original_write = ms_swift_sft._write_reserved_member
 
-    def fail_during_split_write(path: Path, payload: bytes) -> None:
-        if path.name == "dev.jsonl":
+    def fail_during_split_write(
+        output_dir: Path, output_fd: int | None, filename: str, payload: bytes
+    ) -> None:
+        if filename == "dev.jsonl":
             raise OSError("simulated disk failure")
-        original_write(path, payload)
+        original_write(output_dir, output_fd, filename, payload)
 
-    monkeypatch.setattr(ms_swift_sft, "_write_exclusive", fail_during_split_write)
+    monkeypatch.setattr(ms_swift_sft, "_write_reserved_member", fail_during_split_write)
     with pytest.raises(OSError, match="simulated disk failure"):
         prepare_sft_bundle("track_a", tasks, oracles, output)
 
     assert not (output / "manifest.json").exists()
     assert output.is_dir()
+
+
+def test_bundle_reservation_identity_swap_never_writes_replacement_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tasks, oracles = _write_track_a_sources(tmp_path, [("asset-1", "policy-v1")])
+    output = tmp_path / "bundle"
+    displaced = tmp_path / "owned-reservation"
+    original_samestat = os.path.samestat
+    swapped = False
+
+    def swap_after_first_identity_match(first, second):
+        nonlocal swapped
+        result = original_samestat(first, second)
+        if result and not swapped:
+            output.rename(displaced)
+            output.mkdir()
+            (output / "competitor.txt").write_text("keep", encoding="utf-8")
+            swapped = True
+        return result
+
+    monkeypatch.setattr(ms_swift_sft.os.path, "samestat", swap_after_first_identity_match)
+
+    with pytest.raises(RuntimeError, match="reservation path identity changed"):
+        prepare_sft_bundle("track_a", tasks, oracles, output)
+
+    assert swapped is True
+    assert sorted(path.name for path in output.iterdir()) == ["competitor.txt"]
+    assert (output / "competitor.txt").read_text(encoding="utf-8") == "keep"
 
 
 def test_prepare_track_b_uses_validated_stores_and_only_emits_messages(tmp_path: Path) -> None:
