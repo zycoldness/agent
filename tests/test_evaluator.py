@@ -25,6 +25,10 @@ def make_task_and_oracle() -> tuple[Task, Oracle]:
 
 def test_evaluation_reports_exact_label_rule_and_evidence_metrics() -> None:
     task, oracle = make_task_and_oracle()
+    safe_task = task.model_copy(update={"policy_version": "v2", "active_policy": ()})
+    safe_oracle = oracle.model_copy(
+        update={"policy_version": "v2", "label": "safe", "rule_id": None, "evidence_ids": ()}
+    )
 
     report = evaluate_decisions(
         [
@@ -38,11 +42,11 @@ def test_evaluation_reports_exact_label_rule_and_evidence_metrics() -> None:
                 },
             ),
             (
-                task,
-                oracle,
+                safe_task,
+                safe_oracle,
                 {
-                    "label": "safe",
-                    "rule_id": None,
+                    "label": "unsafe",
+                    "rule_id": "AD-1",
                     "evidence_ids": ["ocr-1"],
                 },
             ),
@@ -51,7 +55,7 @@ def test_evaluation_reports_exact_label_rule_and_evidence_metrics() -> None:
 
     assert report == {
         "label_accuracy": 0.5,
-        "policy_following_accuracy": 0.5,
+        "policy_following_accuracy": 0.0,
         "rule_exact_match": 0.5,
         "evidence_exact_match": 0.5,
     }
@@ -84,3 +88,32 @@ def test_evaluation_rejects_non_mapping_decisions_and_non_iterable_evidence() ->
         evaluate_decisions([(task, oracle, "unsafe")])  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="evidence_ids"):
         evaluate_decisions([(task, oracle, {"label": "unsafe", "evidence_ids": 3})])
+    with pytest.raises(TypeError, match="evidence_ids"):
+        evaluate_decisions([(task, oracle, {"label": "unsafe", "evidence_ids": {"ocr-1": "mapped"}})])
+
+
+def test_policy_following_requires_the_same_label_change_as_the_oracle() -> None:
+    unsafe_task, unsafe_oracle = make_task_and_oracle()
+    safe_task = unsafe_task.model_copy(update={"policy_version": "v2", "active_policy": ()})
+    safe_oracle = unsafe_oracle.model_copy(
+        update={"policy_version": "v2", "label": "safe", "rule_id": None, "evidence_ids": ()}
+    )
+
+    report = evaluate_decisions(
+        [
+            (unsafe_task, unsafe_oracle, {"label": "unsafe", "rule_id": "AD-1", "evidence_ids": []}),
+            (safe_task, safe_oracle, {"label": "unsafe", "rule_id": None, "evidence_ids": []}),
+        ]
+    )
+
+    assert report["label_accuracy"] == 0.5
+    assert report["policy_following_accuracy"] == 0.0
+
+
+def test_policy_following_for_singleton_assets_falls_back_to_label_correctness() -> None:
+    task, oracle = make_task_and_oracle()
+
+    report = evaluate_decisions([(task, oracle, {"label": "safe", "rule_id": None, "evidence_ids": []})])
+
+    assert report["label_accuracy"] == 0.0
+    assert report["policy_following_accuracy"] == 0.0
