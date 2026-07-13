@@ -25,6 +25,9 @@ USER_AGENT = "risk-agent-research/0.1 (+contact-required)"
 TIMEOUT_SECONDS = 20.0
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_ROBOTS_BYTES = 256 * 1024
+MAX_ARTIFACT_FILE_BYTES = MAX_RESPONSE_BYTES
+MAX_ARTIFACT_TOTAL_BYTES = MAX_RESPONSE_BYTES + 3 * MAX_ROBOTS_BYTES
+MAX_MANIFEST_BYTES = 1024 * 1024
 # We intentionally allow only public records.  These route segments are common
 # authenticated/profile surfaces and are blocked wherever they occur in a URL.
 _BLOCKED_ACCOUNT_ROUTE_SEGMENTS = frozenset(
@@ -69,6 +72,28 @@ _DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", re.ASCII)
 _NUMERIC_IP_LABEL = re.compile(r"(?:0x[0-9a-f]+|0[0-7]*|[0-9]+)", re.ASCII)
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """Fail closed on duplicate source-manifest keys."""
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[Any, Any]:
+    result: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in result:
+            raise ValueError(f"duplicate YAML key: {key}")
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+_UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
 @dataclass(frozen=True)
 class Source:
     """One manually approved public URL from a source manifest.
@@ -81,7 +106,12 @@ class Source:
     allowed_domains: tuple[str, ...]
     source_type: str = "unknown"
     license: str = "not_reviewed"
+    # ``terms_review`` is retained for old manifests. New manifests must use
+    # the three explicit, hash-bound governance status fields below.
     terms_review: str = "not_reviewed"
+    license_review_status: str = "pending"
+    terms_review_status: str = "pending"
+    content_review_status: str = "pending"
 
 
 @dataclass(frozen=True)
@@ -93,8 +123,41 @@ class SourceMetadata:
     content_sha256: str
     source_type: str
     license: str
-    terms_review: str
+    license_review_status: str
+    terms_review_status: str
+    content_review_status: str
     raw_path: str
+
+
+@dataclass
+class ReadBudget:
+    """A shared byte budget for bounded local artifact reads."""
+
+    max_file_bytes: int
+    max_total_bytes: int
+    total_bytes: int = 0
+
+    def read(self, path: Path) -> bytes:
+        """Open a regular file once and charge every consumed byte."""
+
+        if self.max_file_bytes <= 0 or self.max_total_bytes <= 0:
+            raise ValueError("byte limits must be positive")
+        if _has_symlinked_ancestor(path.parent) or path.is_symlink() or not path.is_file():
+            raise ValueError("artifact input must be a regular non-symlink file")
+        if path.stat().st_size > self.max_file_bytes:
+            raise ValueError(f"artifact file exceeds byte limit of {self.max_file_bytes}")
+        chunks: list[bytes] = []
+        file_bytes = 0
+        with path.open("rb") as handle:
+            while chunk := handle.read(64 * 1024):
+                file_bytes += len(chunk)
+                if file_bytes > self.max_file_bytes:
+                    raise ValueError(f"artifact file exceeds byte limit of {self.max_file_bytes}")
+                if self.total_bytes + len(chunk) > self.max_total_bytes:
+                    raise ValueError(f"artifact reads exceed total byte limit of {self.max_total_bytes}")
+                self.total_bytes += len(chunk)
+                chunks.append(chunk)
+        return b"".join(chunks)
 
 
 def validate_source(source: Source) -> str:
@@ -130,7 +193,17 @@ def validate_source(source: Source) -> str:
         normalized_name = "".join(character for character in name.casefold() if character.isalnum())
         if normalized_name in _SENSITIVE_QUERY_PARAMETER_NAMES:
             raise ValueError("source URL must not contain a credential-bearing query parameter")
-    if not all(isinstance(value, str) and value.strip() for value in (source.source_type, source.license, source.terms_review)):
+    if not all(
+        isinstance(value, str) and value.strip()
+        for value in (
+            source.source_type,
+            source.license,
+            source.terms_review,
+            source.license_review_status,
+            source.terms_review_status,
+            source.content_review_status,
+        )
+    ):
         raise ValueError("source metadata fields must be non-empty strings")
     return source.url
 
@@ -164,32 +237,47 @@ def is_complete_artifact(source: Source, output_dir: Path) -> bool:
     """
 
     try:
-        url = validate_source(source)
-        raw_path = raw_path_for(source, output_dir)
-        metadata_path = metadata_path_for(source, output_dir)
-        marker_path = completion_path_for(source, output_dir)
-        if any(_has_symlinked_ancestor(path.parent) for path in (raw_path, metadata_path, marker_path)):
-            return False
-        if any(path.is_symlink() or not path.is_file() for path in (raw_path, metadata_path, marker_path)):
-            return False
-        marker = json.loads(marker_path.read_text(encoding="utf-8"))
-        metadata_bytes = metadata_path.read_bytes()
-        metadata = json.loads(metadata_bytes)
-        if not isinstance(marker, Mapping) or not isinstance(metadata, Mapping):
-            return False
-        if marker.get("raw_path") != raw_path.name or marker.get("metadata_path") != metadata_path.name:
-            return False
-        if marker.get("metadata_sha256") != hashlib.sha256(metadata_bytes).hexdigest():
-            return False
-        raw_hash = hashlib.sha256(raw_path.read_bytes()).hexdigest()
-        return (
-            marker.get("content_sha256") == raw_hash
-            and metadata.get("content_sha256") == raw_hash
-            and metadata.get("url") == url
-            and metadata.get("raw_path") == raw_path.name
-        )
+        read_complete_artifact(source, output_dir)
+        return True
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return False
+
+
+def read_complete_artifact(
+    source: Source,
+    output_dir: Path,
+    *,
+    max_file_bytes: int = MAX_ARTIFACT_FILE_BYTES,
+    max_total_bytes: int = MAX_ARTIFACT_TOTAL_BYTES,
+    budget: ReadBudget | None = None,
+) -> tuple[bytes, dict[str, Any]]:
+    """Read and verify one committed artifact without reopening consumed files."""
+
+    url = validate_source(source)
+    raw_path = raw_path_for(source, output_dir)
+    metadata_path = metadata_path_for(source, output_dir)
+    marker_path = completion_path_for(source, output_dir)
+    read_budget = budget or ReadBudget(max_file_bytes, max_total_bytes)
+    marker_bytes = read_budget.read(marker_path)
+    metadata_bytes = read_budget.read(metadata_path)
+    raw_bytes = read_budget.read(raw_path)
+    marker = json.loads(marker_bytes)
+    metadata = json.loads(metadata_bytes)
+    if not isinstance(marker, Mapping) or not isinstance(metadata, Mapping):
+        raise ValueError("artifact marker and metadata must be JSON mappings")
+    if marker.get("raw_path") != raw_path.name or marker.get("metadata_path") != metadata_path.name:
+        raise ValueError("artifact marker paths do not match the governed source")
+    if marker.get("metadata_sha256") != hashlib.sha256(metadata_bytes).hexdigest():
+        raise ValueError("artifact metadata hash mismatch")
+    raw_hash = hashlib.sha256(raw_bytes).hexdigest()
+    if not (
+        marker.get("content_sha256") == raw_hash
+        and metadata.get("content_sha256") == raw_hash
+        and metadata.get("url") == url
+        and metadata.get("raw_path") == raw_path.name
+    ):
+        raise ValueError("artifact raw content or provenance hash mismatch")
+    return raw_bytes, dict(metadata)
 
 
 def fetch(
@@ -230,7 +318,9 @@ def fetch(
         content_sha256=hashlib.sha256(body).hexdigest(),
         source_type=source.source_type,
         license=source.license,
-        terms_review=source.terms_review,
+        license_review_status=source.license_review_status,
+        terms_review_status=_effective_terms_review_status(source),
+        content_review_status=source.content_review_status,
         raw_path=raw_path.name,
     )
     metadata_bytes = (json.dumps(asdict(metadata), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
@@ -252,8 +342,9 @@ def load_manifest(path: Path) -> tuple[Source, ...]:
     """Load and fully validate a YAML manifest before fetching any source."""
 
     try:
-        document = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except yaml.YAMLError as error:
+        manifest_bytes = ReadBudget(MAX_MANIFEST_BYTES, MAX_MANIFEST_BYTES).read(path)
+        document = yaml.load(manifest_bytes.decode("utf-8"), Loader=_UniqueKeyLoader)
+    except (UnicodeDecodeError, yaml.YAMLError) as error:
         raise ValueError(f"invalid YAML source manifest: {error}") from error
     if not isinstance(document, Mapping):
         raise ValueError("source manifest must be a mapping")
@@ -263,11 +354,16 @@ def load_manifest(path: Path) -> tuple[Source, ...]:
         isinstance(domain, str) and domain.strip() for domain in allowed_domains
     ):
         raise ValueError("source manifest requires non-empty allowed_domains")
+    if len(set(allowed_domains)) != len(allowed_domains):
+        raise ValueError("source manifest contains duplicate allowed_domains")
     if not isinstance(source_rows, list) or not source_rows:
         raise ValueError("source manifest requires a non-empty sources list")
 
     domains = tuple(allowed_domains)
     sources = tuple(_source_from_row(row, domains) for row in source_rows)
+    urls = [source.url for source in sources]
+    if len(set(urls)) != len(urls):
+        raise ValueError("source manifest contains duplicate source URL")
     for source in sources:
         validate_source(source)
     return sources
@@ -278,18 +374,41 @@ def _source_from_row(row: Any, allowed_domains: tuple[str, ...]) -> Source:
         return Source(url=row, allowed_domains=allowed_domains)
     if not isinstance(row, Mapping):
         raise ValueError("each source must be a URL string or mapping")
-    unknown_fields = set(row) - {"url", "source_type", "license", "terms_review"}
+    unknown_fields = set(row) - {
+        "url",
+        "source_type",
+        "license",
+        "terms_review",
+        "license_review_status",
+        "terms_review_status",
+        "content_review_status",
+    }
     if unknown_fields:
         raise ValueError(f"unknown source fields: {', '.join(sorted(map(str, unknown_fields)))}")
     url = row.get("url")
     if not isinstance(url, str):
         raise ValueError("each source mapping requires a string url")
-    metadata = {name: row.get(name, default) for name, default in (
-        ("source_type", "unknown"),
-        ("license", "not_reviewed"),
-        ("terms_review", "not_reviewed"),
-    )}
+    metadata = {
+        name: row.get(name, default)
+        for name, default in (
+            ("source_type", "unknown"),
+            ("license", "not_reviewed"),
+            ("terms_review", "not_reviewed"),
+            ("license_review_status", "pending"),
+            ("terms_review_status", "pending"),
+            ("content_review_status", "pending"),
+        )
+    }
     return Source(url=url, allowed_domains=allowed_domains, **metadata)
+
+
+def _effective_terms_review_status(source: Source) -> str:
+    if source.terms_review_status != "pending" or source.terms_review == "not_reviewed":
+        return source.terms_review_status
+    return {
+        "reviewed": "approved",
+        "review_required": "pending",
+    }.get(source.terms_review, source.terms_review)
 
 
 def _check_robots(client: httpx.Client, url: str) -> None:

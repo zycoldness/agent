@@ -10,7 +10,7 @@ This pipeline creates a small, governed public-data seed for plumbing tests. It 
 - Questions are read from a user-supplied local checkout under `data/processed_questions`.
 - Images are expected under `data/imgs/{scenario}/{SD|SD_TYPO|TYPO}/{question_id}.jpg`.
 - The importer never downloads images. Download and place them manually according to the upstream instructions, or explicitly set `allow_missing_media: true`.
-- The upstream dataset notice states CC BY-NC 4.0, research-only, non-commercial use. This repository therefore defaults it to `usage_scope: smoke_only`. Do not use it for commercial training or production decisions.
+- The upstream notice states CC BY-NC 4.0 research-only/non-commercial use and says upstream GPT-4 and Stable Diffusion license restrictions also apply. Every asset, report, and config records all three restrictions. This repository therefore defaults to `usage_scope: smoke_only`.
 - `TinyVersion_ID_List.json` is supported. `split_group` groups the three variants of one question only for leakage control; it is **not an official MM-SafetyBench evaluation split**.
 
 The normalized record deliberately contains no inferred `label`, `rule_id`, `Oracle`, or policy mapping. Benchmark scenarios are preserved as source metadata rather than converted into business risk labels.
@@ -20,9 +20,10 @@ The normalized record deliberately contains no inferred `label`, `rule_id`, `Ora
 The example configuration identifies one SAMR page and one CAC page as public regulatory sources. Public visibility is not a license grant. Their terms and downstream reuse rights must be reviewed separately.
 
 - Raw pages should normally enter through the governed crawler's hash-verified `raw + metadata + completion` transaction.
-- A local HTML file is accepted only when the operator provides the public source URL, retrieval time, license ID, terms-review status, and license-review status.
+- A local HTML file is accepted only with an exact hostname allowlist, source URL, retrieval time, license ID, and explicit license/terms/content review statuses.
 - Extracted `<article>` paragraphs/list items are whitespace-normalized and deduplicated. No rule or verdict is inferred.
-- Cases remain `quarantined` unless both `license_review_status` and `terms_review_status` are `approved`.
+- HTML tag removal is not PII sanitization. `content_review_status` defaults to `pending`; a case remains `quarantined` unless license, terms, and content review are all `approved`.
+- Crawler imports derive governance from completion-hash-covered metadata. Caller values are expectations only; a mismatch is rejected, so editing config cannot promote an older artifact.
 
 ## Normalized outputs
 
@@ -35,7 +36,7 @@ import_report.json
 import_manifest.json
 ```
 
-`import_manifest.json` is committed last and records record counts, output hashes, missing-media counts, and license status. Consumers should require `status == "complete"` and verify the listed SHA-256 hashes.
+The command creates a complete sibling staging directory, then renames it into a destination that must not exist. `import_manifest.json` records counts, output hashes, missing media, and license status. Consumers should require `status == "complete"` and verify the hashes.
 
 Every public asset records:
 
@@ -53,7 +54,7 @@ Every sanitized case records the factual snippet, the raw-source and snippet con
 ## Reproducible import
 
 1. Copy `configs/public_sources.example.yaml` and replace local paths/timestamps.
-2. Review every license and terms field. Leave regulatory records as `review_required` until approval is documented.
+2. Review every license, terms, and content field. Leave regulatory records as `pending` until approval is documented.
 3. Run:
 
 ```bash
@@ -62,7 +63,7 @@ python scripts/import_public_data.py \
   data/processed/public_seed
 ```
 
-The command rejects input/output path overlap, placeholder licenses, invalid record caps, duplicate assets/cases, missing MM-SafetyBench images unless explicitly allowed, pre-existing output files, and incomplete/tampered crawler artifacts. It performs no network requests.
+The command rejects path overlap, placeholder governance, invalid record/byte caps, duplicate YAML/JSON keys and records, noncanonical URLs, symlinked/escaping MM paths, missing images unless explicitly allowed, any existing destination, and incomplete/tampered artifacts. Every JSON, HTML, and media read is charged to per-file and aggregate byte budgets. It performs no network requests.
 
 ## Intended and prohibited uses
 
@@ -77,5 +78,5 @@ Not sufficient or permitted by this pipeline alone:
 - claiming a reproduction of the SingGuard training distribution;
 - treating source scenarios as content-risk Oracle labels;
 - commercial use of CC BY-NC data;
-- publishing quarantined regulatory snippets;
+- publishing regulatory snippets before explicit content/PII review;
 - measuring business performance without an authorized, deidentified holdout.

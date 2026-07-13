@@ -216,7 +216,7 @@ python scripts/import_public_data.py \
   data/processed/public_seed
 ```
 
-该命令不访问网络，输出 `public_assets.jsonl`、`sanitized_cases.jsonl`、`import_report.json` 和最后提交的 `import_manifest.json`。MM-SafetyBench 默认仅作 `smoke_only` 研究用途，不把 scenario 转成业务标签；监管案例在条款和 license 均获批前保持 `quarantined`。这批公开数据只用于跑通 pipeline/OOD 检查，不直接生成 `Task` 或 `Oracle`，更不等于 SingGuard 官方训练集。完整字段、许可证边界和校验方式见 `docs/public-data-card.md`。
+该命令不访问网络，按单文件/总字节预算读取，并通过完整 staging 目录的独占 rename 输出；目标目录必须不存在。MM-SafetyBench 每条记录同时保留 CC BY-NC 4.0 非商业限制和上游 GPT-4/Stable Diffusion 限制。HTML 清理不等于 PII 脱敏；监管案例只有在 license、条款和内容审查全部获批后才可 `published`。Crawler 导入只信任完成哈希覆盖的治理 metadata，配置不能事后提升旧 artifact。这批公开数据只用于 pipeline/OOD 检查，不生成 `Task` 或 `Oracle`，也不等于 SingGuard 官方训练集。完整说明见 `docs/public-data-card.md`。
 
 ## 测试
 
@@ -227,7 +227,7 @@ python -m pytest -q
 当前基线为：
 
 ```text
-199 passed, 4 skipped
+215 passed, 4 skipped
 ```
 
 4 个 skip 来自 Windows 环境缺少稳定的符号链接权限，对应 crawler 的 symlink 防护测试；在具备 symlink 权限的平台上会执行。测试不访问 Gemini，也不运行真实训练。

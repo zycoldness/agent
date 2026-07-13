@@ -15,6 +15,7 @@ from risk_agent.crawler import (
     fetch,
     is_complete_artifact,
     load_manifest,
+    read_complete_artifact,
     validate_source,
 )
 
@@ -115,7 +116,9 @@ def test_fetch_obeys_robots_and_writes_raw_bytes_and_metadata(tmp_path):
         allowed_domains=("example.gov.cn",),
         source_type="public_case",
         license="public notice",
-        terms_review="reviewed",
+        license_review_status="approved",
+        terms_review_status="approved",
+        content_review_status="approved",
     )
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
         raw_path = fetch(source, tmp_path, client=client, retrieved_at="2026-07-13T00:00:00Z")
@@ -133,14 +136,44 @@ def test_fetch_obeys_robots_and_writes_raw_bytes_and_metadata(tmp_path):
     assert metadata == {
         "content_sha256": hashlib.sha256(b"<html>public record</html>").hexdigest(),
         "license": "public notice",
+        "license_review_status": "approved",
+        "terms_review_status": "approved",
+        "content_review_status": "approved",
         "raw_path": f"{digest}.raw",
         "retrieved_at": "2026-07-13T00:00:00Z",
         "source_type": "public_case",
-        "terms_review": "reviewed",
         "url": source.url,
     }
     assert is_complete_artifact(source, tmp_path)
     assert completion_path_for(source, tmp_path).is_file()
+    body, verified_metadata = read_complete_artifact(source, tmp_path)
+    assert body == b"<html>public record</html>"
+    assert verified_metadata["content_review_status"] == "approved"
+
+
+def test_complete_artifact_reader_enforces_file_and_total_byte_limits(tmp_path):
+    source = Source(
+        url="https://example.gov.cn/case/1",
+        allowed_domains=("example.gov.cn",),
+        source_type="public_case",
+        license="RIGHTS-REVIEW-REQUIRED",
+        license_review_status="pending",
+        terms_review_status="pending",
+        content_review_status="pending",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+        return httpx.Response(200, content=b"bounded raw artifact")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        fetch(source, tmp_path, client=client, retrieved_at="2026-07-13T00:00:00Z")
+
+    with pytest.raises(ValueError, match="byte limit"):
+        read_complete_artifact(source, tmp_path, max_file_bytes=8, max_total_bytes=1024)
+    with pytest.raises(ValueError, match="total byte limit"):
+        read_complete_artifact(source, tmp_path, max_file_bytes=1024, max_total_bytes=32)
 
 
 def test_fetch_rejects_robots_denial_before_requesting_source(tmp_path):
@@ -198,6 +231,24 @@ sources:
 
     with pytest.raises(ValueError, match="allowlisted"):
         load_manifest(manifest)
+
+
+def test_load_manifest_rejects_duplicate_yaml_keys_and_source_urls(tmp_path):
+    duplicate_key = tmp_path / "duplicate-key.yaml"
+    duplicate_key.write_text(
+        "allowed_domains:\n  - example.gov.cn\nsources:\n  - url: https://example.gov.cn/a\n    license: A\n    license: B\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="duplicate YAML key"):
+        load_manifest(duplicate_key)
+
+    duplicate_source = tmp_path / "duplicate-source.yaml"
+    duplicate_source.write_text(
+        "allowed_domains:\n  - example.gov.cn\nsources:\n  - https://example.gov.cn/a\n  - https://example.gov.cn/a\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="duplicate source URL"):
+        load_manifest(duplicate_source)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows symlink privileges are not reliably available in CI")

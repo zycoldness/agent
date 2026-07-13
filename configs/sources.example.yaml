@@ -6,4 +6,6 @@ sources:
   - url: https://example.gov.cn/public-case.html
     source_type: public_case
     license: public notice
-    terms_review: reviewed
+    license_review_status: pending
+    terms_review_status: pending
+    content_review_status: pending
