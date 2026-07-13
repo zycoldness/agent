@@ -16,13 +16,23 @@ class CaseStore:
     """Searchable case text that deliberately excludes evaluation metadata."""
 
     def __init__(self, rows: Iterable[Mapping[str, object]]) -> None:
-        self._rows = tuple(
-            {"case_id": str(row["case_id"]), "text": str(row["text"])} for row in rows
-        )
+        sanitized_rows: list[dict[str, str]] = []
+        case_ids: set[str] = set()
+        for row in rows:
+            case_id = str(row["case_id"])
+            if case_id in case_ids:
+                raise ValueError(f"duplicate case_id: {case_id}")
+            case_ids.add(case_id)
+            sanitized_rows.append({"case_id": case_id, "text": str(row["text"])})
+        self._rows = tuple(sanitized_rows)
 
     def search(self, query: str, top_k: int) -> list[dict[str, str]]:
         """Return the highest-overlap sanitized cases, with a stable case-id tie-break."""
 
+        if not isinstance(query, str):
+            raise ValueError("query must be a string")
+        if isinstance(top_k, bool) or not isinstance(top_k, int):
+            raise ValueError("top_k must be an integer")
         if top_k <= 0:
             return []
 
