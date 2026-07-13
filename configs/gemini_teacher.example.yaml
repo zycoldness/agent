@@ -1,0 +1,10 @@
+# Reference settings for scripts/generate_teacher_sft.py.
+# The CLI deliberately requires --allow-external-data on every invocation.
+model: gemini-2.5-pro
+data_classification: synthetic  # allowed: synthetic, public
+max_attempts: 3
+initial_backoff_seconds: 1.0
+# Set prices explicitly if cost estimation is needed; otherwise metadata is null.
+input_cost_per_million: null
+output_cost_per_million: null
+
