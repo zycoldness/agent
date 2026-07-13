@@ -46,6 +46,11 @@ def _action(tool: str, arguments: dict[str, object]) -> str:
     return json.dumps({"tool": tool, "arguments": arguments}, ensure_ascii=False)
 
 
+def _rule_observation(rule: PolicyRule | None = None) -> str:
+    rule = rule or _task().active_policy[0]
+    return json.dumps(rule.model_dump(mode="json"), ensure_ascii=False)
+
+
 def test_track_a_injects_full_policy_and_only_generates_final_action():
     row = export_track_a(_task(), _oracle())
 
@@ -70,8 +75,11 @@ def test_trajectory_serializes_one_valid_nonfinal_action_per_tool_turn():
         _task(),
         _oracle(),
         [
-            (_action("get_rule_detail", {"rule_id": "AD-001"}), '{"rule_id":"AD-001","text":"No guarantees."}'),
-            (_action("inspect_evidence", {"kinds": ["ocr"]}), '[{"evidence_id":"ocr-1","content":"Guaranteed"}]'),
+            (_action("get_rule_detail", {"rule_id": "AD-001"}), _rule_observation()),
+            (
+                _action("inspect_evidence", {"kinds": ["ocr"]}),
+                '[{"evidence_id":"ocr-1","asset_id":"asset-1","kind":"ocr","content":"Guaranteed"}]',
+            ),
         ],
     )
 
@@ -110,6 +118,77 @@ def test_trajectory_rejects_nested_oracle_object_in_a_tool_observation():
                     _action("search_case", {"query": "weight loss", "top_k": 1}),
                     '{"case_id":"case-1","oracle":{}}',
                 ),
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        "Oracle outcome: unsafe under AD-001.",
+        '{"verdict":"unsafe"}',
+        '[{"case_id":"case-1","text":"fact only","gold_evidence":["ocr-1"]}]',
+    ],
+)
+def test_trajectory_rejects_free_text_and_gold_style_tool_observations(observation: str):
+    with pytest.raises(ValueError, match="tool observation"):
+        export_trajectory(
+            _task(),
+            _oracle(),
+            [(_action("search_case", {"query": "weight loss", "top_k": 1}), observation)],
+        )
+
+
+def test_trajectory_rejects_rule_detail_that_does_not_match_requested_active_rule():
+    wrong_rule = PolicyRule(rule_id="AD-999", title="Other", text="Other text")
+    with pytest.raises(ValueError, match="active policy rule"):
+        export_trajectory(
+            _task(),
+            _oracle(),
+            [(_action("get_rule_detail", {"rule_id": "AD-001"}), _rule_observation(wrong_rule))],
+        )
+
+
+def test_trajectory_rejects_noncanonical_rule_detail_field_types():
+    malformed_rule = _task().active_policy[0].model_dump(mode="json")
+    malformed_rule["priority"] = "100"
+    with pytest.raises(ValueError, match="active policy rule"):
+        export_trajectory(
+            _task(),
+            _oracle(),
+            [
+                (
+                    _action("get_rule_detail", {"rule_id": "AD-001"}),
+                    json.dumps(malformed_rule),
+                )
+            ],
+        )
+
+
+def test_trajectory_rejects_evidence_outside_requested_asset_or_kind():
+    with pytest.raises(ValueError, match="requested asset and kinds"):
+        export_trajectory(
+            _task(),
+            _oracle(),
+            [
+                (
+                    _action("inspect_evidence", {"kinds": ["ocr"]}),
+                    '[{"evidence_id":"ocr-1","asset_id":"asset-2","kind":"metadata","content":"Guaranteed"}]',
+                )
+            ],
+        )
+
+
+def test_trajectory_rejects_case_result_with_unapproved_extra_field():
+    with pytest.raises(ValueError, match="sanitized case"):
+        export_trajectory(
+            _task(),
+            _oracle(),
+            [
+                (
+                    _action("search_case", {"query": "weight loss", "top_k": 1}),
+                    '[{"case_id":"case-1","text":"fact only","source_type":"case"}]',
+                )
             ],
         )
 
@@ -172,7 +251,7 @@ def test_cli_exports_deterministic_track_b_jsonl(tmp_path: Path):
                 "steps": [
                     {
                         "action": _action("get_rule_detail", {"rule_id": "AD-001"}),
-                        "observation": '{"rule_id":"AD-001","text":"No guarantees."}',
+                        "observation": _rule_observation(),
                     }
                 ],
             }
@@ -191,6 +270,34 @@ def test_cli_exports_deterministic_track_b_jsonl(tmp_path: Path):
     row = json.loads(first)
     assert row["messages"][0]["role"] == "system"
     assert json.loads(row["messages"][-1]["content"])["tool"] == "final_decision"
+
+
+@pytest.mark.parametrize("output_name", ["tasks.jsonl", "oracle.jsonl"])
+def test_cli_rejects_output_path_that_resolves_to_an_input_path(tmp_path: Path, output_name: str):
+    tasks = tmp_path / "tasks.jsonl"
+    oracle = tmp_path / "oracle.jsonl"
+    tasks.write_text(_task().model_dump_json() + "\n", encoding="utf-8")
+    oracle.write_text(_oracle().model_dump_json() + "\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/export_sft.py",
+            "track_a",
+            str(tasks),
+            str(oracle),
+            str(tmp_path / "." / output_name),
+        ],
+        cwd=Path(__file__).parents[1],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "must not be the same file" in result.stderr
+    assert tasks.read_text(encoding="utf-8") == _task().model_dump_json() + "\n"
+    assert oracle.read_text(encoding="utf-8") == _oracle().model_dump_json() + "\n"
 
 
 def test_synthetic_fixture_task_and_oracle_files_are_parseable_and_aligned():

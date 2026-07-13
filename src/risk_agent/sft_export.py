@@ -8,7 +8,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from risk_agent.contracts import Action, Oracle, Task
+from risk_agent.contracts import Action, Evidence, Oracle, PolicyRule, Task
 from risk_agent.policy import render_active_policy
 
 
@@ -16,8 +16,8 @@ SYSTEM_SUFFIX = (
     "Return exactly one JSON action on every assistant turn. "
     'The only valid format is {"tool": "...", "arguments": {...}}.'
 )
-_ORACLE_ONLY_OBSERVATION_KEYS = frozenset(
-    {"oracle", "label", "evidence_ids", "risk_level", "next_action"}
+_FORBIDDEN_OBSERVATION_KEYS = frozenset(
+    {"oracle", "label", "evidence_ids", "risk_level", "next_action", "verdict", "decision"}
 )
 _ALLOWED_EVIDENCE_KINDS = frozenset({"ocr", "asr", "frame", "metadata", "case"})
 
@@ -88,7 +88,7 @@ def _validate_tool_arguments(action: Action) -> None:
     raise ValueError("trajectory tool actions must not be final_decision")
 
 
-def _normalize_tool_action(action_text: object) -> str:
+def _parse_tool_action(action_text: object) -> Action:
     if not isinstance(action_text, str):
         raise ValueError("trajectory actions must be JSON strings")
     try:
@@ -102,30 +102,118 @@ def _normalize_tool_action(action_text: object) -> str:
     except ValidationError as error:
         raise ValueError("trajectory actions must be valid JSON action objects") from error
     _validate_tool_arguments(action)
-    return _compact_json(action.model_dump(mode="json"))
+    return action
 
 
-def _contains_oracle_only_field(value: object) -> bool:
+def _contains_forbidden_observation_field(value: object) -> bool:
     if isinstance(value, Mapping):
         return any(
-            key in _ORACLE_ONLY_OBSERVATION_KEYS or _contains_oracle_only_field(item)
+            isinstance(key, str)
+            and (key.casefold() in _FORBIDDEN_OBSERVATION_KEYS or key.casefold().startswith("gold"))
+            or _contains_forbidden_observation_field(item)
             for key, item in value.items()
         )
     if isinstance(value, list):
-        return any(_contains_oracle_only_field(item) for item in value)
+        return any(_contains_forbidden_observation_field(item) for item in value)
     return False
 
 
-def _normalize_observation(observation: object) -> str:
+def _parse_json_observation(observation: object) -> object:
     if not isinstance(observation, str):
         raise ValueError("trajectory observations must be strings")
     try:
-        parsed = json.loads(observation)
-    except json.JSONDecodeError:
-        return observation
-    if _contains_oracle_only_field(parsed):
+        return json.loads(observation)
+    except json.JSONDecodeError as error:
+        raise ValueError("tool observation must be valid JSON") from error
+
+
+def _normalize_rule_detail(task: Task, action: Action, observation: object) -> str:
+    if not isinstance(observation, Mapping) or set(observation) != {
+        "rule_id",
+        "title",
+        "text",
+        "exceptions",
+        "priority",
+    }:
+        raise ValueError("tool observation must be one active policy rule matching requested rule_id")
+    if (
+        not isinstance(observation["rule_id"], str)
+        or not isinstance(observation["title"], str)
+        or not isinstance(observation["text"], str)
+        or not isinstance(observation["exceptions"], list)
+        or any(not isinstance(item, str) for item in observation["exceptions"])
+        or isinstance(observation["priority"], bool)
+        or not isinstance(observation["priority"], int)
+    ):
+        raise ValueError("tool observation must be one active policy rule matching requested rule_id")
+    try:
+        rule = PolicyRule.model_validate(observation)
+    except ValidationError as error:
+        raise ValueError("tool observation must be one active policy rule matching requested rule_id") from error
+    requested_rule_id = action.arguments["rule_id"]
+    expected = next((item for item in task.active_policy if item.rule_id == requested_rule_id), None)
+    if expected is None or rule != expected:
+        raise ValueError("tool observation must be one active policy rule matching requested rule_id")
+    return _compact_json(rule.model_dump(mode="json"))
+
+
+def _normalize_case_results(action: Action, observation: object) -> str:
+    if not isinstance(observation, list):
+        raise ValueError("tool observation must contain sanitized case records only")
+    top_k = action.arguments.get("top_k", 3)
+    if len(observation) > top_k:
+        raise ValueError("tool observation must not contain more cases than requested")
+    normalized: list[dict[str, str]] = []
+    case_ids: set[str] = set()
+    for row in observation:
+        if not isinstance(row, Mapping) or set(row) != {"case_id", "text"}:
+            raise ValueError("tool observation must contain sanitized case records only")
+        case_id, text = row["case_id"], row["text"]
+        if not isinstance(case_id, str) or not case_id or not isinstance(text, str):
+            raise ValueError("tool observation must contain sanitized case records only")
+        if case_id in case_ids:
+            raise ValueError("tool observation must not repeat case_id values")
+        case_ids.add(case_id)
+        normalized.append({"case_id": case_id, "text": text})
+    return _compact_json(normalized)
+
+
+def _normalize_evidence(task: Task, action: Action, observation: object) -> str:
+    expected_keys = {"evidence_id", "asset_id", "kind", "content"}
+    if not isinstance(observation, list):
+        raise ValueError("tool observation evidence must match requested asset and kinds")
+    requested_kinds = set(action.arguments["kinds"])
+    normalized: list[dict[str, object]] = []
+    evidence_ids: set[str] = set()
+    for item in observation:
+        if not isinstance(item, Mapping) or set(item) != expected_keys:
+            raise ValueError("tool observation evidence must match requested asset and kinds")
+        if any(not isinstance(item[key], str) for key in expected_keys):
+            raise ValueError("tool observation evidence must match requested asset and kinds")
+        try:
+            evidence = Evidence.model_validate(item)
+        except ValidationError as error:
+            raise ValueError("tool observation evidence must match requested asset and kinds") from error
+        if evidence.asset_id != task.asset_id or evidence.kind not in requested_kinds:
+            raise ValueError("tool observation evidence must match requested asset and kinds")
+        if evidence.evidence_id in evidence_ids:
+            raise ValueError("tool observation must not repeat evidence_id values")
+        evidence_ids.add(evidence.evidence_id)
+        normalized.append(evidence.model_dump(mode="json"))
+    return _compact_json(normalized)
+
+
+def _normalize_observation(task: Task, action: Action, raw_observation: object) -> str:
+    observation = _parse_json_observation(raw_observation)
+    if _contains_forbidden_observation_field(observation):
         raise ValueError("tool observation must not contain an oracle field")
-    return observation
+    if action.tool == "get_rule_detail":
+        return _normalize_rule_detail(task, action, observation)
+    if action.tool == "search_case":
+        return _normalize_case_results(action, observation)
+    if action.tool == "inspect_evidence":
+        return _normalize_evidence(task, action, observation)
+    raise ValueError("trajectory tool actions must not be final_decision")
 
 
 def export_track_a(task: Task, oracle: Oracle) -> dict[str, list[dict[str, str]]]:
@@ -173,9 +261,10 @@ def export_trajectory(
         if not isinstance(step, (tuple, list)) or len(step) != 2:
             raise ValueError("each trajectory step must be an action-observation pair")
         action_text, observation = step
-        messages.append({"role": "assistant", "content": _normalize_tool_action(action_text)})
+        action = _parse_tool_action(action_text)
+        messages.append({"role": "assistant", "content": _compact_json(action.model_dump(mode="json"))})
         messages.append(
-            {"role": "user", "content": f"Tool observation: {_normalize_observation(observation)}"}
+            {"role": "user", "content": f"Tool observation: {_normalize_observation(task, action, observation)}"}
         )
     messages.append({"role": "assistant", "content": _final_action(oracle)})
     return {"messages": messages}

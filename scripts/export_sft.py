@@ -37,6 +37,25 @@ def _read_jsonl(path: Path, name: str) -> list[dict[str, Any]]:
     return records
 
 
+def _ensure_distinct_output_path(output_path: Path, *input_paths: Path) -> None:
+    """Reject aliases that would overwrite either validated source file."""
+
+    try:
+        output_resolved = output_path.resolve(strict=False)
+    except OSError as error:
+        raise ValueError(f"cannot resolve output path: {output_path}") from error
+    for input_path in input_paths:
+        try:
+            same_resolved_path = output_resolved == input_path.resolve(strict=False)
+            same_existing_file = (
+                output_path.exists() and input_path.exists() and output_path.samefile(input_path)
+            )
+        except OSError as error:
+            raise ValueError(f"cannot compare output path with input path: {input_path}") from error
+        if same_resolved_path or same_existing_file:
+            raise ValueError("output path must not be the same file as an input or oracle path")
+
+
 def _load_oracles(path: Path) -> dict[tuple[str, str], Oracle]:
     oracles: dict[tuple[str, str], Oracle] = {}
     for number, record in enumerate(_read_jsonl(path, "oracle input"), start=1):
@@ -135,6 +154,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("output_path", type=Path)
     args = parser.parse_args(argv)
     try:
+        _ensure_distinct_output_path(args.output_path, args.input_path, args.oracle_path)
         rows = build_rows(args.mode, args.input_path, args.oracle_path)
         write_jsonl_atomically(rows, args.output_path)
     except (OSError, ValueError) as error:
