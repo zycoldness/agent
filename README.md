@@ -5,7 +5,7 @@
 
 > [!IMPORTANT]
 > 本项目目前是 **SingGuard-style 简化训练复现**，不是官方训练过程的逐项精确复现。
-> 本仓库目前不包含 SingGuard 官方完整训练数据、训练脚本和全部超参数；这里实现的是动态 policy 数据契约、反事实数据、SFT 数据导出、确定性评测和受限 Agent 环境。官方模型 inference 适配，以及基于 [ms-swift](https://github.com/modelscope/ms-swift) 的 SFT、GRPO、OPD 配置仍在路线图中。
+> 本仓库目前不包含 SingGuard 官方完整训练数据、训练脚本和全部超参数；这里实现的是动态 policy 数据契约、反事实数据、SFT 数据导出、确定性评测和受限 Agent 环境。已经提供基于 [ms-swift](https://github.com/modelscope/ms-swift) 4.3 的单卡 LoRA SFT 基线；官方模型 inference 适配、GRPO 和 OPD 仍在路线图中。
 
 ## 两条实验主线
 
@@ -41,7 +41,7 @@
 | Track A / Track B messages JSONL 导出 | 已实现 | `src/risk_agent/sft_export.py` |
 | 有预算、可审计的 Gemini teacher 候选生成 | 已实现 | `src/risk_agent/teacher.py`、`synthesis.py` |
 | 官方 SingGuard 模型 inference / fast、fast-slow、slow 适配 | **尚未实现** | 路线图 |
-| ms-swift SFT 训练配置和启动脚本 | **尚未实现** | 路线图 |
+| ms-swift 4.3 单卡 H20 SFT 数据切分、LoRA 配置和安全启动脚本 | 已实现 | `src/risk_agent/ms_swift_sft.py`、`ms_swift_launcher.py` |
 | ms-swift 多轮 GYM / GRPO rollout 适配 | **尚未实现** | 路线图 |
 | OPD 训练配置与教师/学生实验 | **尚未实现** | 路线图 |
 
@@ -71,7 +71,13 @@ python -m pip install -e ".[dev]"
 python -m pip install -e ".[dev,teacher]"
 ```
 
-`.[train]` 声明了 `ms-swift` 可选依赖，但当前仓库还没有可直接运行的 SFT、GRPO 或 OPD 训练配置，因此安装它不等于训练链路已经完成。
+服务器运行 SFT 时安装锁定在 4.3 minor 的训练依赖：
+
+```bash
+python -m pip install -e ".[dev,train]"
+```
+
+本地开发和单测不需要安装 `ms-swift`；只有非 `--dry-run` 启动才会检查 `ms-swift>=4.3,<4.4` 和 `swift` 可执行文件。GRPO 与 OPD 尚未实现。
 
 ## 数据边界
 
@@ -92,7 +98,7 @@ Oracle               → 只进终局监督和评测，不进检索或工具 obs
 
 ## 导出 SFT 数据
 
-导出结果是通用 `messages` JSONL；当前代码只负责严格校验和序列化，尚未包含 ms-swift 训练启动命令。
+导出结果是通用 `messages` JSONL。单文件导出适合检查格式；真正训练前应继续构造分组切分 bundle。
 
 ### Track A：无工具 Guard
 
@@ -131,6 +137,62 @@ python scripts/export_sft.py \
 ```
 
 `data/processed/track_b_trajectories.jsonl` 是待生成的输入路径，仓库当前没有预置该文件。导出器会重新执行确定性查询并核对 observation：案例只能含 `case_id/text`，证据只能含 `evidence_id/asset_id/kind/content`，自由文本、Oracle 字段、跨素材证据和伪造检索结果都会被拒绝。所有记录先完成校验，再原子写入输出文件。
+
+### 构造 ms-swift train/dev/holdout bundle
+
+Track A 示例：
+
+```bash
+python scripts/prepare_ms_swift_sft.py \
+  track_a \
+  data/fixtures/tasks.jsonl \
+  data/fixtures/oracle.jsonl \
+  outputs/track_a_bundle \
+  --train-ratio 0.8 \
+  --dev-ratio 0.1 \
+  --holdout-ratio 0.1 \
+  --seed 42
+```
+
+切分以 `asset_id` 为组：同一素材的不同 policy 版本和反事实变体不会跨 train/dev/holdout。小数据允许 dev 或 holdout 为空，`manifest.json` 会明确记录每个 split 的样本数与素材组数。三份训练文件每行只有标准 `messages`，不会附带 `asset_id`、Oracle 或分组元数据；这些信息只参与切分和最终监督。输出目录必须不存在，完整校验后才独占发布。
+
+Track B 使用同一命令并增加闭世界底库：
+
+```bash
+python scripts/prepare_ms_swift_sft.py \
+  track_b \
+  data/processed/track_b_trajectories.jsonl \
+  data/fixtures/oracle.jsonl \
+  outputs/track_b_bundle \
+  --cases data/fixtures/cases.jsonl \
+  --evidence data/fixtures/evidence.jsonl \
+  --seed 42
+```
+
+### dry-run 与单卡 SFT
+
+先在不导入 ms-swift、不访问 GPU 的情况下验证 bundle 哈希和最终配置：
+
+```bash
+python scripts/launch_ms_swift_sft.py \
+  outputs/track_a_bundle \
+  --config configs/ms_swift/sft_qwen3_1_7b_lora.yaml \
+  --output-dir outputs/runs/qwen3-1.7b-track-a \
+  --device 0 \
+  --dry-run
+```
+
+dry-run 输出完整 `rendered_config`、argv 和环境变量。若 dev 为空，会显式渲染 `val_dataset: []` 与 `eval_strategy: no`，不会拿 train 充当验证集。确认后移除 `--dry-run` 即可真实启动：
+
+```bash
+python scripts/launch_ms_swift_sft.py \
+  outputs/track_a_bundle \
+  --config configs/ms_swift/sft_qwen3_1_7b_lora.yaml \
+  --output-dir outputs/runs/qwen3-1.7b-track-a \
+  --device 0
+```
+
+基线为 `Qwen/Qwen3-1.7B`、`tuner_type: lora`、bf16、`max_length: 4096`、batch size 1 加梯度累积和 gradient checkpointing；默认不启用 DeepSpeed、vLLM 或 4-bit。launcher 固定单进程单卡，通过 argv 调用而不使用 shell，并在进程结束后清理临时渲染配置。可用 `--model /path/to/local/model` 覆盖模型。
 
 ## Gemini teacher 合成
 
@@ -254,20 +316,18 @@ git checkout feature/singguard-risk-agent
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[dev,train]"
 python -m pytest -q
 ```
 
-运行训练前先确认服务器 CUDA、PyTorch、模型权重和 ms-swift 版本；当前分支尚未提供可直接启动的训练配置。
+先用较小样本 bundle 做 H20 smoke run，建议保持默认 4096 长度，只跑 1 epoch，并观察显存、首个 logging step、checkpoint 写入和 dev 行为。准备 bundle、执行 dry-run 和真实启动的完整命令见上面的“导出 SFT 数据”。本地测试不会下载模型、访问 GPU 或实际训练。
 
 ## 路线图
 
-1. 补齐规则驱动数据生成器和按原始素材分组的 train/dev/holdout pipeline。
-2. 接入 SingGuard 官方模型，复用官方 inference，增加批量适配和 `fast / fast-slow / slow` 对比评测。
-3. 增加单张 H20 优先的 2B LoRA/QLoRA ms-swift SFT 配置和可复现实验清单。
-4. 增加 Track A 的 GRPO 与 OPD 配方，奖励以 label、active rule、evidence、policy counterfactual 为确定性信号。
-5. 将现有 `RiskEnvironment` 适配到 ms-swift 多轮 rollout，先做 Tool-SFT，再做最多 3 轮 Agentic GRPO。
-6. 使用获批、去标识化业务 holdout 执行 30/60/90 gate，并与无工具 slow Guard 比较效果、成本和延迟。
+1. 接入 SingGuard 官方模型，复用官方 inference，增加批量适配和 `fast / fast-slow / slow` 对比评测。
+2. 增加 Track A 的 GRPO 与 OPD 配方，奖励以 label、active rule、evidence、policy counterfactual 为确定性信号。
+3. 将现有 `RiskEnvironment` 适配到 ms-swift 多轮 rollout，先做 Tool-SFT，再做最多 3 轮 Agentic GRPO。
+4. 使用获批、去标识化业务 holdout 执行 30/60/90 gate，并与无工具 slow Guard 比较效果、成本和延迟。
 
 ## 参考
 

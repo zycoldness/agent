@@ -15,7 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3"]
-train = ["ms-swift>=3.0"]
+train = ["ms-swift>=4.3,<4.4"]
 teacher = ["google-genai>=1.0"]
 
 [tool.pytest.ini_options]
