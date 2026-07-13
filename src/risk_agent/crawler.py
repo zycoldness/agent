@@ -6,10 +6,14 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 import hashlib
+from ipaddress import ip_address
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import Any
-from urllib.parse import parse_qsl, urlparse
+from unicodedata import normalize
+from urllib.parse import parse_qsl, unquote, urlparse
 from urllib.robotparser import RobotFileParser
 
 import httpx
@@ -98,6 +102,8 @@ def validate_source(source: Source) -> str:
     allowed_domains = {domain.casefold() for domain in source.allowed_domains}
     if parsed.scheme.casefold() != "https":
         raise ValueError("source must use HTTPS")
+    if not hostname or _is_local_or_ip_literal(hostname):
+        raise ValueError("source must not use a local or IP-literal hostname")
     if not hostname or hostname.casefold() not in allowed_domains:
         raise ValueError("source must use an exact allowlisted hostname")
     if parsed.username is not None or parsed.password is not None:
@@ -110,7 +116,7 @@ def validate_source(source: Source) -> str:
         raise ValueError("source URL must not use a non-standard port")
     if parsed.fragment:
         raise ValueError("source URL must not contain a fragment")
-    path_segments = {segment.casefold() for segment in parsed.path.split("/") if segment}
+    path_segments = set(_normalized_path_segments(parsed.path))
     if path_segments & _BLOCKED_ACCOUNT_ROUTE_SEGMENTS:
         raise ValueError("source URL must not target a user-account page")
     for name, _ in parse_qsl(parsed.query, keep_blank_values=True):
@@ -151,6 +157,11 @@ def fetch(
     """
 
     url = validate_source(source)
+    output_dir, metadata_dir = _prepare_output_directories(output_dir)
+    raw_path = raw_path_for(source, output_dir)
+    metadata_path = _safe_child(metadata_dir, metadata_path_for(source, output_dir).name)
+    _reject_symlink(raw_path)
+    _reject_symlink(metadata_path)
     owns_client = client is None
     if client is None:
         client = httpx.Client(timeout=TIMEOUT_SECONDS, follow_redirects=False, trust_env=False)
@@ -161,11 +172,6 @@ def fetch(
         if owns_client:
             client.close()
 
-    raw_path = raw_path_for(source, output_dir)
-    metadata_path = metadata_path_for(source, output_dir)
-    raw_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
-    raw_path.write_bytes(body)
     metadata = SourceMetadata(
         url=url,
         retrieved_at=retrieved_at or datetime.now(UTC).isoformat().replace("+00:00", "Z"),
@@ -175,10 +181,10 @@ def fetch(
         terms_review=source.terms_review,
         raw_path=raw_path.name,
     )
-    metadata_path.write_text(
-        json.dumps(asdict(metadata), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    # Both files are staged in their verified direct directories and atomically
+    # replaced, so a failed write cannot leave a truncated raw or sidecar file.
+    _atomic_write(raw_path, body)
+    _atomic_write(metadata_path, (json.dumps(asdict(metadata), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"))
     return raw_path
 
 
@@ -262,12 +268,91 @@ def _get_bounded(client: httpx.Client, url: str, byte_limit: int) -> bytes:
 
 
 def _safe_child(parent: Path, filename: str) -> Path:
-    """Defend output handling even if the configured output path is unusual."""
+    """Construct a controlled child path from a fixed, non-user filename."""
 
-    resolved_parent = parent.resolve()
-    candidate = (resolved_parent / filename).resolve()
+    if Path(filename).name != filename:
+        raise ValueError("crawler output filename must not contain a path")
+    return parent / filename
+
+
+def _is_local_or_ip_literal(hostname: str) -> bool:
+    """Reject local names and all numeric addresses, including IPv6 forms."""
+
+    normalized_hostname = hostname.casefold().rstrip(".")
+    if normalized_hostname == "localhost" or normalized_hostname.endswith(".localhost") or normalized_hostname.endswith(".local"):
+        return True
     try:
-        candidate.relative_to(resolved_parent)
-    except ValueError as error:  # pragma: no cover - fixed digest names make this defensive.
-        raise ValueError("crawler output escaped the configured output directory") from error
-    return candidate
+        ip_address(normalized_hostname)
+    except ValueError:
+        return False
+    return True
+
+
+def _normalized_path_segments(path: str) -> tuple[str, ...]:
+    """Decode and normalize route segments before matching account surfaces."""
+
+    decoded = path
+    # One decode matches typical server handling; repeat a bounded number of
+    # times to fail closed on common double-encoded route bypasses.
+    for _ in range(3):
+        next_decoded = unquote(decoded)
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
+    return tuple(normalize("NFKC", segment).casefold() for segment in decoded.split("/") if segment)
+
+
+def _prepare_output_directories(output_dir: Path) -> tuple[Path, Path]:
+    """Create only direct output directories; never traverse symlinks."""
+
+    direct_output_dir = _verify_direct_directory(Path(output_dir))
+    metadata_dir = _verify_direct_directory(direct_output_dir / "metadata")
+    return direct_output_dir, metadata_dir
+
+
+def _verify_direct_directory(directory: Path) -> Path:
+    direct_directory = directory.absolute()
+    _reject_symlinked_ancestors(direct_directory)
+    if direct_directory.exists() and not direct_directory.is_dir():
+        raise ValueError("crawler output path must be a directory")
+    direct_directory.mkdir(parents=True, exist_ok=True)
+    _reject_symlinked_ancestors(direct_directory)
+    if not direct_directory.is_dir():  # pragma: no cover - protects against a filesystem race.
+        raise ValueError("crawler output path must be a directory")
+    return direct_directory
+
+
+def _reject_symlinked_ancestors(path: Path) -> None:
+    candidate = path
+    while True:
+        if candidate.is_symlink():
+            raise ValueError("crawler output directories must not be symlinks")
+        if candidate == candidate.parent:
+            return
+        candidate = candidate.parent
+
+
+def _reject_symlink(path: Path) -> None:
+    if path.is_symlink():
+        raise ValueError("crawler output files must not be symlinks")
+
+
+def _atomic_write(path: Path, content: bytes) -> None:
+    """Write one output file atomically without following an existing link."""
+
+    _reject_symlink(path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _reject_symlinked_ancestors(path.parent)
+        _reject_symlink(path)
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise

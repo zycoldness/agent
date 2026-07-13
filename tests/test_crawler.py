@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import os
+from pathlib import Path
 
 import httpx
 import pytest
@@ -35,12 +37,17 @@ def test_source_requires_https_and_exact_allowlisted_hostname():
         "https://example.gov.cn/profile/alice",
         "https://example.gov.cn/settings",
         "https://example.gov.cn/dashboard",
+        "https://localhost/case/1",
+        "https://internal.local/case/1",
+        "https://127.0.0.1/case/1",
+        "https://[::1]/case/1",
+        "https://[2001:4860:4860::8888]/case/1",
     ],
 )
 def test_source_rejects_non_allowlisted_or_dangerous_urls(url: str):
     source = Source(url=url, allowed_domains=("example.gov.cn",))
 
-    with pytest.raises(ValueError, match="allowlisted|HTTPS|credentials|port|user-account"):
+    with pytest.raises(ValueError, match="allowlisted|HTTPS|credentials|port|user-account|local|IP-literal"):
         validate_source(source)
 
 
@@ -68,6 +75,22 @@ def test_source_allows_ordinary_public_query_parameters():
     )
 
     assert validate_source(source) == source.url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.gov.cn/%6cogin",
+        "https://example.gov.cn/%75ser/alice",
+        "https://example.gov.cn/%61ccount",
+        "https://example.gov.cn/%50%72%6f%46%69%6c%65/alice",
+    ],
+)
+def test_source_normalizes_encoded_account_route_segments(url: str):
+    source = Source(url=url, allowed_domains=("example.gov.cn",))
+
+    with pytest.raises(ValueError, match="user-account"):
+        validate_source(source)
 
 
 def test_fetch_obeys_robots_and_writes_raw_bytes_and_metadata(tmp_path):
@@ -165,3 +188,42 @@ sources:
 
     with pytest.raises(ValueError, match="allowlisted"):
         load_manifest(manifest)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows symlink privileges are not reliably available in CI")
+def test_fetch_rejects_symlinked_output_paths_before_any_network_request(tmp_path):
+    real_output = tmp_path / "real-output"
+    real_output.mkdir()
+    linked_output = tmp_path / "linked-output"
+    linked_output.symlink_to(real_output, target_is_directory=True)
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+
+    source = Source(url="https://example.gov.cn/case/1", allowed_domains=("example.gov.cn",))
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(ValueError, match="symlink"):
+            fetch(source, linked_output, client=client)
+
+    assert not called
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows symlink privileges are not reliably available in CI")
+@pytest.mark.parametrize("target_kind", ["raw", "metadata"])
+def test_fetch_rejects_preexisting_symlinked_raw_or_metadata_file(tmp_path, target_kind: str):
+    source = Source(url="https://example.gov.cn/case/1", allowed_domains=("example.gov.cn",))
+    raw_target = tmp_path / "sentinel"
+    raw_target.write_text("do not overwrite", encoding="utf-8")
+    digest = hashlib.sha256(source.url.encode("utf-8")).hexdigest()
+    linked_path = tmp_path / f"{digest}.raw"
+    if target_kind == "metadata":
+        linked_path = tmp_path / "metadata" / f"{digest}.json"
+        linked_path.parent.mkdir()
+    linked_path.symlink_to(raw_target)
+
+    with pytest.raises(ValueError, match="symlink"):
+        fetch(source, tmp_path)
+    assert raw_target.read_text(encoding="utf-8") == "do not overwrite"
