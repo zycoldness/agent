@@ -1,5 +1,7 @@
 """Bootstrap package contract tests."""
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -19,6 +21,15 @@ def test_action_parses_case_search_json() -> None:
 
     assert action.tool == "search_case"
     assert action.arguments == {"query": "减肥"}
+
+
+def test_action_serializes_immutable_arguments_as_json_objects() -> None:
+    action = Action.model_validate_json(
+        '{"tool":"search_case","arguments":{"query":"减肥"}}'
+    )
+
+    assert json.loads(action.model_dump_json())["arguments"] == {"query": "减肥"}
+    assert action.model_dump()["arguments"] == {"query": "减肥"}
 
 
 def test_action_arguments_are_immutable() -> None:

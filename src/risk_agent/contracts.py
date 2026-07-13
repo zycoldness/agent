@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 
 def _freeze(value: Any) -> Any:
@@ -17,6 +17,16 @@ def _freeze(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return tuple(_freeze(item) for item in value)
     raise TypeError(f"Action arguments must contain JSON-compatible values, not {type(value).__name__}")
+
+
+def _thaw(value: Any) -> Any:
+    """Recursively convert frozen argument containers to JSON containers."""
+
+    if isinstance(value, Mapping):
+        return {key: _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(item) for item in value]
+    return value
 
 
 class PolicyRule(BaseModel):
@@ -85,6 +95,12 @@ class Action(BaseModel):
             return _freeze(arguments)
         except TypeError as error:
             raise ValueError(str(error)) from error
+
+    @field_serializer("arguments")
+    def serialize_arguments(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        """Expose frozen arguments as ordinary JSON-compatible containers."""
+
+        return _thaw(arguments)
 
 
 class Decision(BaseModel):
