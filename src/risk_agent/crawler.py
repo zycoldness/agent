@@ -9,7 +9,7 @@ import hashlib
 import json
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 from urllib.robotparser import RobotFileParser
 
 import httpx
@@ -20,7 +20,46 @@ USER_AGENT = "risk-agent-research/0.1 (+contact-required)"
 TIMEOUT_SECONDS = 20.0
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_ROBOTS_BYTES = 256 * 1024
-_BLOCKED_ACCOUNT_SEGMENTS = frozenset({"account", "accounts", "auth", "login", "signin", "user", "users"})
+# We intentionally allow only public records.  These route segments are common
+# authenticated/profile surfaces and are blocked wherever they occur in a URL.
+_BLOCKED_ACCOUNT_ROUTE_SEGMENTS = frozenset(
+    {
+        "account",
+        "accounts",
+        "auth",
+        "dashboard",
+        "dashboards",
+        "login",
+        "profile",
+        "profiles",
+        "setting",
+        "settings",
+        "signin",
+        "user",
+        "users",
+    }
+)
+_SENSITIVE_QUERY_PARAMETER_NAMES = frozenset(
+    {
+        "accesstoken",
+        "apikey",
+        "authorization",
+        "authtoken",
+        "bearer",
+        "cookie",
+        "credential",
+        "jwt",
+        "key",
+        "password",
+        "passwd",
+        "secret",
+        "session",
+        "sessionid",
+        "sig",
+        "signature",
+        "token",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -63,13 +102,21 @@ def validate_source(source: Source) -> str:
         raise ValueError("source must use an exact allowlisted hostname")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("source URL must not contain credentials")
-    if parsed.port not in (None, 443):
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("source URL contains an invalid port") from error
+    if port not in (None, 443):
         raise ValueError("source URL must not use a non-standard port")
     if parsed.fragment:
         raise ValueError("source URL must not contain a fragment")
     path_segments = {segment.casefold() for segment in parsed.path.split("/") if segment}
-    if path_segments & _BLOCKED_ACCOUNT_SEGMENTS:
+    if path_segments & _BLOCKED_ACCOUNT_ROUTE_SEGMENTS:
         raise ValueError("source URL must not target a user-account page")
+    for name, _ in parse_qsl(parsed.query, keep_blank_values=True):
+        normalized_name = "".join(character for character in name.casefold() if character.isalnum())
+        if normalized_name in _SENSITIVE_QUERY_PARAMETER_NAMES:
+            raise ValueError("source URL must not contain a credential-bearing query parameter")
     if not all(isinstance(value, str) and value.strip() for value in (source.source_type, source.license, source.terms_review)):
         raise ValueError("source metadata fields must be non-empty strings")
     return source.url

@@ -32,13 +32,42 @@ def test_source_requires_https_and_exact_allowlisted_hostname():
         "https://user:secret@example.gov.cn/case/1",
         "file:///etc/passwd",
         "https://example.gov.cn:8443/case/1",
+        "https://example.gov.cn/profile/alice",
+        "https://example.gov.cn/settings",
+        "https://example.gov.cn/dashboard",
     ],
 )
 def test_source_rejects_non_allowlisted_or_dangerous_urls(url: str):
     source = Source(url=url, allowed_domains=("example.gov.cn",))
 
-    with pytest.raises(ValueError, match="allowlisted|HTTPS|credentials|port"):
+    with pytest.raises(ValueError, match="allowlisted|HTTPS|credentials|port|user-account"):
         validate_source(source)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.gov.cn/case/1?access_token=secret-value",
+        "https://example.gov.cn/case/1?SESSION_ID=secret-value",
+        "https://example.gov.cn/case/1?api-key=secret-value",
+    ],
+)
+def test_source_rejects_credential_bearing_query_without_echoing_it(url: str):
+    source = Source(url=url, allowed_domains=("example.gov.cn",))
+
+    with pytest.raises(ValueError, match="credential-bearing query") as error:
+        validate_source(source)
+
+    assert "secret-value" not in str(error.value)
+
+
+def test_source_allows_ordinary_public_query_parameters():
+    source = Source(
+        url="https://example.gov.cn/public-case.html?q=advertising&page=2",
+        allowed_domains=("example.gov.cn",),
+    )
+
+    assert validate_source(source) == source.url
 
 
 def test_fetch_obeys_robots_and_writes_raw_bytes_and_metadata(tmp_path):

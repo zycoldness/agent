@@ -4,7 +4,7 @@ This project uses the crawler only for individually listed, public research sour
 
 ## Access and collection boundaries
 
-- Each manifest URL must be HTTPS and its hostname must exactly match the manifest allowlist; subdomains, credentials, fragments, non-standard ports, and account-like paths are rejected.
+- Each manifest URL must be HTTPS and its hostname must exactly match the manifest allowlist; subdomains, credentials, fragments, non-standard ports, and account-like paths are rejected. The route-segment blocklist covers account, auth, dashboard, login, profile, settings, and user surfaces. Credential-bearing query parameter names (for example `access_token`, `session_id`, and `api-key`) are rejected without logging their values; ordinary public parameters such as `q` and `page` remain allowed.
 - The crawler sends one identified user agent, fetches and applies `robots.txt`, never authenticates, never follows redirects, and limits robots files and documents to bounded response sizes.
 - A source manifest is fully validated before the first request. URLs are fetched one at a time; there is no discovery, link traversal, pagination, or broad crawling.
 - Only the original response body is written as a deterministic `.raw` file. The crawler does not parse, label, normalize, or convert downloaded material into training data.
