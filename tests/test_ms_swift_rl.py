@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import subprocess
 import sys
@@ -51,22 +50,17 @@ def test_rl_bundle_is_group_split_like_sft_and_prompt_never_contains_answer(
 ) -> None:
     tasks, oracles = _sources(tmp_path)
     output = tmp_path / mode
-    prepared = prepare_rl_bundle(mode, tasks, oracles, output, seed=7)
-    manifest = prepared["manifest"]
+    manifest = prepare_rl_bundle(mode, tasks, oracles, output, seed=7)
 
     assert manifest["mode"] == mode
     assert manifest["track"] == "track_a"
-    assert manifest["split_algorithm"] == "sha256-seed-null-asset-id"
     expected = {name: set() for name in ("train", "dev", "holdout")}
     for index in range(8):
         asset_id = f"asset-{index}"
         expected[_split_for(asset_id, 7, SplitRatios())].add(asset_id)
     assert {k: set(v) for k, v in manifest["split_asset_ids"].items()} == expected
     assert manifest["asset_policy_versions"]["asset-0"] == ["policy-v1"]
-    assert len(prepared["manifest_sha256"]) == 64
-    assert prepared["manifest_sha256"] == hashlib.sha256(
-        (output / "manifest.json").read_bytes()
-    ).hexdigest()
+    assert json.loads((output / "manifest.json").read_text(encoding="utf-8")) == manifest
 
     all_rows = sum((_rows(output / f"{name}.jsonl") for name in expected), [])
     assert len(all_rows) == 8
@@ -84,19 +78,13 @@ def test_rl_bundle_is_group_split_like_sft_and_prompt_never_contains_answer(
             assert "Active policy" not in row["teacher_prompt"]
 
 
-def test_rl_manifest_hashes_exact_bytes_and_contains_policy_metadata_only(tmp_path: Path) -> None:
+def test_rl_rows_contain_training_fields_only(tmp_path: Path) -> None:
     tasks, oracles = _sources(tmp_path, 1)
     output = tmp_path / "bundle"
-    prepared = prepare_rl_bundle(
+    prepare_rl_bundle(
         "grpo", tasks, oracles, output,
         ratios=SplitRatios(train=1, dev=0, holdout=0), seed=11,
     )
-    manifest = prepared["manifest"]
-
-    payload = (output / "train.jsonl").read_bytes()
-    assert manifest["files"]["train.jsonl"] == {
-        "bytes": len(payload), "records": 1, "sha256": hashlib.sha256(payload).hexdigest()
-    }
     row = _rows(output / "train.jsonl")[0]
     assert set(row) == {"messages", "solution"}
     assert "asset_id" not in row and "policy_version" not in row
@@ -164,8 +152,8 @@ def test_prepare_rl_cli_emits_manifest_without_traceback(tmp_path: Path) -> None
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
-    assert payload["manifest"]["mode"] == "grpo"
-    assert len(payload["manifest_sha256"]) == 64
+    assert payload["mode"] == "grpo"
+    assert payload["split_counts"] == {"train": 1, "dev": 0, "holdout": 0}
 
 
 def test_same_asset_multiple_policies_is_deduplicated_in_split_manifest(tmp_path: Path) -> None:
@@ -176,8 +164,7 @@ def test_same_asset_multiple_policies_is_deduplicated_in_split_manifest(tmp_path
     oracle["policy_version"] = "policy-v2"
     tasks.write_text(tasks.read_text(encoding="utf-8") + json.dumps(task) + "\n", encoding="utf-8")
     oracles.write_text(oracles.read_text(encoding="utf-8") + json.dumps(oracle) + "\n", encoding="utf-8")
-    prepared = prepare_rl_bundle("grpo", tasks, oracles, tmp_path / "bundle")
-    manifest = prepared["manifest"]
+    manifest = prepare_rl_bundle("grpo", tasks, oracles, tmp_path / "bundle")
     assert manifest["asset_policy_versions"] == {"asset-0": ["policy-v1", "policy-v2"]}
     assert sum(manifest["asset_group_counts"].values()) == 1
     assert sum(len(ids) for ids in manifest["split_asset_ids"].values()) == 1

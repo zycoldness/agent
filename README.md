@@ -59,7 +59,7 @@ python scripts/prepare_ms_swift_sft.py track_a \
   --train-ratio 1 --dev-ratio 0 --holdout-ratio 0
 ```
 
-输出包含 `train.jsonl`、`dev.jsonl`、`holdout.jsonl` 和 `manifest.json`。同一 `asset_id` 的不同 policy version 始终进入同一 split，防止素材泄漏。
+输出包含 `train.jsonl`、`dev.jsonl`、`holdout.jsonl` 和一个只记录切分比例与数量的轻量 `manifest.json`。同一 `asset_id` 的不同 policy version 始终进入同一 split，防止素材泄漏。
 
 ### 2. SFT
 

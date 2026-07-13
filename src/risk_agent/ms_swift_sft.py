@@ -1,11 +1,10 @@
-"""Prepare deterministic, leak-free messages JSONL bundles for ms-swift SFT."""
+"""Convert risk tasks and oracles into ms-swift SFT JSONL files."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import math
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -49,15 +48,11 @@ def _reject_nonfinite_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant is forbidden: {value}")
 
 
-def _read_jsonl(path: Path, name: str) -> tuple[list[dict[str, Any]], bytes]:
+def _read_jsonl(path: Path, name: str) -> list[dict[str, Any]]:
     try:
-        payload = path.read_bytes()
-    except OSError as error:
-        raise ValueError(f"cannot read {name}: {path}") from error
-    try:
-        text = payload.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError(f"{name} must be UTF-8") from error
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ValueError(f"cannot read UTF-8 {name}: {path}") from error
     lines = text.splitlines()
     if not lines:
         raise ValueError(f"{name} must contain at least one record")
@@ -76,7 +71,7 @@ def _read_jsonl(path: Path, name: str) -> tuple[list[dict[str, Any]], bytes]:
         if not isinstance(record, dict):
             raise ValueError(f"{name} line {number} must be a JSON object")
         records.append(record)
-    return records, payload
+    return records
 
 
 def _require_fields(
@@ -109,8 +104,8 @@ def _parse_task(record: dict[str, Any], context: str) -> Task:
         raise ValueError(f"{context} is invalid") from error
 
 
-def _load_oracles(path: Path) -> tuple[dict[tuple[str, str], Oracle], bytes]:
-    records, payload = _read_jsonl(path, "oracle input")
+def _load_oracles(path: Path) -> dict[tuple[str, str], Oracle]:
+    records = _read_jsonl(path, "oracle input")
     result: dict[tuple[str, str], Oracle] = {}
     for number, record in enumerate(records, start=1):
         _require_fields(record, _ORACLE_REQUIRED, _ORACLE_OPTIONAL, f"oracle input line {number}")
@@ -122,11 +117,11 @@ def _load_oracles(path: Path) -> tuple[dict[tuple[str, str], Oracle], bytes]:
         if key in result:
             raise ValueError(f"duplicate oracle record for {key[0]!r}, {key[1]!r}")
         result[key] = oracle
-    return result, payload
+    return result
 
 
-def _load_stores(cases_path: Path, evidence_path: Path) -> tuple[CaseStore, EvidenceStore, bytes, bytes]:
-    case_records, case_payload = _read_jsonl(cases_path, "case input")
+def _load_stores(cases_path: Path, evidence_path: Path) -> tuple[CaseStore, EvidenceStore]:
+    case_records = _read_jsonl(cases_path, "case input")
     cases: list[dict[str, str]] = []
     for number, record in enumerate(case_records, start=1):
         if set(record) != {"case_id", "text"}:
@@ -135,7 +130,7 @@ def _load_stores(cases_path: Path, evidence_path: Path) -> tuple[CaseStore, Evid
             raise ValueError(f"case input line {number} is invalid")
         cases.append(record)  # type: ignore[arg-type]
 
-    evidence_records, evidence_payload = _read_jsonl(evidence_path, "evidence input")
+    evidence_records = _read_jsonl(evidence_path, "evidence input")
     evidence: list[Evidence] = []
     for number, record in enumerate(evidence_records, start=1):
         if set(record) != {"evidence_id", "asset_id", "kind", "content"}:
@@ -145,7 +140,7 @@ def _load_stores(cases_path: Path, evidence_path: Path) -> tuple[CaseStore, Evid
         except ValidationError as error:
             raise ValueError(f"evidence input line {number} is invalid") from error
     try:
-        return CaseStore(cases), EvidenceStore(evidence), case_payload, evidence_payload
+        return CaseStore(cases), EvidenceStore(evidence)
     except ValueError as error:
         raise ValueError("case or evidence input is invalid") from error
 
@@ -174,36 +169,14 @@ def _split_for(asset_id: str, seed: int, ratios: SplitRatios) -> str:
     return "holdout"
 
 
-def _source_fingerprint(payload: bytes) -> dict[str, object]:
-    return {"bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
-
-
-def _jsonl_bytes(rows: list[dict[str, object]]) -> bytes:
-    return b"".join(
-        (
-            json.dumps(
-                row,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            )
-            + "\n"
-        ).encode("utf-8")
-        for row in rows
+def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+    path.write_text(
+        "".join(
+            json.dumps(row, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
+            for row in rows
+        ),
+        encoding="utf-8",
     )
-
-
-def _ensure_distinct_sources(paths: list[Path]) -> None:
-    identities: set[Path] = set()
-    for path in paths:
-        try:
-            identity = path.resolve(strict=True)
-        except OSError as error:
-            raise ValueError(f"cannot resolve source file: {path}") from error
-        if identity in identities:
-            raise ValueError("all inputs must be distinct source files")
-        identities.add(identity)
 
 
 def _build_rows(
@@ -212,25 +185,17 @@ def _build_rows(
     oracle_path: Path,
     cases_path: Path | None,
     evidence_path: Path | None,
-) -> tuple[list[tuple[str, str, dict[str, object]]], dict[str, dict[str, object]]]:
-    oracles, oracle_payload = _load_oracles(oracle_path)
-    input_records, input_payload = _read_jsonl(
+) -> list[tuple[str, str, dict[str, object]]]:
+    oracles = _load_oracles(oracle_path)
+    input_records = _read_jsonl(
         input_path, "task input" if track == "track_a" else "trajectory input"
     )
-    sources = {
-        "input": _source_fingerprint(input_payload),
-        "oracle": _source_fingerprint(oracle_payload),
-    }
     case_store: CaseStore | None = None
     evidence_store: EvidenceStore | None = None
     if track == "track_b":
         if cases_path is None or evidence_path is None:
             raise ValueError("track_b requires cases_path and evidence_path")
-        case_store, evidence_store, case_payload, evidence_payload = _load_stores(
-            cases_path, evidence_path
-        )
-        sources["cases"] = _source_fingerprint(case_payload)
-        sources["evidence"] = _source_fingerprint(evidence_payload)
+        case_store, evidence_store = _load_stores(cases_path, evidence_path)
     elif cases_path is not None or evidence_path is not None:
         raise ValueError("cases_path and evidence_path are only valid for track_b")
 
@@ -277,7 +242,7 @@ def _build_rows(
     if unmatched:
         first = sorted(unmatched)[0]
         raise ValueError(f"unmatched oracle record for {first[0]!r}, {first[1]!r}")
-    return rows, sources
+    return rows
 
 
 def prepare_sft_bundle(
@@ -291,7 +256,7 @@ def prepare_sft_bundle(
     ratios: SplitRatios = SplitRatios(),
     seed: int = 42,
 ) -> dict[str, object]:
-    """Validate all sources and exclusively publish a split messages bundle."""
+    """Validate inputs and write train, dev and holdout JSONL files."""
 
     output_dir = output_dir.absolute()
     if track not in ("track_a", "track_b"):
@@ -299,22 +264,10 @@ def prepare_sft_bundle(
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ValueError("seed must be an integer")
     _validate_ratios(ratios)
-    source_paths = [input_path, oracle_path]
-    if cases_path is not None:
-        source_paths.append(cases_path)
-    if evidence_path is not None:
-        source_paths.append(evidence_path)
-    _ensure_distinct_sources(source_paths)
     if output_dir.exists():
         raise ValueError("output directory must not exist")
-    try:
-        output_identity = output_dir.resolve(strict=False)
-    except OSError as error:
-        raise ValueError(f"cannot resolve output directory: {output_dir}") from error
-    if output_identity in {path.resolve(strict=True) for path in source_paths}:
-        raise ValueError("output path must not alias a source file")
 
-    rows, sources = _build_rows(track, input_path, oracle_path, cases_path, evidence_path)
+    rows = _build_rows(track, input_path, oracle_path, cases_path, evidence_path)
     split_rows: dict[str, list[dict[str, object]]] = {name: [] for name in _SPLITS}
     split_assets: dict[str, set[str]] = {name: set() for name in _SPLITS}
     for asset_id, _policy_version, row in rows:
@@ -322,19 +275,7 @@ def prepare_sft_bundle(
         split_rows[split].append(row)
         split_assets[split].add(asset_id)
 
-    payloads = {f"{split}.jsonl": _jsonl_bytes(split_rows[split]) for split in _SPLITS}
-    files = {
-        name: {
-            "bytes": len(payload),
-            "records": len(split_rows[name.removesuffix(".jsonl")]),
-            "sha256": hashlib.sha256(payload).hexdigest(),
-        }
-        for name, payload in payloads.items()
-    }
     manifest: dict[str, object] = {
-        "schema_version": 1,
-        "format": "ms-swift-messages-jsonl",
-        "status": "complete",
         "track": track,
         "seed": seed,
         "ratios": {
@@ -342,104 +283,19 @@ def prepare_sft_bundle(
             "dev": ratios.dev,
             "holdout": ratios.holdout,
         },
-        "sources": sources,
         "split_counts": {name: len(split_rows[name]) for name in _SPLITS},
         "asset_group_counts": {name: len(split_assets[name]) for name in _SPLITS},
-        "files": files,
     }
-    manifest_payload = (
-        json.dumps(
-            manifest,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-        + "\n"
-    ).encode("utf-8")
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     try:
         output_dir.mkdir(exist_ok=False)
     except FileExistsError as error:
         raise ValueError("output directory must not exist") from error
-    created_identity = os.stat(output_dir, follow_symlinks=False)
-    if os.name == "posix":
-        output_dir.chmod(0o700)
-    _publish_reserved_bundle(
-        output_dir,
-        created_identity,
-        payloads,
-        manifest_payload,
+    for split in _SPLITS:
+        _write_jsonl(output_dir / f"{split}.jsonl", split_rows[split])
+    (output_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n",
+        encoding="utf-8",
     )
     return manifest
-
-
-def _publish_reserved_bundle(
-    output_dir: Path,
-    created_identity: os.stat_result,
-    payloads: dict[str, bytes],
-    manifest_payload: bytes,
-) -> None:
-    """Write split members and then the manifest without trusting the path again."""
-
-    ordered_members = (*payloads.items(), ("manifest.json", manifest_payload))
-    if os.name == "posix":
-        directory_flags = os.O_RDONLY
-        directory_flags |= getattr(os, "O_CLOEXEC", 0)
-        directory_flags |= getattr(os, "O_DIRECTORY", 0)
-        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
-        output_fd = os.open(output_dir, directory_flags)
-        try:
-            held_identity = os.fstat(output_fd)
-            if not os.path.samestat(created_identity, held_identity):
-                raise RuntimeError("SFT bundle reservation path identity changed")
-            for filename, payload in ordered_members:
-                _require_reservation_identity(output_dir, held_identity)
-                _write_reserved_member(output_dir, output_fd, filename, payload)
-                _require_reservation_identity(output_dir, held_identity)
-        finally:
-            os.close(output_fd)
-        return
-
-    for filename, payload in ordered_members:
-        # Python does not expose Windows directory-relative create.  Recheck
-        # twice before opening so a replacement triggered by the first probe
-        # is detected before any member is written, and check again after.
-        _require_reservation_identity(output_dir, created_identity)
-        _require_reservation_identity(output_dir, created_identity)
-        _write_reserved_member(output_dir, None, filename, payload)
-        _require_reservation_identity(output_dir, created_identity)
-
-
-def _require_reservation_identity(output_dir: Path, identity: os.stat_result) -> None:
-    try:
-        matches = os.path.samestat(identity, os.stat(output_dir, follow_symlinks=False))
-    except OSError:
-        matches = False
-    if not matches:
-        raise RuntimeError("SFT bundle reservation path identity changed")
-
-
-def _write_reserved_member(
-    output_dir: Path,
-    output_fd: int | None,
-    filename: str,
-    payload: bytes,
-) -> None:
-    """Exclusively create a member relative to the held directory on POSIX."""
-
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    if output_fd is None:
-        descriptor = os.open(output_dir / filename, flags, 0o600)
-    else:
-        descriptor = os.open(filename, flags, 0o600, dir_fd=output_fd)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = -1
-            handle.write(payload)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)

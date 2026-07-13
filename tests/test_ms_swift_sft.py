@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-import risk_agent.ms_swift_sft as ms_swift_sft
 from risk_agent.contracts import Oracle, PolicyRule, Task
 from risk_agent.ms_swift_sft import SplitRatios, prepare_sft_bundle
 
@@ -94,18 +91,12 @@ def test_prepare_bundle_is_deterministic_and_training_rows_only_contain_messages
         one = (tmp_path / "one" / f"{split}.jsonl").read_bytes()
         two = (tmp_path / "two" / f"{split}.jsonl").read_bytes()
         assert one == two
-        assert first["files"][f"{split}.jsonl"]["sha256"] == hashlib.sha256(one).hexdigest()
-        assert second["files"][f"{split}.jsonl"]["sha256"] == hashlib.sha256(two).hexdigest()
         assert all(set(row) == {"messages"} for row in _read_rows(tmp_path / "one" / f"{split}.jsonl"))
 
     manifest = json.loads((tmp_path / "one" / "manifest.json").read_text(encoding="utf-8"))
     assert manifest == first
-    assert manifest["status"] == "complete"
-    assert manifest["schema_version"] == 1
-    assert manifest["format"] == "ms-swift-messages-jsonl"
+    assert second == first
     assert manifest["track"] == "track_a"
-    assert set(manifest["sources"]) == {"input", "oracle"}
-    assert all(set(item) == {"bytes", "sha256"} for item in manifest["sources"].values())
 
 
 def test_prepare_bundle_allows_empty_splits_and_reports_them(tmp_path: Path) -> None:
@@ -121,6 +112,26 @@ def test_prepare_bundle_allows_empty_splits_and_reports_them(tmp_path: Path) -> 
 
     assert manifest["split_counts"] == {"train": 1, "dev": 0, "holdout": 0}
     assert manifest["asset_group_counts"] == {"train": 1, "dev": 0, "holdout": 0}
+
+
+def test_manifest_only_keeps_split_metadata_needed_for_experiments(tmp_path: Path) -> None:
+    tasks, oracles = _write_track_a_sources(tmp_path, [("asset-1", "policy-v1")])
+
+    manifest = prepare_sft_bundle(
+        "track_a",
+        tasks,
+        oracles,
+        tmp_path / "bundle",
+        ratios=SplitRatios(train=1, dev=0, holdout=0),
+    )
+
+    assert set(manifest) == {
+        "track",
+        "seed",
+        "ratios",
+        "split_counts",
+        "asset_group_counts",
+    }
     assert (tmp_path / "bundle" / "dev.jsonl").read_bytes() == b""
 
 
@@ -174,67 +185,13 @@ def test_prepare_bundle_rejects_duplicate_json_keys_and_extra_input_fields(tmp_p
         prepare_sft_bundle("track_a", tasks, oracles, tmp_path / "extra")
 
 
-def test_prepare_bundle_rejects_existing_output_and_source_path_aliases(tmp_path: Path) -> None:
+def test_prepare_bundle_rejects_existing_output(tmp_path: Path) -> None:
     tasks, oracles = _write_track_a_sources(tmp_path, [("asset-1", "policy-v1")])
     output = tmp_path / "bundle"
     output.mkdir()
 
     with pytest.raises(ValueError, match="must not exist"):
         prepare_sft_bundle("track_a", tasks, oracles, output)
-
-    with pytest.raises(ValueError, match="distinct source files"):
-        prepare_sft_bundle("track_a", tasks, tasks, tmp_path / "alias")
-
-
-def test_prepare_bundle_publish_failure_never_leaves_a_complete_manifest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    tasks, oracles = _write_track_a_sources(tmp_path, [("asset-1", "policy-v1")])
-    output = tmp_path / "bundle"
-    original_write = ms_swift_sft._write_reserved_member
-
-    def fail_during_split_write(
-        output_dir: Path, output_fd: int | None, filename: str, payload: bytes
-    ) -> None:
-        if filename == "dev.jsonl":
-            raise OSError("simulated disk failure")
-        original_write(output_dir, output_fd, filename, payload)
-
-    monkeypatch.setattr(ms_swift_sft, "_write_reserved_member", fail_during_split_write)
-    with pytest.raises(OSError, match="simulated disk failure"):
-        prepare_sft_bundle("track_a", tasks, oracles, output)
-
-    assert not (output / "manifest.json").exists()
-    assert output.is_dir()
-
-
-def test_bundle_reservation_identity_swap_never_writes_replacement_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    tasks, oracles = _write_track_a_sources(tmp_path, [("asset-1", "policy-v1")])
-    output = tmp_path / "bundle"
-    displaced = tmp_path / "owned-reservation"
-    original_samestat = os.path.samestat
-    swapped = False
-
-    def swap_after_first_identity_match(first, second):
-        nonlocal swapped
-        result = original_samestat(first, second)
-        if result and not swapped:
-            output.rename(displaced)
-            output.mkdir()
-            (output / "competitor.txt").write_text("keep", encoding="utf-8")
-            swapped = True
-        return result
-
-    monkeypatch.setattr(ms_swift_sft.os.path, "samestat", swap_after_first_identity_match)
-
-    with pytest.raises(RuntimeError, match="reservation path identity changed"):
-        prepare_sft_bundle("track_a", tasks, oracles, output)
-
-    assert swapped is True
-    assert sorted(path.name for path in output.iterdir()) == ["competitor.txt"]
-    assert (output / "competitor.txt").read_text(encoding="utf-8") == "keep"
 
 
 def test_prepare_track_b_uses_validated_stores_and_only_emits_messages(tmp_path: Path) -> None:
@@ -285,7 +242,8 @@ def test_prepare_track_b_uses_validated_stores_and_only_emits_messages(tmp_path:
         ratios=SplitRatios(train=1.0, dev=0.0, holdout=0.0),
     )
 
-    assert set(manifest["sources"]) == {"input", "oracle", "cases", "evidence"}
+    assert manifest["track"] == "track_b"
+    assert manifest["split_counts"] == {"train": 1, "dev": 0, "holdout": 0}
     assert set(_read_rows(tmp_path / "bundle" / "train.jsonl")[0]) == {"messages"}
 
 
