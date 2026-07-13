@@ -1,0 +1,9 @@
+# This is a public-source manifest example, not a crawl seed list.
+# Add each URL only after confirming that its terms/license permit the intended review.
+allowed_domains:
+  - example.gov.cn
+sources:
+  - url: https://example.gov.cn/public-case.html
+    source_type: public_case
+    license: public notice
+    terms_review: reviewed
