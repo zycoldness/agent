@@ -1,12 +1,14 @@
-"""Structured teacher providers for offline SFT candidate generation.
+"""Structured, bounded teacher providers for offline SFT generation.
 
-Provider prompts may contain privileged supervision. Callers must never persist the
-request; only the validated payload and aggregate usage metadata may leave this module.
+Provider prompts may contain privileged supervision. Callers must never persist a
+request or raw provider error; only validated payloads and aggregate accounting may
+leave this module.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from collections.abc import Callable, Mapping
@@ -14,16 +16,34 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 
+def _finite_nonnegative(value: float, name: str, *, maximum: float | None = None) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite non-negative number")
+    result = float(value)
+    if not math.isfinite(result) or result < 0 or (maximum is not None and result > maximum):
+        raise ValueError(f"{name} must be a finite non-negative number")
+    return result
+
+
 @dataclass(frozen=True)
 class TeacherUsage:
-    """Non-sensitive request and cost accounting metadata."""
+    """Non-sensitive aggregate request and cost accounting metadata."""
 
     provider: str
     model: str
     request_count: int = 1
-    input_tokens: int | None = None
-    output_tokens: int | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
     estimated_cost_usd: float | None = None
+    accounting_complete: bool = False
+
+    def __post_init__(self) -> None:
+        for name in ("request_count", "input_tokens", "output_tokens"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.estimated_cost_usd is not None:
+            _finite_nonnegative(self.estimated_cost_usd, "estimated_cost_usd")
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -33,6 +53,7 @@ class TeacherUsage:
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "estimated_cost_usd": self.estimated_cost_usd,
+            "accounting_complete": self.accounting_complete,
         }
 
 
@@ -44,11 +65,146 @@ class TeacherReply:
     usage: TeacherUsage
 
 
-class Teacher(Protocol):
-    """Injected structured teacher interface used by the synthesis pipeline."""
+class TeacherRequestError(RuntimeError):
+    """Sanitized provider failure retaining accounting but no raw exception."""
 
+    def __init__(self, message: str, usage: TeacherUsage) -> None:
+        super().__init__(message)
+        self.usage = usage
+
+
+class TeacherBudgetExceeded(RuntimeError):
+    """Raised before a known batch budget would be exceeded."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class Teacher(Protocol):
     def generate(self, request: Mapping[str, Any]) -> TeacherReply:
         """Return one JSON object without persisting the privileged request."""
+
+
+class _UsageAccumulator:
+    def __init__(
+        self,
+        provider: str,
+        model: str,
+        input_price: float | None,
+        output_price: float | None,
+    ) -> None:
+        self.provider = provider
+        self.model = model
+        self.input_price = input_price
+        self.output_price = output_price
+        self.requests = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.cost = 0.0
+        self.accounting_complete = True
+
+    def add(
+        self,
+        input_tokens: object,
+        output_tokens: object,
+        *,
+        explicit_cost: float | None = None,
+    ) -> TeacherUsage:
+        self.requests += 1
+        valid_usage = (
+            isinstance(input_tokens, int)
+            and not isinstance(input_tokens, bool)
+            and input_tokens >= 0
+            and isinstance(output_tokens, int)
+            and not isinstance(output_tokens, bool)
+            and output_tokens >= 0
+        )
+        if valid_usage:
+            self.input_tokens += input_tokens
+            self.output_tokens += output_tokens
+        else:
+            self.accounting_complete = False
+        if explicit_cost is not None:
+            self.cost += explicit_cost
+        elif valid_usage and self.input_price is not None and self.output_price is not None:
+            self.cost += (
+                input_tokens * self.input_price + output_tokens * self.output_price
+            ) / 1_000_000
+        return self.snapshot()
+
+    def snapshot(self) -> TeacherUsage:
+        has_cost = self.input_price is not None and self.output_price is not None
+        return TeacherUsage(
+            provider=self.provider,
+            model=self.model,
+            request_count=self.requests,
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            estimated_cost_usd=self.cost if has_cost else None,
+            accounting_complete=self.accounting_complete,
+        )
+
+
+class TeacherBudget:
+    """Shared attempt-level ledger used to enforce CLI batch budgets."""
+
+    def __init__(
+        self,
+        *,
+        max_requests: int | None = None,
+        max_estimated_cost_usd: float | None = None,
+    ) -> None:
+        if max_requests is not None and (
+            isinstance(max_requests, bool) or not isinstance(max_requests, int) or max_requests < 0
+        ):
+            raise ValueError("max_requests must be a non-negative integer")
+        if max_estimated_cost_usd is not None:
+            max_estimated_cost_usd = _finite_nonnegative(
+                max_estimated_cost_usd, "max_estimated_cost_usd"
+            )
+        self.max_requests = max_requests
+        self.max_estimated_cost_usd = max_estimated_cost_usd
+        self.request_count = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.estimated_cost_usd = 0.0
+        self.accounting_complete = True
+
+    def reserve_request(self) -> None:
+        if self.max_requests is not None and self.request_count >= self.max_requests:
+            raise TeacherBudgetExceeded("max_requests")
+        if self.max_estimated_cost_usd is not None:
+            if not self.accounting_complete:
+                raise TeacherBudgetExceeded("cost_accounting_incomplete")
+            if self.estimated_cost_usd >= self.max_estimated_cost_usd:
+                raise TeacherBudgetExceeded("max_estimated_cost")
+        self.request_count += 1
+
+    def record_attempt(self, usage: TeacherUsage) -> None:
+        self.input_tokens += usage.input_tokens
+        self.output_tokens += usage.output_tokens
+        self.accounting_complete = self.accounting_complete and usage.accounting_complete
+        if usage.estimated_cost_usd is None:
+            if self.max_estimated_cost_usd is not None:
+                self.accounting_complete = False
+                raise TeacherBudgetExceeded("cost_accounting_incomplete")
+        else:
+            self.estimated_cost_usd += usage.estimated_cost_usd
+        if (
+            self.max_estimated_cost_usd is not None
+            and self.estimated_cost_usd > self.max_estimated_cost_usd
+        ):
+            raise TeacherBudgetExceeded("max_estimated_cost")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "request_count": self.request_count,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "estimated_cost_usd": self.estimated_cost_usd,
+            "accounting_complete": self.accounting_complete,
+        }
 
 
 def _parse_object(value: object) -> dict[str, Any]:
@@ -63,7 +219,7 @@ def _parse_object(value: object) -> dict[str, Any]:
 
 
 class CallableTeacher:
-    """Adapt an injected callable for deterministic tests or private providers."""
+    """Adapt one injected request callable for deterministic tests/private providers."""
 
     def __init__(
         self,
@@ -71,19 +227,39 @@ class CallableTeacher:
         *,
         provider: str = "callable",
         model: str = "injected",
+        budget: TeacherBudget | None = None,
     ) -> None:
         self._call = call
         self._provider = provider
         self._model = model
+        self._budget = budget
 
     def generate(self, request: Mapping[str, Any]) -> TeacherReply:
-        value = self._call(request)
-        if isinstance(value, TeacherReply):
-            return value
-        return TeacherReply(
-            payload=_parse_object(value),
-            usage=TeacherUsage(provider=self._provider, model=self._model),
-        )
+        if self._budget is not None:
+            self._budget.reserve_request()
+        provider_failed = False
+        try:
+            value = self._call(request)
+        except TeacherBudgetExceeded:
+            raise
+        except Exception:
+            provider_failed = True
+        if provider_failed:
+            usage = TeacherUsage(provider=self._provider, model=self._model)
+            if self._budget is not None:
+                self._budget.record_attempt(usage)
+            raise TeacherRequestError("teacher request failed after 1 attempt", usage) from None
+        if not isinstance(value, TeacherReply):
+            usage = TeacherUsage(provider=self._provider, model=self._model)
+            if self._budget is not None:
+                self._budget.record_attempt(usage)
+            return TeacherReply(payload=_parse_object(value), usage=usage)
+        reply = value
+        if reply.usage.request_count != 1:
+            raise ValueError("CallableTeacher replies must account for exactly one request")
+        if self._budget is not None:
+            self._budget.record_attempt(reply.usage)
+        return reply
 
 
 _ACTION_SCHEMA: dict[str, object] = {
@@ -101,7 +277,7 @@ _ACTION_SCHEMA: dict[str, object] = {
 
 
 class GeminiTeacher:
-    """Lazily loaded Gemini JSON provider with bounded retries and accounting."""
+    """Lazily loaded Gemini JSON provider with finite timeout and retries."""
 
     def __init__(
         self,
@@ -110,39 +286,74 @@ class GeminiTeacher:
         client_factory: Callable[[], object] | None = None,
         max_attempts: int = 3,
         initial_backoff_seconds: float = 1.0,
+        max_backoff_seconds: float = 30.0,
+        request_timeout_seconds: float = 60.0,
         sleep: Callable[[float], None] = time.sleep,
         input_cost_per_million: float | None = None,
         output_cost_per_million: float | None = None,
+        budget: TeacherBudget | None = None,
     ) -> None:
-        if not 1 <= max_attempts <= 5:
+        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or not 1 <= max_attempts <= 5:
             raise ValueError("max_attempts must be between 1 and 5")
-        if initial_backoff_seconds < 0:
-            raise ValueError("initial_backoff_seconds must be non-negative")
         self.model = model
         self._client_factory = client_factory
         self._max_attempts = max_attempts
-        self._initial_backoff_seconds = initial_backoff_seconds
+        self._initial_backoff_seconds = _finite_nonnegative(
+            initial_backoff_seconds, "initial_backoff_seconds", maximum=300
+        )
+        self._max_backoff_seconds = _finite_nonnegative(
+            max_backoff_seconds, "max_backoff_seconds", maximum=300
+        )
+        self._request_timeout_seconds = _finite_nonnegative(
+            request_timeout_seconds, "request_timeout_seconds", maximum=600
+        )
+        if self._request_timeout_seconds == 0:
+            raise ValueError("request_timeout_seconds must be positive")
         self._sleep = sleep
-        self._input_cost_per_million = input_cost_per_million
-        self._output_cost_per_million = output_cost_per_million
+        self._input_cost_per_million = (
+            None
+            if input_cost_per_million is None
+            else _finite_nonnegative(input_cost_per_million, "input_cost_per_million")
+        )
+        self._output_cost_per_million = (
+            None
+            if output_cost_per_million is None
+            else _finite_nonnegative(output_cost_per_million, "output_cost_per_million")
+        )
+        if (self._input_cost_per_million is None) != (self._output_cost_per_million is None):
+            raise ValueError("input and output prices must be supplied together")
+        self._budget = budget
 
     def _new_client(self) -> object:
         if self._client_factory is not None:
             return self._client_factory()
         try:
             from google import genai
-        except ImportError as error:
+        except ImportError:
             raise RuntimeError(
                 "Gemini support requires the optional 'teacher' dependency"
-            ) from error
+            ) from None
         api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-        return genai.Client(api_key=api_key) if api_key else genai.Client()
+        kwargs: dict[str, object] = {
+            "http_options": {"timeout": int(self._request_timeout_seconds * 1000)}
+        }
+        if api_key:
+            kwargs["api_key"] = api_key
+        return genai.Client(**kwargs)
 
     def generate(self, request: Mapping[str, Any]) -> TeacherReply:
         client = self._new_client()
         prompt = json.dumps(request, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-        last_error: Exception | None = None
+        aggregate = _UsageAccumulator(
+            "gemini",
+            self.model,
+            self._input_cost_per_million,
+            self._output_cost_per_million,
+        )
         for attempt in range(1, self._max_attempts + 1):
+            if self._budget is not None:
+                self._budget.reserve_request()
+            response_received = False
             try:
                 response = client.models.generate_content(
                     model=self.model,
@@ -154,40 +365,63 @@ class GeminiTeacher:
                         "response_schema": _ACTION_SCHEMA,
                     },
                 )
-                payload = _parse_object(response.text or "")
-                usage = getattr(response, "usage_metadata", None)
-                input_tokens = getattr(usage, "prompt_token_count", None)
-                output_tokens = getattr(usage, "candidates_token_count", None)
-                cost = self._estimate_cost(input_tokens, output_tokens)
-                return TeacherReply(
-                    payload=payload,
-                    usage=TeacherUsage(
-                        provider="gemini",
-                        model=self.model,
-                        request_count=attempt,
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        estimated_cost_usd=cost,
-                    ),
+                response_received = True
+                metadata = getattr(response, "usage_metadata", None)
+                attempt_usage = TeacherUsage(
+                    provider="gemini",
+                    model=self.model,
+                    request_count=1,
+                    input_tokens=getattr(metadata, "prompt_token_count", 0) or 0,
+                    output_tokens=getattr(metadata, "candidates_token_count", 0) or 0,
+                    estimated_cost_usd=self._attempt_cost(metadata),
+                    accounting_complete=self._has_usage(metadata),
                 )
-            except Exception as error:  # Provider SDK exceptions vary by release.
-                last_error = error
+                aggregate.add(
+                    attempt_usage.input_tokens if attempt_usage.accounting_complete else None,
+                    attempt_usage.output_tokens if attempt_usage.accounting_complete else None,
+                )
+                if self._budget is not None:
+                    self._budget.record_attempt(attempt_usage)
+                payload = _parse_object(response.text or "")
+                return TeacherReply(payload=payload, usage=aggregate.snapshot())
+            except TeacherBudgetExceeded:
+                raise
+            except Exception:
+                if not response_received:
+                    missing = TeacherUsage(provider="gemini", model=self.model)
+                    aggregate.add(None, None)
+                    if self._budget is not None:
+                        self._budget.record_attempt(missing)
                 if attempt < self._max_attempts:
-                    self._sleep(self._initial_backoff_seconds * (2 ** (attempt - 1)))
-        raise RuntimeError(
-            f"teacher request failed after {self._max_attempts} attempts"
-        ) from last_error
+                    delay = min(
+                        self._max_backoff_seconds,
+                        self._initial_backoff_seconds * (2 ** (attempt - 1)),
+                    )
+                    self._sleep(delay)
+        raise TeacherRequestError(
+            f"teacher request failed after {self._max_attempts} attempts",
+            aggregate.snapshot(),
+        ) from None
 
-    def _estimate_cost(self, input_tokens: object, output_tokens: object) -> float | None:
+    @staticmethod
+    def _has_usage(metadata: object) -> bool:
+        return (
+            isinstance(getattr(metadata, "prompt_token_count", None), int)
+            and not isinstance(getattr(metadata, "prompt_token_count", None), bool)
+            and getattr(metadata, "prompt_token_count") >= 0
+            and isinstance(getattr(metadata, "candidates_token_count", None), int)
+            and not isinstance(getattr(metadata, "candidates_token_count", None), bool)
+            and getattr(metadata, "candidates_token_count") >= 0
+        )
+
+    def _attempt_cost(self, metadata: object) -> float | None:
         if (
-            not isinstance(input_tokens, int)
-            or not isinstance(output_tokens, int)
+            not self._has_usage(metadata)
             or self._input_cost_per_million is None
             or self._output_cost_per_million is None
         ):
             return None
         return (
-            input_tokens * self._input_cost_per_million
-            + output_tokens * self._output_cost_per_million
+            metadata.prompt_token_count * self._input_cost_per_million
+            + metadata.candidates_token_count * self._output_cost_per_million
         ) / 1_000_000
-

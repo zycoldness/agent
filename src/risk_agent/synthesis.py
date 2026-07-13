@@ -48,6 +48,8 @@ def _teacher_request(
     phase: str,
     first_action: dict[str, object] | None = None,
     local_observation: object | None = None,
+    data_classification: str,
+    external_categories: list[str],
 ) -> dict[str, object]:
     request: dict[str, object] = {
         "instruction": (
@@ -57,6 +59,10 @@ def _teacher_request(
         "phase": phase,
         "task": task.model_dump(mode="json"),
         "oracle": oracle.model_dump(mode="json"),
+        "external_data": {
+            "classification": data_classification,
+            "categories": external_categories,
+        },
     }
     if first_action is not None:
         request["first_action"] = first_action
@@ -142,16 +148,17 @@ def _validate_final(
 
 def _combine_usage(replies: list[TeacherReply]) -> dict[str, object]:
     usages = [reply.usage for reply in replies]
-    input_tokens = sum(item.input_tokens for item in usages if item.input_tokens is not None)
-    output_tokens = sum(item.output_tokens for item in usages if item.output_tokens is not None)
+    input_tokens = sum(item.input_tokens for item in usages)
+    output_tokens = sum(item.output_tokens for item in usages)
     costs = [item.estimated_cost_usd for item in usages]
     return TeacherUsage(
         provider=usages[0].provider,
         model=usages[0].model,
         request_count=sum(item.request_count for item in usages),
-        input_tokens=input_tokens if all(item.input_tokens is not None for item in usages) else None,
-        output_tokens=output_tokens if all(item.output_tokens is not None for item in usages) else None,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
         estimated_cost_usd=sum(costs) if all(item is not None for item in costs) else None,
+        accounting_complete=all(item.accounting_complete for item in usages),
     ).as_dict()
 
 
@@ -171,7 +178,16 @@ def generate_teacher_sample(
     if (task.asset_id, task.policy_version) != (oracle.asset_id, oracle.policy_version):
         raise ValueError("oracle must match task")
 
-    first_reply = teacher.generate(_teacher_request(task, oracle, phase="first"))
+    first_categories = ["task", "oracle"]
+    first_reply = teacher.generate(
+        _teacher_request(
+            task,
+            oracle,
+            phase="first",
+            data_classification=data_classification,
+            external_categories=first_categories,
+        )
+    )
     first_action = _parse_action(first_reply.payload)
     replies = [first_reply]
     if first_action.tool == "final_decision":
@@ -182,6 +198,10 @@ def generate_teacher_sample(
         if task.max_turns < 2 or first_action.tool not in _LOOKUP_TOOLS:
             raise ValueError("first teacher action must be final_decision or one allowed lookup tool")
         local_observation, observed_ids = _execute_lookup(task, first_action, case_store, evidence_store)
+        selected_category = "cases" if first_action.tool == "search_case" else (
+            "evidence" if first_action.tool == "inspect_evidence" else "active_policy_rule"
+        )
+        second_categories = [*first_categories, selected_category]
         second_reply = teacher.generate(
             _teacher_request(
                 task,
@@ -189,6 +209,8 @@ def generate_teacher_sample(
                 phase="second_final",
                 first_action=first_action.model_dump(mode="json"),
                 local_observation=local_observation,
+                data_classification=data_classification,
+                external_categories=second_categories,
             )
         )
         replies.append(second_reply)
@@ -206,6 +228,10 @@ def generate_teacher_sample(
             evidence_store,
         )
         trajectory_type = "one_lookup"
+    if first_action.tool == "final_decision":
+        external_categories = first_categories
+    else:
+        external_categories = second_categories
 
     return SynthesisResult(
         row=row,
@@ -213,6 +239,9 @@ def generate_teacher_sample(
             "data_classification": data_classification,
             "trajectory_type": trajectory_type,
             "teacher": _combine_usage(replies),
+            "external_data": {
+                "classification": data_classification,
+                "categories": external_categories,
+            },
         },
     )
-

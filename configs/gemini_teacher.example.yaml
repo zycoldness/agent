@@ -1,10 +1,15 @@
-# Reference settings for scripts/generate_teacher_sft.py.
-# The CLI deliberately requires --allow-external-data on every invocation.
+# Reference values to translate into CLI flags; this file is not auto-loaded.
+# Every invocation requires --allow-external-data, acknowledging that Task,
+# Oracle, and selected sanitized case/evidence records are sent to Gemini.
 model: gemini-2.5-pro
 data_classification: synthetic  # allowed: synthetic, public
 max_attempts: 3
 initial_backoff_seconds: 1.0
+max_backoff_seconds: 30.0
+request_timeout_seconds: 60.0
+max_records: 1000
+max_requests: 2000
+max_estimated_cost: null
 # Set prices explicitly if cost estimation is needed; otherwise metadata is null.
 input_cost_per_million: null
 output_cost_per_million: null
-
