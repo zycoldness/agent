@@ -1,0 +1,74 @@
+version: singguard-sources-v1
+sources:
+  - source: uci_sms_spam
+    dataset_url: https://archive.ics.uci.edu/dataset/228/sms+spam+collection
+    artifact_url: https://archive.ics.uci.edu/static/public/228/sms+spam+collection.zip
+    license: CC-BY-4.0
+    usage_scope: research_only
+    source_role: style_seed
+    adapter: uci_sms_zip
+    enabled: true
+  - source: uci_youtube_spam
+    dataset_url: https://archive.ics.uci.edu/dataset/380/youtube+spam+collection
+    artifact_url: https://archive.ics.uci.edu/static/public/380/youtube+spam+collection.zip
+    license: CC-BY-4.0
+    usage_scope: research_only
+    source_role: style_seed
+    adapter: uci_youtube_zip
+    enabled: true
+  - source: amazon_esci
+    dataset_url: https://github.com/amazon-science/esci-data
+    artifact_url: https://github.com/amazon-science/esci-data
+    license: Apache-2.0
+    usage_scope: research_only
+    source_role: style_seed
+    adapter: catalog_only
+    enabled: false
+  - source: nemotron_aegis_v2
+    dataset_url: https://huggingface.co/datasets/nvidia/Aegis-AI-Content-Safety-Dataset-2.0
+    artifact_url: https://huggingface.co/datasets/nvidia/Aegis-AI-Content-Safety-Dataset-2.0
+    license: CC-BY-4.0
+    usage_scope: research_only
+    source_role: hard_negative
+    adapter: catalog_only
+    enabled: false
+  - source: wildguardmix
+    dataset_url: https://huggingface.co/datasets/allenai/wildguardmix
+    artifact_url: https://huggingface.co/datasets/allenai/wildguardmix
+    license: ODC-BY-1.0
+    usage_scope: research_only
+    source_role: risk_seed
+    adapter: catalog_only
+    enabled: false
+  - source: toxic_chat
+    dataset_url: https://huggingface.co/datasets/lmsys/toxic-chat
+    artifact_url: https://huggingface.co/datasets/lmsys/toxic-chat
+    license: CC-BY-NC-4.0
+    usage_scope: research_only
+    source_role: hard_negative
+    adapter: catalog_only
+    enabled: false
+  - source: beavertails
+    dataset_url: https://huggingface.co/datasets/PKU-Alignment/BeaverTails
+    artifact_url: https://huggingface.co/datasets/PKU-Alignment/BeaverTails
+    license: CC-BY-NC-4.0
+    usage_scope: research_only
+    source_role: risk_seed
+    adapter: catalog_only
+    enabled: false
+  - source: civil_comments
+    dataset_url: https://huggingface.co/datasets/google/civil_comments
+    artifact_url: https://huggingface.co/datasets/google/civil_comments
+    license: CC0-1.0
+    usage_scope: research_only
+    source_role: hard_negative
+    adapter: catalog_only
+    enabled: false
+  - source: ftc_fda_public_records
+    dataset_url: https://www.ftc.gov/news-events/topics/truth-advertising/health-claims
+    artifact_url: https://www.ftc.gov/news-events/topics/truth-advertising/health-claims
+    license: RIGHTS-REVIEW-REQUIRED
+    usage_scope: research_only
+    source_role: risk_seed
+    adapter: catalog_only
+    enabled: false
