@@ -27,6 +27,16 @@ export GOOGLE_GENAI_USE_VERTEXAI=true
 ```
 
 Never put credentials in a command, JSONL file, shell script, or Git commit.
+The repository also provides a blank template:
+
+```bash
+cp configs/vertex_ai.env.example configs/vertex_ai.env
+# Edit configs/vertex_ai.env locally, then load it into the current shell.
+source configs/vertex_ai.env
+```
+
+`configs/vertex_ai.env` is ignored by Git; the example contains no credential
+path, project ID, API key, or model selection.
 
 ## 2. Fetch governed public style seeds
 

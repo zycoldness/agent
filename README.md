@@ -19,6 +19,8 @@ python scripts/generate_singguard_data.py outputs/singguard-plan \
 Then follow [the data runbook](docs/singguard-data-runbook.md) to fetch governed
 style seeds and run the 100-anchor / 200-row pilot. Do not start the 2,000-anchor
 batch until `quality_report.json` and the stratified human-review sample pass.
+For Vertex AI, copy `configs/vertex_ai.env.example` to the Git-ignored
+`configs/vertex_ai.env`, fill it privately, and `source` it before generation.
 
 一个面向内容风控实验的最小仓库：先复现 SingGuard 最有价值的动态策略训练思路，再扩展到最多 3 轮工具调用。
 
