@@ -367,6 +367,8 @@ class GeminiTeacher:
         self,
         *,
         model: str,
+        response_schema: Mapping[str, object] | None = None,
+        temperature: float = 0.2,
         client_factory: Callable[[], object] | None = None,
         max_attempts: int = 3,
         initial_backoff_seconds: float = 1.0,
@@ -381,6 +383,8 @@ class GeminiTeacher:
         if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or not 1 <= max_attempts <= 5:
             raise ValueError("max_attempts must be between 1 and 5")
         self.model = model
+        self._response_schema = dict(response_schema or _ACTION_SCHEMA)
+        self._temperature = _finite_nonnegative(temperature, "temperature", maximum=2)
         self._client_factory = client_factory
         self._max_attempts = max_attempts
         self._initial_backoff_seconds = _finite_nonnegative(
@@ -491,10 +495,10 @@ class GeminiTeacher:
                     model=self.model,
                     contents=contents,
                     config={
-                        "temperature": 0.2,
+                        "temperature": self._temperature,
                         "candidate_count": 1,
                         "response_mime_type": "application/json",
-                        "response_schema": _ACTION_SCHEMA,
+                        "response_schema": self._response_schema,
                         "max_output_tokens": self._max_output_tokens,
                     },
                 )

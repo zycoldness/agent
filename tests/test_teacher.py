@@ -82,6 +82,36 @@ def test_gemini_teacher_retries_with_bounded_backoff_and_reports_usage():
     assert reply.usage.accounting_complete is False
 
 
+def test_gemini_teacher_accepts_per_task_schema_and_temperature():
+    captured = {}
+    schema = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+
+    def generate_content(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            text='{"query":"A natural English ad."}',
+            usage_metadata=SimpleNamespace(prompt_token_count=5, candidates_token_count=3),
+        )
+
+    teacher = GeminiTeacher(
+        model="gemini-test",
+        client_factory=lambda: SimpleNamespace(
+            models=SimpleNamespace(generate_content=generate_content)
+        ),
+        response_schema=schema,
+        temperature=0.7,
+    )
+    teacher.generate({"instruction": "Generate content."})
+
+    assert captured["config"]["response_schema"] == schema
+    assert captured["config"]["temperature"] == 0.7
+
+
 def test_gemini_teacher_attaches_local_images_without_sending_local_paths(
     tmp_path, monkeypatch
 ):
