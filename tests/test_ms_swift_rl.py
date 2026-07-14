@@ -32,7 +32,6 @@ def _sources(tmp_path: Path, count: int = 8) -> tuple[Path, Path]:
             policy_version="policy-v1",
             label="unsafe" if index % 2 else "safe",
             rule_id="R-1" if index % 2 else None,
-            evidence_ids=(f"ev-{index}",) if index % 2 else (),
             risk_level="P1" if index % 2 else None,
         ).model_dump_json())
     tasks.write_text("\n".join(task_lines) + "\n", encoding="utf-8")

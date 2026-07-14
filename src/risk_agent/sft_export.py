@@ -68,7 +68,6 @@ def _final_action(oracle: Oracle) -> str:
     arguments: dict[str, Any] = {
         "label": oracle.label,
         "rule_id": oracle.rule_id,
-        "evidence_ids": list(oracle.evidence_ids),
         "confidence": 1.0,
     }
     if oracle.risk_level is not None:

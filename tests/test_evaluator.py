@@ -19,37 +19,26 @@ def make_task_and_oracle() -> tuple[Task, Oracle]:
         policy_version="v1",
         label="unsafe",
         rule_id="AD-1",
-        evidence_ids=("ocr-1", "frame-1"),
     )
     return task, oracle
 
 
-def test_evaluation_reports_exact_label_rule_and_evidence_metrics() -> None:
+def test_evaluation_reports_exact_label_and_rule_metrics() -> None:
     task, oracle = make_task_and_oracle()
     safe_task = task.model_copy(update={"policy_version": "v2", "active_policy": ()})
-    safe_oracle = oracle.model_copy(
-        update={"policy_version": "v2", "label": "safe", "rule_id": None, "evidence_ids": ()}
-    )
+    safe_oracle = oracle.model_copy(update={"policy_version": "v2", "label": "safe", "rule_id": None})
 
     report = evaluate_decisions(
         [
             (
                 task,
                 oracle,
-                {
-                    "label": "unsafe",
-                    "rule_id": "AD-1",
-                    "evidence_ids": ["frame-1", "ocr-1"],
-                },
+                {"label": "unsafe", "rule_id": "AD-1"},
             ),
             (
                 safe_task,
                 safe_oracle,
-                {
-                    "label": "unsafe",
-                    "rule_id": "AD-1",
-                    "evidence_ids": ["ocr-1"],
-                },
+                {"label": "unsafe", "rule_id": "AD-1"},
             ),
         ]
     )
@@ -58,18 +47,7 @@ def test_evaluation_reports_exact_label_rule_and_evidence_metrics() -> None:
         "label_accuracy": 0.5,
         "policy_following_accuracy": 0.0,
         "rule_exact_match": 0.5,
-        "evidence_exact_match": 0.5,
     }
-
-
-def test_evaluation_treats_evidence_as_an_exact_set() -> None:
-    task, oracle = make_task_and_oracle()
-
-    report = evaluate_decisions(
-        [(task, oracle, {"label": "unsafe", "rule_id": "AD-1", "evidence_ids": ["ocr-1", "ocr-1", "frame-1"]})]
-    )
-
-    assert report["evidence_exact_match"] == 1.0
 
 
 def test_evaluation_rejects_empty_or_misaligned_rows() -> None:
@@ -82,28 +60,22 @@ def test_evaluation_rejects_empty_or_misaligned_rows() -> None:
         evaluate_decisions([(other_task, oracle, {"label": "unsafe"})])
 
 
-def test_evaluation_rejects_non_mapping_decisions_and_non_iterable_evidence() -> None:
+def test_evaluation_rejects_non_mapping_decisions() -> None:
     task, oracle = make_task_and_oracle()
 
     with pytest.raises(TypeError, match="mapping"):
         evaluate_decisions([(task, oracle, "unsafe")])  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="evidence_ids"):
-        evaluate_decisions([(task, oracle, {"label": "unsafe", "evidence_ids": 3})])
-    with pytest.raises(TypeError, match="evidence_ids"):
-        evaluate_decisions([(task, oracle, {"label": "unsafe", "evidence_ids": {"ocr-1": "mapped"}})])
 
 
 def test_policy_following_requires_the_same_label_change_as_the_oracle() -> None:
     unsafe_task, unsafe_oracle = make_task_and_oracle()
     safe_task = unsafe_task.model_copy(update={"policy_version": "v2", "active_policy": ()})
-    safe_oracle = unsafe_oracle.model_copy(
-        update={"policy_version": "v2", "label": "safe", "rule_id": None, "evidence_ids": ()}
-    )
+    safe_oracle = unsafe_oracle.model_copy(update={"policy_version": "v2", "label": "safe", "rule_id": None})
 
     report = evaluate_decisions(
         [
-            (unsafe_task, unsafe_oracle, {"label": "unsafe", "rule_id": "AD-1", "evidence_ids": []}),
-            (safe_task, safe_oracle, {"label": "unsafe", "rule_id": None, "evidence_ids": []}),
+            (unsafe_task, unsafe_oracle, {"label": "unsafe", "rule_id": "AD-1"}),
+            (safe_task, safe_oracle, {"label": "unsafe", "rule_id": None}),
         ]
     )
 
@@ -114,7 +86,7 @@ def test_policy_following_requires_the_same_label_change_as_the_oracle() -> None
 def test_policy_following_for_singleton_assets_falls_back_to_label_correctness() -> None:
     task, oracle = make_task_and_oracle()
 
-    report = evaluate_decisions([(task, oracle, {"label": "safe", "rule_id": None, "evidence_ids": []})])
+    report = evaluate_decisions([(task, oracle, {"label": "safe", "rule_id": None})])
 
     assert report["label_accuracy"] == 0.0
     assert report["policy_following_accuracy"] == 0.0
@@ -123,14 +95,12 @@ def test_policy_following_for_singleton_assets_falls_back_to_label_correctness()
 def test_policy_following_rejects_a_fully_inverted_counterfactual_pair() -> None:
     unsafe_task, unsafe_oracle = make_task_and_oracle()
     safe_task = unsafe_task.model_copy(update={"policy_version": "v2", "active_policy": ()})
-    safe_oracle = unsafe_oracle.model_copy(
-        update={"policy_version": "v2", "label": "safe", "rule_id": None, "evidence_ids": ()}
-    )
+    safe_oracle = unsafe_oracle.model_copy(update={"policy_version": "v2", "label": "safe", "rule_id": None})
 
     report = evaluate_decisions(
         [
-            (unsafe_task, unsafe_oracle, {"label": "safe", "rule_id": None, "evidence_ids": []}, "pair-1"),
-            (safe_task, safe_oracle, {"label": "unsafe", "rule_id": "AD-1", "evidence_ids": []}, "pair-1"),
+            (unsafe_task, unsafe_oracle, {"label": "safe", "rule_id": None}, "pair-1"),
+            (safe_task, safe_oracle, {"label": "unsafe", "rule_id": "AD-1"}, "pair-1"),
         ]
     )
 
@@ -161,10 +131,10 @@ def test_explicit_groups_keep_independent_same_asset_transformations_separate() 
 
     report = evaluate_decisions(
         [
-            EvaluationRow.from_policy_shift(first_pair[0], {"label": "safe", "evidence_ids": []}),
-            EvaluationRow.from_policy_shift(first_pair[1], {"label": "unsafe", "evidence_ids": []}),
-            EvaluationRow.from_policy_shift(second_pair[0], {"label": "unsafe", "evidence_ids": []}),
-            EvaluationRow.from_policy_shift(second_pair[1], {"label": "safe", "evidence_ids": []}),
+            EvaluationRow.from_policy_shift(first_pair[0], {"label": "safe"}),
+            EvaluationRow.from_policy_shift(first_pair[1], {"label": "unsafe"}),
+            EvaluationRow.from_policy_shift(second_pair[0], {"label": "unsafe"}),
+            EvaluationRow.from_policy_shift(second_pair[1], {"label": "safe"}),
         ]
     )
 

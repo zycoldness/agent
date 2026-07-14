@@ -7,7 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 import risk_agent
-from risk_agent.contracts import Action, Decision, PolicyRule, Task
+from risk_agent.contracts import Action, Decision, Oracle, PolicyRule, Task
 
 
 def test_package_marker_is_importable() -> None:
@@ -75,15 +75,30 @@ def test_action_rejects_nonfinite_float_argument_values(value: float) -> None:
         Action.model_validate({"tool": "search_case", "arguments": {"score": value}})
 
 
-def test_decision_preserves_evidence_ids() -> None:
+def test_final_decision_has_no_evidence_id_target() -> None:
     decision = Decision(
         label="unsafe",
         rule_id="AD-001",
-        evidence_ids=("ocr-1",),
         confidence=0.9,
     )
 
-    assert decision.evidence_ids == ("ocr-1",)
+    assert "evidence_ids" not in Decision.model_fields
+
+
+@pytest.mark.parametrize("contract", [Decision, Oracle])
+def test_final_contracts_reject_removed_evidence_ids(contract) -> None:
+    payload = {
+        "asset_id": "asset-1",
+        "policy_version": "v1",
+        "label": "unsafe",
+        "rule_id": "AD-001",
+        "evidence_ids": ["ocr-1"],
+    }
+    if contract is Decision:
+        payload = {"label": "unsafe", "rule_id": "AD-001", "confidence": 0.9, "evidence_ids": ["ocr-1"]}
+
+    with pytest.raises(ValidationError):
+        contract.model_validate(payload)
 
 
 def test_task_includes_full_active_policy() -> None:

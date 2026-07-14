@@ -66,18 +66,6 @@ def _validate_row(row: EvaluationInput) -> EvaluationRow:
     return normalized
 
 
-def _evidence_matches(oracle: Oracle, decision: Mapping[str, Any]) -> bool:
-    """Compare evidence support as an unordered exact set."""
-
-    evidence_ids = decision.get("evidence_ids", ())
-    if isinstance(evidence_ids, (Mapping, str, bytes)) or not isinstance(evidence_ids, Iterable):
-        raise TypeError("decision evidence_ids must be an iterable of IDs")
-    submitted_ids = tuple(evidence_ids)
-    if any(not isinstance(evidence_id, str) for evidence_id in submitted_ids):
-        raise TypeError("decision evidence_ids must contain only string IDs")
-    return set(oracle.evidence_ids) == set(submitted_ids)
-
-
 def _decision_label(decision: Mapping[str, Any]) -> str:
     """Return the one valid binary decision label used by every metric."""
 
@@ -150,18 +138,15 @@ def evaluate_decisions(rows: Iterable[EvaluationInput]) -> dict[str, float]:
     labels: list[str] = []
     correct_labels: list[bool] = []
     correct_rules: list[bool] = []
-    correct_evidence: list[bool] = []
     for row in prepared_rows:
         label = _decision_label(row.decision)
         labels.append(label)
         correct_labels.append(row.oracle.label == label)
         correct_rules.append(row.oracle.rule_id == row.decision.get("rule_id"))
-        correct_evidence.append(_evidence_matches(row.oracle, row.decision))
 
     total = len(prepared_rows)
     return {
         "label_accuracy": sum(correct_labels) / total,
         "policy_following_accuracy": _policy_following_accuracy(prepared_rows, labels),
         "rule_exact_match": sum(correct_rules) / total,
-        "evidence_exact_match": sum(correct_evidence) / total,
     }

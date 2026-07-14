@@ -34,7 +34,6 @@ class RiskEnvironment:
         {
             "label",
             "rule_id",
-            "evidence_ids",
             "confidence",
             "risk_level",
             "route",
@@ -57,14 +56,12 @@ class RiskEnvironment:
         self.evidence_store = evidence_store
         self.oracle = oracle
         self.turns = 0
-        self.observed_evidence_ids: set[str] = set()
         self._done = False
 
     def reset(self) -> str:
         """Start a fresh trajectory with the entire active policy in context."""
 
         self.turns = 0
-        self.observed_evidence_ids.clear()
         self._done = False
         return f"{render_active_policy(self.task.active_policy)}\n\nAsset:\n{self.task.initial_observation}"
 
@@ -139,7 +136,6 @@ class RiskEnvironment:
             return self._invalid_action()
 
         evidence = self.evidence_store.inspect(self.task.asset_id, set(kinds))
-        self.observed_evidence_ids.update(item.evidence_id for item in evidence)
         return self._tool_result(
             json.dumps(
                 [item.model_dump(mode="json") for item in evidence],
@@ -159,13 +155,10 @@ class RiskEnvironment:
         active_rule_ids = {rule.rule_id for rule in self.task.active_policy}
         if decision.rule_id is not None and decision.rule_id not in active_rule_ids:
             return self._invalid_action()
-        if not set(decision.evidence_ids).issubset(self.observed_evidence_ids):
-            return self._invalid_action()
 
         self._done = True
         reward = float(decision.label == self.oracle.label)
-        reward += 0.6 * float(decision.rule_id == self.oracle.rule_id)
-        reward += 0.4 * float(bool(set(decision.evidence_ids) & set(self.oracle.evidence_ids)))
+        reward += float(decision.rule_id == self.oracle.rule_id)
         return StepResult(
             observation="Assessment complete.",
             reward=reward,

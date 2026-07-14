@@ -34,7 +34,6 @@ def _oracle(asset_id: str, policy_version: str) -> Oracle:
         policy_version=policy_version,
         label="unsafe",
         rule_id="AD-001",
-        evidence_ids=(f"evidence-{asset_id}",),
     )
 
 

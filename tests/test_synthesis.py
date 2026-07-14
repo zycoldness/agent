@@ -38,7 +38,6 @@ def _oracle() -> Oracle:
         policy_version="v1",
         label="unsafe",
         rule_id="AD-001",
-        evidence_ids=("ocr-1",),
         risk_level="P1",
         next_action="block",
     )
@@ -73,7 +72,6 @@ def test_direct_teacher_decision_exports_only_rebuilt_student_messages():
                 "arguments": {
                     "label": "unsafe",
                     "rule_id": "AD-001",
-                    "evidence_ids": ["ocr-1"],
                     "confidence": 0.8,
                     "risk_level": "P1",
                     "next_action": "block",
@@ -109,7 +107,6 @@ def test_lookup_observation_is_recomputed_locally_and_teacher_observation_is_ign
             "arguments": {
                 "label": "unsafe",
                 "rule_id": "AD-001",
-                "evidence_ids": ["ocr-1"],
                 "confidence": 0.9,
                 "risk_level": "P1",
                 "next_action": "block",
@@ -170,7 +167,6 @@ def test_rule_and_case_lookups_are_recomputed_for_safe_oracles_without_evidence(
         asset_id="asset-1",
         policy_version="v1",
         label="safe",
-        evidence_ids=(),
         next_action="allow",
     )
     teacher = _teacher(
@@ -181,7 +177,6 @@ def test_rule_and_case_lookups_are_recomputed_for_safe_oracles_without_evidence(
                 "arguments": {
                     "label": "safe",
                     "rule_id": None,
-                    "evidence_ids": [],
                     "confidence": 1.0,
                     "next_action": "allow",
                 },
@@ -199,12 +194,12 @@ def test_rule_and_case_lookups_are_recomputed_for_safe_oracles_without_evidence(
 @pytest.mark.parametrize(
     "final_arguments",
     [
-        {"label": "safe", "rule_id": None, "evidence_ids": [], "confidence": 1.0},
-        {"label": "unsafe", "rule_id": "AD-999", "evidence_ids": ["ocr-1"], "confidence": 1.0},
-        {"label": "unsafe", "rule_id": "AD-001", "evidence_ids": ["made-up"], "confidence": 1.0},
+        {"label": "safe", "rule_id": None, "confidence": 1.0},
+        {"label": "unsafe", "rule_id": "AD-999", "confidence": 1.0},
+        {"label": "unsafe", "rule_id": "AD-001", "evidence_ids": ["ocr-1"], "confidence": 1.0},
     ],
 )
-def test_teacher_final_must_agree_with_oracle_active_rule_and_observed_evidence(final_arguments):
+def test_teacher_final_must_agree_with_oracle_and_reject_removed_fields(final_arguments):
     teacher = _teacher(
         [
             {"tool": "inspect_evidence", "arguments": {"kinds": ["ocr"]}},
@@ -331,7 +326,6 @@ def _write_batch_inputs(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
         asset_id="asset-2",
         policy_version="v2",
         label="safe",
-        evidence_ids=(),
         next_action="allow",
     )
     tasks_path = tmp_path / "tasks.jsonl"
@@ -362,7 +356,6 @@ def _direct_reply(request, *, cost: float = 0.05) -> TeacherReply:
     arguments = {
         "label": oracle["label"],
         "rule_id": oracle["rule_id"],
-        "evidence_ids": oracle["evidence_ids"],
         "confidence": 1.0,
         "risk_level": oracle["risk_level"],
         "next_action": oracle["next_action"],

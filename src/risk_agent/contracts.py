@@ -74,13 +74,12 @@ class Evidence(BaseModel):
 class Oracle(BaseModel):
     """Reference assessment for an asset and policy version."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     asset_id: str
     policy_version: str
     label: Literal["safe", "unsafe"]
     rule_id: str | None = None
-    evidence_ids: tuple[str, ...] = ()
     risk_level: Literal["P0", "P1", "P2", "P3"] | None = None
     next_action: str | None = None
 
@@ -113,11 +112,10 @@ class Action(BaseModel):
 class Decision(BaseModel):
     """An immutable policy decision for an asset."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     label: Literal["safe", "unsafe"]
     rule_id: str | None = None
-    evidence_ids: tuple[str, ...] = ()
     confidence: float = Field(ge=0.0, le=1.0)
     risk_level: Literal["P0", "P1", "P2", "P3"] | None = None
     route: Literal["fast", "hybrid", "slow", "agent"] = "agent"

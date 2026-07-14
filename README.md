@@ -112,7 +112,7 @@ VAL_DATA= \
 bash scripts/train_qwen3_vl_grpo.sh
 ```
 
-GRPO 使用四个确定性 reward：JSON 格式、label、rule、evidence IDs，权重为 `0.05 / 0.60 / 0.20 / 0.15`。SFT adapter 同时作为 policy 与 reference adapter，符合 ms-swift 的 LoRA GRPO 用法。
+GRPO 使用三个确定性 reward：JSON 格式、label 和 rule，权重为 `0.05 / 0.75 / 0.20`。SFT adapter 同时作为 policy 与 reference adapter，符合 ms-swift 的 LoRA GRPO 用法。
 
 ### 5. OPSD
 
@@ -193,14 +193,14 @@ python scripts/generate_teacher_sft.py \
   --max-requests 100
 ```
 
-生成结果仍需经过本地封闭案例库、证据库和轨迹校验，模型不能自行创造 case/evidence ID。
+生成结果仍需经过本地封闭案例库、证据库和轨迹校验，模型不能自行创造 case ID；证据 ID 只在工具返回中作为内部定位字段，不属于最终判定目标。
 
 `Task.images` 为空时只发送文字；非空时读取本地 JPEG、PNG、WebP 或 GIF，并与文字 prompt 一起发送。本地路径只用于读取文件，不会进入 Gemini prompt。当前 Gemini 合成不下载 HTTP 图片，也不处理视频。
 
 ## 核心数据边界
 
 - `Task`：素材、当前 `policy_version`、完整 `active_policy`、最多 3 轮预算；
-- `Oracle`：冻结标签、命中规则、证据与处置，仅用于导出答案、reward 和评测；
+- `Oracle`：冻结标签、命中规则与处置，仅用于导出答案、reward 和评测；
 - `CaseStore` / `EvidenceStore`：工具唯一可见的封闭底库；
 - `RiskEnvironment`：`get_rule_detail`、`search_case`、`inspect_evidence`、`final_decision`；
 - split key：`asset_id`，而不是单条样本；

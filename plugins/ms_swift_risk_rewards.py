@@ -3,7 +3,6 @@
 from swift.rewards import ORM, orms
 
 from risk_agent.rl_rewards import (
-    evidence_exact_reward,
     format_reward,
     label_exact_reward,
     rule_exact_reward,
@@ -29,15 +28,10 @@ class RiskRuleExactORM(_CoreORM):
     core = staticmethod(rule_exact_reward)
 
 
-class RiskEvidenceExactORM(_CoreORM):
-    core = staticmethod(evidence_exact_reward)
-
-
 _REGISTRATIONS = {
     "risk_format_v1": RiskFormatORM,
     "risk_label_exact_v1": RiskLabelExactORM,
     "risk_rule_exact_v1": RiskRuleExactORM,
-    "risk_evidence_exact_v1": RiskEvidenceExactORM,
 }
 _collisions = sorted(set(_REGISTRATIONS) & set(orms))
 if _collisions:

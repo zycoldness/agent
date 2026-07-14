@@ -22,8 +22,8 @@ swift rlhf \
   --dataset "$TRAIN_DATA" \
   "${VAL_ARGS[@]}" \
   --external_plugins plugins/ms_swift_risk_rewards.py \
-  --reward_funcs risk_format_v1 risk_label_exact_v1 risk_rule_exact_v1 risk_evidence_exact_v1 \
-  --reward_weights 0.05 0.60 0.20 0.15 \
+  --reward_funcs risk_format_v1 risk_label_exact_v1 risk_rule_exact_v1 \
+  --reward_weights 0.05 0.75 0.20 \
   --use_vllm true \
   --vllm_mode server \
   --vllm_server_host 127.0.0.1 \

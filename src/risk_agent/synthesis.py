@@ -17,7 +17,7 @@ from risk_agent.teacher import Teacher, TeacherReply, TeacherUsage
 
 _LOOKUP_TOOLS = frozenset({"get_rule_detail", "search_case", "inspect_evidence"})
 _FINAL_KEYS = frozenset(
-    {"label", "rule_id", "evidence_ids", "confidence", "risk_level", "route", "next_action"}
+    {"label", "rule_id", "confidence", "risk_level", "route", "next_action"}
 )
 
 
@@ -76,7 +76,7 @@ def _execute_lookup(
     action: Action,
     case_store: CaseStore,
     evidence_store: EvidenceStore,
-) -> tuple[object, set[str]]:
+) -> object:
     arguments = action.arguments
     if action.tool == "get_rule_detail":
         if set(arguments) != {"rule_id"} or not isinstance(arguments.get("rule_id"), str):
@@ -84,7 +84,7 @@ def _execute_lookup(
         rule = next((item for item in task.active_policy if item.rule_id == arguments["rule_id"]), None)
         if rule is None:
             raise ValueError("teacher lookup rule must be active")
-        return rule.model_dump(mode="json"), set()
+        return rule.model_dump(mode="json")
     if action.tool == "search_case":
         if not set(arguments).issubset({"query", "top_k"}):
             raise ValueError("invalid search_case teacher action")
@@ -98,7 +98,7 @@ def _execute_lookup(
             or not 1 <= top_k <= 5
         ):
             raise ValueError("invalid search_case teacher action")
-        return case_store.search(query, top_k), set()
+        return case_store.search(query, top_k)
     if action.tool == "inspect_evidence":
         kinds = arguments.get("kinds")
         if (
@@ -109,10 +109,7 @@ def _execute_lookup(
         ):
             raise ValueError("invalid inspect_evidence teacher action")
         evidence = evidence_store.inspect(task.asset_id, set(kinds))
-        return (
-            [item.model_dump(mode="json") for item in evidence],
-            {item.evidence_id for item in evidence},
-        )
+        return [item.model_dump(mode="json") for item in evidence]
     raise ValueError("first teacher action must be final_decision or one allowed lookup tool")
 
 
@@ -120,8 +117,6 @@ def _validate_final(
     task: Task,
     oracle: Oracle,
     action: Action,
-    *,
-    observed_evidence_ids: set[str] | None,
 ) -> None:
     if action.tool != "final_decision":
         raise ValueError("second teacher action must be final_decision")
@@ -137,13 +132,10 @@ def _validate_final(
     if (
         decision.label != oracle.label
         or decision.rule_id != oracle.rule_id
-        or tuple(decision.evidence_ids) != tuple(oracle.evidence_ids)
         or decision.risk_level != oracle.risk_level
         or decision.next_action != oracle.next_action
     ):
         raise ValueError("teacher final decision must agree with the oracle")
-    if observed_evidence_ids is not None and not set(decision.evidence_ids).issubset(observed_evidence_ids):
-        raise ValueError("teacher final decision cites unobserved evidence")
 
 
 def _combine_usage(replies: list[TeacherReply]) -> dict[str, object]:
@@ -191,13 +183,13 @@ def generate_teacher_sample(
     first_action = _parse_action(first_reply.payload)
     replies = [first_reply]
     if first_action.tool == "final_decision":
-        _validate_final(task, oracle, first_action, observed_evidence_ids=None)
+        _validate_final(task, oracle, first_action)
         row = export_track_a(task, oracle)
         trajectory_type = "direct"
     else:
         if task.max_turns < 2 or first_action.tool not in _LOOKUP_TOOLS:
             raise ValueError("first teacher action must be final_decision or one allowed lookup tool")
-        local_observation, observed_ids = _execute_lookup(task, first_action, case_store, evidence_store)
+        local_observation = _execute_lookup(task, first_action, case_store, evidence_store)
         selected_category = "cases" if first_action.tool == "search_case" else (
             "evidence" if first_action.tool == "inspect_evidence" else "active_policy_rule"
         )
@@ -215,7 +207,7 @@ def generate_teacher_sample(
         )
         replies.append(second_reply)
         second_action = _parse_action(second_reply.payload)
-        _validate_final(task, oracle, second_action, observed_evidence_ids=observed_ids)
+        _validate_final(task, oracle, second_action)
         action_text = json.dumps(
             first_action.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":")
         )

@@ -49,12 +49,6 @@ def test_policy_shift_rows_are_immutable() -> None:
         row.task = row.task
 
 
-@pytest.mark.parametrize("evidence_ids", [{"ocr-1": "mapped"}, "ocr-1", b"ocr-1", ["ocr-1", 2]])
-def test_policy_outcome_rejects_invalid_evidence_ids(evidence_ids: object) -> None:
-    with pytest.raises(TypeError, match="evidence_ids"):
-        PolicyOutcome(label="safe", evidence_ids=evidence_ids)  # type: ignore[arg-type]
-
-
 def test_generic_builder_uses_complete_policies_explicit_outcomes_and_unique_versions() -> None:
     unrelated = PolicyRule(rule_id="DISC-1", title="Disclosure", text="Show a disclosure")
     matching = PolicyRule(rule_id="AD-1", title="Claims", text="Do not guarantee weight loss")

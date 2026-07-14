@@ -1,2 +1,2 @@
-{"asset_id":"synthetic-asset-1","policy_version":"synthetic-with-efficacy-rule","label":"unsafe","rule_id":"AD-001","evidence_ids":["ocr-1"],"risk_level":"P1","next_action":"block"}
-{"asset_id":"synthetic-asset-1","policy_version":"synthetic-without-efficacy-rule","label":"safe","rule_id":null,"evidence_ids":[],"risk_level":null,"next_action":"allow"}
+{"asset_id":"synthetic-asset-1","policy_version":"synthetic-with-efficacy-rule","label":"unsafe","rule_id":"AD-001","risk_level":"P1","next_action":"block"}
+{"asset_id":"synthetic-asset-1","policy_version":"synthetic-without-efficacy-rule","label":"safe","rule_id":null,"risk_level":null,"next_action":"allow"}

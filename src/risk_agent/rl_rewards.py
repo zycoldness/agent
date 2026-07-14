@@ -7,7 +7,7 @@ from collections.abc import Callable
 from typing import Any
 
 
-_ARG_REQUIRED = frozenset({"label", "rule_id", "evidence_ids", "confidence"})
+_ARG_REQUIRED = frozenset({"label", "rule_id", "confidence"})
 _ARG_OPTIONAL = frozenset({"risk_level", "next_action"})
 
 
@@ -41,13 +41,6 @@ def _decision(value: object) -> dict[str, Any] | None:
     if args["label"] not in ("safe", "unsafe"):
         return None
     if args["rule_id"] is not None and not isinstance(args["rule_id"], str):
-        return None
-    evidence = args["evidence_ids"]
-    if (
-        not isinstance(evidence, list)
-        or any(not isinstance(item, str) or not item for item in evidence)
-        or len(evidence) != len(set(evidence))
-    ):
         return None
     confidence = args["confidence"]
     if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
@@ -91,14 +84,4 @@ def rule_exact_reward(completions: object, *, solution: object = None, **kwargs:
         completions,
         solution,
         lambda got, want: got["label"] == want["label"] and got["rule_id"] == want["rule_id"],
-    )
-
-
-def evidence_exact_reward(completions: object, *, solution: object = None, **kwargs: object) -> list[float]:
-    return _batch(
-        completions,
-        solution,
-        lambda got, want: (
-            got["label"] == want["label"] and got["evidence_ids"] == want["evidence_ids"]
-        ),
     )

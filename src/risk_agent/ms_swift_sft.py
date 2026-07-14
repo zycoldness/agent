@@ -23,7 +23,7 @@ _TASK_OPTIONAL = frozenset({"max_turns", "images", "videos"})
 _RULE_REQUIRED = frozenset({"rule_id", "title", "text"})
 _RULE_OPTIONAL = frozenset({"exceptions", "priority"})
 _ORACLE_REQUIRED = frozenset({"asset_id", "policy_version", "label"})
-_ORACLE_OPTIONAL = frozenset({"rule_id", "evidence_ids", "risk_level", "next_action"})
+_ORACLE_OPTIONAL = frozenset({"rule_id", "risk_level", "next_action"})
 
 
 @dataclass(frozen=True)

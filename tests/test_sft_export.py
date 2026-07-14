@@ -37,7 +37,6 @@ def _oracle() -> Oracle:
         policy_version="policy-v1",
         label="unsafe",
         rule_id="AD-001",
-        evidence_ids=("ocr-1",),
         risk_level="P1",
         next_action="block",
     )
@@ -93,7 +92,6 @@ def test_track_a_injects_full_policy_and_only_generates_final_action():
         "arguments": {
             "label": "unsafe",
             "rule_id": "AD-001",
-            "evidence_ids": ["ocr-1"],
             "confidence": 1.0,
             "risk_level": "P1",
             "next_action": "block",

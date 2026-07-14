@@ -55,7 +55,6 @@ def make_env(*, max_turns: int = 3) -> RiskEnvironment:
             policy_version="v1",
             label="unsafe",
             rule_id="AD-1",
-            evidence_ids=("ocr-1",),
             risk_level="P0",
             next_action="oracle-only-next-action",
         ),
@@ -79,28 +78,6 @@ def test_reset_injects_all_active_policy_and_initial_observation() -> None:
     assert "[AD-1] Claims: Do not guarantee results" in observation
     assert "[AD-2] Disclosure: Show required disclosure" in observation
     assert "OCR: guaranteed result in seven days" in observation
-
-
-def test_reset_clears_previously_observed_evidence() -> None:
-    env = make_env()
-    env.reset()
-    env.step(action("inspect_evidence", {"kinds": ["ocr"]}))
-    env.reset()
-
-    result = env.step(
-        action(
-            "final_decision",
-            {
-                "label": "unsafe",
-                "rule_id": "AD-1",
-                "evidence_ids": ["ocr-1"],
-                "confidence": 0.9,
-            },
-        )
-    )
-
-    assert result.done is True
-    assert result.info["status"] == "invalid_action"
 
 
 @pytest.mark.parametrize(
@@ -147,7 +124,7 @@ def test_case_search_returns_sanitized_store_results_only() -> None:
     assert_no_oracle_contents(result)
 
 
-def test_evidence_inspection_is_asset_scoped_and_records_observed_ids() -> None:
+def test_evidence_inspection_is_asset_scoped() -> None:
     env = make_env()
     result = env.step(action("inspect_evidence", {"kinds": ["ocr"]}))
 
@@ -159,19 +136,18 @@ def test_evidence_inspection_is_asset_scoped_and_records_observed_ids() -> None:
             "content": "guaranteed result in seven days",
         }
     ]
-    assert env.observed_evidence_ids == {"ocr-1"}
     assert_no_oracle_contents(result)
 
 
 @pytest.mark.parametrize(
     "arguments",
     [
-        {"label": "unsafe", "rule_id": "HIDDEN", "evidence_ids": [], "confidence": 0.9},
+        {"label": "unsafe", "rule_id": "HIDDEN", "confidence": 0.9},
         {"label": "unsafe", "rule_id": "AD-1", "evidence_ids": ["ocr-1"], "confidence": 0.9},
-        {"label": "not-a-label", "rule_id": "AD-1", "evidence_ids": [], "confidence": 0.9},
+        {"label": "not-a-label", "rule_id": "AD-1", "confidence": 0.9},
     ],
 )
-def test_final_decision_rejects_hidden_invalid_or_unobserved_references(arguments: dict[str, object]) -> None:
+def test_final_decision_rejects_hidden_invalid_or_removed_fields(arguments: dict[str, object]) -> None:
     result = make_env().step(action("final_decision", arguments))
 
     assert result.done is True
@@ -179,7 +155,7 @@ def test_final_decision_rejects_hidden_invalid_or_unobserved_references(argument
     assert_no_oracle_contents(result)
 
 
-def test_final_decision_scores_label_rule_and_evidence_overlap() -> None:
+def test_final_decision_scores_label_and_rule() -> None:
     env = make_env()
     env.reset()
     tool_result = env.step(action("inspect_evidence", {"kinds": ["ocr"]}))
@@ -189,7 +165,6 @@ def test_final_decision_scores_label_rule_and_evidence_overlap() -> None:
             {
                 "label": "unsafe",
                 "rule_id": "AD-1",
-                "evidence_ids": ["ocr-1"],
                 "confidence": 0.9,
             },
         )
@@ -207,19 +182,16 @@ def test_final_decision_scores_label_rule_and_evidence_overlap() -> None:
         {
             "label": "unsafe",
             "rule_id": "AD-1",
-            "evidence_ids": [],
             "confidence": True,
         },
         {
             "label": "unsafe",
             "rule_id": "AD-1",
-            "evidence_ids": [],
             "confidence": "0.5",
         },
         {
             "label": "unsafe",
             "rule_id": "AD-1",
-            "evidence_ids": [],
             "confidence": 0.5,
             "unexpected": "must be rejected",
         },

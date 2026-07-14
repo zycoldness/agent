@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -25,21 +25,12 @@ class PolicyOutcome:
 
     label: Literal["safe", "unsafe"]
     rule_id: str | None = None
-    evidence_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.label not in {"safe", "unsafe"}:
             raise ValueError("outcome label must be 'safe' or 'unsafe'")
         if self.rule_id is not None and not isinstance(self.rule_id, str):
             raise TypeError("outcome rule_id must be a string or None")
-        if isinstance(self.evidence_ids, (Mapping, str, bytes)) or not isinstance(
-            self.evidence_ids, Iterable
-        ):
-            raise TypeError("outcome evidence_ids must be an iterable of string IDs")
-        evidence_ids = tuple(self.evidence_ids)
-        if any(not isinstance(evidence_id, str) for evidence_id in evidence_ids):
-            raise TypeError("outcome evidence_ids must contain only string IDs")
-        object.__setattr__(self, "evidence_ids", evidence_ids)
 
 
 @dataclass(frozen=True)
@@ -132,12 +123,10 @@ def _group_id(
         "before_outcome": {
             "label": before_outcome.label,
             "rule_id": before_outcome.rule_id,
-            "evidence_ids": before_outcome.evidence_ids,
         },
         "after_outcome": {
             "label": after_outcome.label,
             "rule_id": after_outcome.rule_id,
-            "evidence_ids": after_outcome.evidence_ids,
         },
     }
     encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
@@ -166,7 +155,6 @@ def _build_row(
         policy_version=policy_version,
         label=outcome.label,
         rule_id=outcome.rule_id,
-        evidence_ids=outcome.evidence_ids,
     )
     return PolicyShiftRow(
         task,
