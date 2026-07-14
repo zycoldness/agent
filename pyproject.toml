@@ -19,7 +19,7 @@ train = ["ms-swift>=4.3", "transformers>=4.57", "qwen-vl-utils>=0.0.14"]
 teacher = ["google-genai>=1.0"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 
 [tool.setuptools]
