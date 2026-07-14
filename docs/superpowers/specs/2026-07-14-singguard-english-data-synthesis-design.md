@@ -1,7 +1,9 @@
 # SingGuard English Data Synthesis and Quality-Gate Design
 
-**Status:** Pending written review  
-**Date:** 2026-07-14  
+**Status:** Pending written review
+
+**Date:** 2026-07-14
+
 **Usage scope:** Internal research only
 
 ## 1. Objective
