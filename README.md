@@ -17,6 +17,7 @@
 | 动态 policy 数据契约与规则反事实 | 已实现 |
 | 公开数据导入与来源记录 | 已实现 |
 | Gemini 生成两跳 SFT 候选 | 已实现 |
+| SingGuard fast/slow 格式与动态 policy SFT bundle | 已实现 |
 | Track A 单轮 SFT / GRPO / OPSD 数据 | 已实现 |
 | Track B 最多 3 轮工具轨迹与环境 | 已实现 |
 | Qwen3-VL 图像/视频字段透传 | 已实现 |
@@ -44,6 +45,34 @@ pip install 'vllm>=0.11.0'
 ```
 
 Qwen3-VL 环境要求来自 ms-swift 官方最佳实践：`transformers>=4.57`、`qwen-vl-utils>=0.0.14`、`ms-swift>=4.0`。
+
+## SingGuard SFT 主线
+
+这条路径复现 SingGuard 的 policy-conditioned 分类格式，与后面的 Agentic JSON 工具调用路径相互独立。每条源数据都包含素材、非空的当前生效 policy、policy 变化类型、标注和 `fast` / `slow` 思考类型。相同 `split_group` 的策略反事实始终进入同一 split，避免同一素材泄漏到训练集和评测集。
+
+先用最小 fixture 验证数据导出；它覆盖 `unsafe→unsafe`、`unsafe→safe`、`safe→unsafe`、`safe→safe` 四类 policy 变化：
+
+```bash
+rm -rf outputs/singguard-smoke
+
+python scripts/prepare_singguard_sft.py \
+  data/fixtures/singguard_examples.jsonl \
+  outputs/singguard-smoke \
+  --train-ratio 1 \
+  --dev-ratio 0 \
+  --holdout-ratio 0
+```
+
+输出的 `train.jsonl` 是 ms-swift 原生 `messages` 格式，可以直接训练：
+
+```bash
+TRAIN_DATA=outputs/singguard-smoke/train.jsonl \
+VAL_DATA= \
+OUTPUT_DIR=outputs/qwen3_vl_8b_singguard_sft \
+bash scripts/train_qwen3_vl_sft.sh
+```
+
+`fast` 标签只输出安全结论和命中规则；`slow` 标签会按当前 policy 顺序逐条检查规则。unsafe 答案必须是当前生效规则的标题，safe 答案固定为 `Safe`，从数据契约层杜绝空 policy 和不可学习的规则标识。
 
 ## 最短跑通路径
 
