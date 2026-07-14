@@ -615,7 +615,9 @@ def test_regulatory_crawler_import_consumes_raw_artifact_once(tmp_path: Path, mo
 
     def counted_open(path, *args, **kwargs):
         nonlocal raw_open_count
-        if Path(path) == raw_path:
+        is_direct_open = Path(path) == raw_path
+        is_posix_openat = kwargs.get("dir_fd") is not None and Path(path) == Path(raw_path.name)
+        if is_direct_open or is_posix_openat:
             raw_open_count += 1
         return original_open(path, *args, **kwargs)
 

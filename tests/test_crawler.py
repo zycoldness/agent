@@ -368,7 +368,7 @@ def test_read_budget_rejects_symlinked_intermediate_component(tmp_path):
     (outside / "artifact.raw").write_bytes(b"outside")
     (trusted_root / "nested").symlink_to(outside, target_is_directory=True)
 
-    with pytest.raises(ValueError, match="regular non-symlink|directory"):
+    with pytest.raises(ValueError, match=r"non-symlink (?:file|director)"):
         ReadBudget(1024, 1024).read(
             trusted_root / "nested" / "artifact.raw",
             trusted_root=trusted_root,
