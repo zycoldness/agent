@@ -438,3 +438,112 @@ def test_batch_refuses_existing_output_before_provider_calls(tmp_path) -> None:
             seed=1,
         )
     assert calls == 0
+
+
+def test_incomplete_batch_resumes_only_with_the_identical_plan(tmp_path) -> None:
+    import hashlib
+    import json
+    import pytest
+
+    from risk_agent.singguard_synthesis import plan_blueprints, run_singguard_batch
+    from risk_agent.teacher import CallableTeacher, TeacherBudget
+
+    plan = tuple(
+        item.model_copy(
+            update={
+                "transition": "unsafe_to_unsafe",
+                "transformation": "rewrite",
+                "before_thinking_type": "fast",
+                "after_thinking_type": "fast",
+                "conversation_type": "query",
+            }
+        )
+        for item in plan_blueprints(32, seed=53)
+    )
+    generation_number = 0
+
+    def generate(request):
+        nonlocal generation_number
+        generation_number += 1
+        fingerprint = hashlib.sha256(
+            f"resume-{generation_number}:{json.dumps(request['constraints'], sort_keys=True)}".encode()
+        ).hexdigest()
+        return {
+            "query": f"{fingerprint} Guaranteed outcome.",
+            "response": None,
+            "style": request["constraints"]["platform_style"],
+        }
+
+    def verify(request):
+        return {
+            "views": [
+                {
+                    "opaque_id": view["opaque_id"],
+                    "label": "unsafe",
+                    "rule_title": view["active_policy"][0]["title"],
+                    "evidence_quote": "Guaranteed outcome",
+                    "confidence": 0.99,
+                    "ambiguous": False,
+                }
+                for view in request["policy_views"]
+            ],
+            "style": request["declared_style"],
+            "naturalness": 5,
+            "template_like": False,
+        }
+
+    output = tmp_path / "resumable"
+    small_budget = TeacherBudget(max_requests=3)
+    first = run_singguard_batch(
+        plan,
+        generator=CallableTeacher(generate, budget=small_budget),
+        verifier=CallableTeacher(verify, budget=small_budget),
+        budget=small_budget,
+        output_dir=output,
+        seed=53,
+    )
+    assert first["status"] == "incomplete"
+    assert not (output / "ms_swift").exists()
+
+    wrong = list(plan)
+    wrong[0] = wrong[0].model_copy(update={"tone": "different"})
+    blocked_budget = TeacherBudget(max_requests=100)
+    with pytest.raises(ValueError, match="plan fingerprint"):
+        run_singguard_batch(
+            tuple(wrong),
+            generator=CallableTeacher(generate, budget=blocked_budget),
+            verifier=CallableTeacher(verify, budget=blocked_budget),
+            budget=blocked_budget,
+            output_dir=output,
+            seed=53,
+            resume=True,
+        )
+
+    with (output / "accepted.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"anchor_id": plan[1].anchor_id}) + "\n")
+    with (output / "rejected.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "anchor_id": plan[1].anchor_id,
+                    "attempt": 1,
+                    "codes": ["schema"],
+                    "oracle_agreement": False,
+                }
+            )
+            + "\n"
+        )
+
+    resumed_budget = TeacherBudget(max_requests=100)
+    second = run_singguard_batch(
+        plan,
+        generator=CallableTeacher(generate, budget=resumed_budget),
+        verifier=CallableTeacher(verify, budget=resumed_budget),
+        budget=resumed_budget,
+        output_dir=output,
+        seed=53,
+        resume=True,
+    )
+    assert second["status"] == "complete"
+    assert second["accepted_anchors"] == 32
+    assert (output / "ms_swift" / "train.jsonl").exists()

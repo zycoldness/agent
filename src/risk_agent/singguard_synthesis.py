@@ -605,6 +605,91 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _fingerprint(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _read_json(path: Path) -> object:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise ValueError(f"cannot read resume artifact {path.name}") from None
+
+
+def _read_jsonl(path: Path) -> list[dict[str, object]]:
+    try:
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except (OSError, json.JSONDecodeError):
+        raise ValueError(f"cannot read resume artifact {path.name}") from None
+    if not all(isinstance(row, dict) for row in rows):
+        raise ValueError(f"resume artifact {path.name} must contain JSON objects")
+    return rows
+
+
+def _run_fingerprints(
+    plan: Sequence[AnchorBlueprint],
+    seed_texts: Mapping[str, str],
+    seed_licenses: Mapping[str, str],
+) -> dict[str, object]:
+    return {
+        "plan_sha256": _fingerprint([item.model_dump(mode="json") for item in plan]),
+        "prompt_sha256": {
+            name: prompt_sha256(name) for name in ("guard", "generator", "verifier")
+        },
+        "source_assignment_sha256": _fingerprint(
+            [
+                {
+                    "anchor_id": item.anchor_id,
+                    "source_id": item.source_id,
+                    "text_sha256": hashlib.sha256(
+                        seed_texts.get(item.anchor_id, "").encode("utf-8")
+                    ).hexdigest(),
+                    "license": seed_licenses.get(item.anchor_id),
+                }
+                for item in plan
+            ]
+        ),
+    }
+
+
+def _restore_budget(budget: TeacherBudget, payload: object) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError("resume checkpoint has invalid budget accounting")
+    values = (
+        payload.get("request_count"),
+        payload.get("input_tokens"),
+        payload.get("output_tokens"),
+    )
+    cost = payload.get("estimated_cost_usd")
+    accounting_complete = payload.get("accounting_complete")
+    if not (
+        all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in values)
+        and isinstance(cost, (int, float))
+        and not isinstance(cost, bool)
+        and cost >= 0
+        and isinstance(accounting_complete, bool)
+    ):
+        raise ValueError("resume checkpoint has invalid budget accounting")
+    if budget.max_requests is not None and values[0] > budget.max_requests:
+        raise ValueError("resume request budget is below prior usage")
+    if budget.max_estimated_cost_usd is not None and float(cost) > budget.max_estimated_cost_usd:
+        raise ValueError("resume cost budget is below prior usage")
+    budget.request_count, budget.input_tokens, budget.output_tokens = values
+    budget.estimated_cost_usd = float(cost)
+    budget.accounting_complete = accounting_complete
+
+
 def _coverage_complete(
     planned: Sequence[AnchorBlueprint], accepted: Sequence[AnchorBlueprint]
 ) -> bool:
@@ -644,6 +729,7 @@ def run_singguard_batch(
     seed_licenses: Mapping[str, str] | None = None,
     max_retries: int = 2,
     pilot: bool = False,
+    resume: bool = False,
 ) -> dict[str, object]:
     """Generate, blind-verify, gate, audit, and export one immutable batch."""
 
@@ -655,8 +741,10 @@ def run_singguard_batch(
     )
 
     output_dir = output_dir.absolute()
-    if output_dir.exists():
+    if output_dir.exists() and not resume:
         raise ValueError("output directory must not exist")
+    if resume and not output_dir.is_dir():
+        raise ValueError("resume output directory does not exist")
     if not plan:
         raise ValueError("plan must not be empty")
     if isinstance(max_retries, bool) or not isinstance(max_retries, int) or not 0 <= max_retries <= 2:
@@ -664,18 +752,64 @@ def run_singguard_batch(
     if len({item.anchor_id for item in plan}) != len(plan):
         raise ValueError("plan contains duplicate anchor IDs")
 
-    output_dir.mkdir(parents=True, exist_ok=False)
-    _atomic_jsonl(output_dir / "plan.jsonl", list(plan))
+    seed_texts = dict(seed_texts or {})
+    seed_licenses = dict(seed_licenses or {})
+    fingerprints = _run_fingerprints(plan, seed_texts, seed_licenses)
     catalog = load_rule_catalog()
-    accepted_rows: list[dict[str, object]] = []
-    accepted_blueprints: list[AnchorBlueprint] = []
-    rejected_rows: list[dict[str, object]] = []
-    existing_texts: list[str] = []
-    first_pass_agreements = 0
-    near_duplicate_rejections = 0
+    if resume:
+        if (output_dir / "ms_swift").exists():
+            raise ValueError("completed output cannot be resumed")
+        checkpoint = _read_json(output_dir / "checkpoint.json")
+        if not isinstance(checkpoint, dict):
+            raise ValueError("resume checkpoint must be a JSON object")
+        for name, expected in fingerprints.items():
+            if checkpoint.get(name) != expected:
+                label = "plan fingerprint" if name == "plan_sha256" else f"{name} fingerprint"
+                raise ValueError(f"resume {label} does not match")
+        completed_count = checkpoint.get("completed_anchors")
+        if not isinstance(completed_count, int) or not 0 <= completed_count <= len(plan):
+            raise ValueError("resume checkpoint has invalid completed anchor count")
+        accepted_rows = _read_jsonl(output_dir / "accepted.jsonl")
+        rejected_rows = _read_jsonl(output_dir / "rejected.jsonl")
+        completed_ids = {item.anchor_id for item in plan[:completed_count]}
+        accepted_rows = [
+            row for row in accepted_rows if row.get("anchor_id") in completed_ids
+        ]
+        rejected_rows = [
+            row for row in rejected_rows if row.get("anchor_id") in completed_ids
+        ]
+        try:
+            accepted_blueprints = [
+                AnchorBlueprint.model_validate(row["blueprint"]) for row in accepted_rows
+            ]
+            existing_texts = [
+                _combined_content_for_batch(GeneratedContent.model_validate(row["content"]))
+                for row in accepted_rows
+            ]
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("resume accepted artifact is invalid") from None
+        first_pass_agreements = sum(
+            int(row.get("attempt") == 1 and row.get("oracle_agreement") is True)
+            for row in rejected_rows
+        ) + sum(int(row.get("attempt") == 1) for row in accepted_rows)
+        near_duplicate_rejections = sum(
+            int("near_duplicate" in row.get("codes", [])) for row in rejected_rows
+        )
+        _restore_budget(budget, checkpoint.get("budget"))
+    else:
+        output_dir.mkdir(parents=True, exist_ok=False)
+        _atomic_jsonl(output_dir / "plan.jsonl", list(plan))
+        accepted_rows = []
+        accepted_blueprints = []
+        rejected_rows = []
+        existing_texts = []
+        first_pass_agreements = 0
+        near_duplicate_rejections = 0
+        completed_count = 0
     stopped_reason: str | None = None
 
-    for plan_index, blueprint in enumerate(plan):
+    for plan_index in range(completed_count, len(plan)):
+        blueprint = plan[plan_index]
         pair = compile_policy_pair(blueprint, catalog=catalog)
         accepted = False
         for attempt in range(max_retries + 1):
@@ -683,7 +817,7 @@ def run_singguard_batch(
                 content, _generator_usage = generate_content(
                     blueprint,
                     generator,
-                    seed_text=(seed_texts or {}).get(blueprint.anchor_id),
+                    seed_text=seed_texts.get(blueprint.anchor_id),
                 )
                 verdict, opaque_to_stage, _verifier_usage = verify_content(
                     blueprint,
@@ -696,6 +830,9 @@ def run_singguard_batch(
                     pair, verdict, opaque_to_stage
                 ):
                     first_pass_agreements += 1
+                oracle_agreement = _verifier_agrees_with_oracle(
+                    pair, verdict, opaque_to_stage
+                )
                 gate = gate_candidate(
                     blueprint,
                     pair,
@@ -703,7 +840,7 @@ def run_singguard_batch(
                     verdict,
                     opaque_to_stage,
                     existing_texts=existing_texts,
-                    source_text=(seed_texts or {}).get(blueprint.anchor_id),
+                    source_text=seed_texts.get(blueprint.anchor_id),
                 )
                 codes = gate.codes
             except (ValueError, KeyError, TypeError):
@@ -728,12 +865,13 @@ def run_singguard_batch(
                 row = {
                     "anchor_id": blueprint.anchor_id,
                     "attempt": attempt + 1,
+                    "oracle_agreement": True,
                     "blueprint": blueprint.model_dump(mode="json"),
                     "content": content.model_dump(mode="json"),
                     "examples": [example.model_dump(mode="json") for example in examples],
                     "source": {
-                        "used": blueprint.anchor_id in (seed_texts or {}),
-                        "license": (seed_licenses or {}).get(blueprint.anchor_id),
+                        "used": blueprint.anchor_id in seed_texts,
+                        "license": seed_licenses.get(blueprint.anchor_id),
                     },
                 }
                 accepted_rows.append(row)
@@ -747,20 +885,24 @@ def run_singguard_batch(
                     "anchor_id": blueprint.anchor_id,
                     "attempt": attempt + 1,
                     "codes": list(codes),
+                    "oracle_agreement": oracle_agreement if verdict is not None else False,
                 }
             )
             near_duplicate_rejections += int("near_duplicate" in codes)
 
+        if not stopped_reason:
+            completed_count = plan_index + 1
         _atomic_jsonl(output_dir / "accepted.jsonl", accepted_rows)
         _atomic_jsonl(output_dir / "rejected.jsonl", rejected_rows)
         _atomic_json(
             output_dir / "checkpoint.json",
             {
                 "schema": "singguard-checkpoint-v1",
-                "completed_anchors": plan_index + int(accepted or stopped_reason is None),
+                "completed_anchors": completed_count,
                 "accepted_anchors": len(accepted_rows),
                 "status": "incomplete" if stopped_reason else "running",
                 "budget": budget.as_dict(),
+                **fingerprints,
             },
         )
         if stopped_reason:
@@ -777,7 +919,7 @@ def run_singguard_batch(
         accepted_blueprints,
         rejection_codes=rejection_codes,
         first_pass_agreements=first_pass_agreements,
-        first_pass_attempts=len(plan),
+        first_pass_attempts=completed_count,
         near_duplicate_rejections=near_duplicate_rejections,
         licenses=licenses,
     )
@@ -794,7 +936,12 @@ def run_singguard_batch(
     )
 
     gates_pass = all(report["pilot_gates"].values()) if pilot else True
-    complete = stopped_reason is None and len(accepted_rows) == len(plan) and gates_pass
+    complete = (
+        stopped_reason is None
+        and completed_count == len(plan)
+        and bool(accepted_rows)
+        and gates_pass
+    )
     if complete:
         examples_path = output_dir / ".accepted_examples.jsonl"
         _atomic_jsonl(
@@ -809,6 +956,7 @@ def run_singguard_batch(
         "status": "complete" if complete else "incomplete",
         "reason": stopped_reason if stopped_reason else (None if gates_pass else "quality_gates"),
         "seed": seed,
+        **fingerprints,
         "planned_anchors": len(plan),
         "accepted_anchors": len(accepted_rows),
         "accepted_examples": len(accepted_rows) * 2,
@@ -830,10 +978,11 @@ def run_singguard_batch(
         output_dir / "checkpoint.json",
         {
             "schema": "singguard-checkpoint-v1",
-            "completed_anchors": len(accepted_rows),
+            "completed_anchors": completed_count,
             "accepted_anchors": len(accepted_rows),
             "status": manifest["status"],
             "budget": budget.as_dict(),
+            **fingerprints,
         },
     )
     return manifest

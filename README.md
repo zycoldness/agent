@@ -1,5 +1,25 @@
 # Dynamic-Policy Content Risk Agent
 
+## Same-day English SingGuard data pilot
+
+The repository now includes a one-command, text-only pipeline for the first real
+SingGuard-style dataset. It fixes eight-domain quotas before any model call, asks
+Gemini to realize content, uses a separate blind Gemini pass to judge shuffled
+before/after policies, applies deterministic local quality gates, and exports
+accepted pairs directly to ms-swift `messages` JSONL.
+
+Start with the credential-free plan check:
+
+```bash
+pip install -e '.[dev,teacher]'
+python scripts/generate_singguard_data.py outputs/singguard-plan \
+  --anchors 100 --seed 42 --plan-only
+```
+
+Then follow [the data runbook](docs/singguard-data-runbook.md) to fetch governed
+style seeds and run the 100-anchor / 200-row pilot. Do not start the 2,000-anchor
+batch until `quality_report.json` and the stratified human-review sample pass.
+
 一个面向内容风控实验的最小仓库：先复现 SingGuard 最有价值的动态策略训练思路，再扩展到最多 3 轮工具调用。
 
 当前代码只做三件事：

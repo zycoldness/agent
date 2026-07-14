@@ -76,6 +76,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-external-data", action="store_true")
     parser.add_argument("--pilot", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--provider-attempts", type=int, default=3)
     parser.add_argument("--request-timeout", type=float, default=120.0)
     parser.add_argument("--max-requests", type=int, default=800)
@@ -90,8 +91,10 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    if args.output_dir.exists():
+    if args.output_dir.exists() and not args.resume:
         parser.error("output directory must not exist")
+    if args.resume and args.plan_only:
+        parser.error("--resume cannot be combined with --plan-only")
     try:
         plan = plan_blueprints(args.anchors, seed=args.seed)
     except ValueError as error:
@@ -172,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
             seed_licenses=seed_licenses,
             max_retries=args.max_retries,
             pilot=args.pilot,
+            resume=args.resume,
         )
     except (OSError, ValueError) as error:
         parser.error(str(error))
