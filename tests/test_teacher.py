@@ -74,11 +74,58 @@ def test_gemini_teacher_retries_with_bounded_backoff_and_reports_usage():
     assert delays == [0.25, 0.5]
     assert attempts[-1]["config"]["response_mime_type"] == "application/json"
     assert attempts[-1]["config"]["response_schema"]["required"] == ["tool", "arguments"]
+    assert isinstance(attempts[-1]["contents"], str)
     assert reply.usage.request_count == 3
     assert reply.usage.input_tokens == 10
     assert reply.usage.output_tokens == 4
     assert reply.usage.estimated_cost_usd == pytest.approx(18e-6)
     assert reply.usage.accounting_complete is False
+
+
+def test_gemini_teacher_attaches_local_images_without_sending_local_paths(
+    tmp_path, monkeypatch
+):
+    image = tmp_path / "ad.jpg"
+    image.write_bytes(b"fake-jpeg")
+    captured = {}
+
+    class Part:
+        @classmethod
+        def from_bytes(cls, *, data, mime_type):
+            return SimpleNamespace(data=data, mime_type=mime_type)
+
+    fake_genai = SimpleNamespace(types=SimpleNamespace(Part=Part))
+    monkeypatch.setitem(__import__("sys").modules, "google.genai", fake_genai)
+
+    def generate_content(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            text='{"tool":"final_decision","arguments":{"label":"safe","confidence":1.0}}',
+            usage_metadata=SimpleNamespace(prompt_token_count=10, candidates_token_count=4),
+        )
+
+    teacher = GeminiTeacher(
+        model="gemini-test",
+        client_factory=lambda: SimpleNamespace(
+            models=SimpleNamespace(generate_content=generate_content)
+        ),
+    )
+
+    teacher.generate(
+        {
+            "phase": "first",
+            "task": {
+                "initial_observation": "<image>\nReview this advertisement.",
+                "images": [str(image)],
+            },
+        }
+    )
+
+    image_part, prompt = captured["contents"]
+    assert image_part.data == b"fake-jpeg"
+    assert image_part.mime_type == "image/jpeg"
+    assert str(image) not in prompt
+    assert '"images":["<attached_image_0>"]' in prompt
 
 
 def test_gemini_teacher_stops_after_configured_attempts_without_logging_secret(caplog):
@@ -192,6 +239,27 @@ def test_default_gemini_client_receives_finite_application_timeout(monkeypatch):
     teacher._new_client()
 
     assert captured["http_options"]["timeout"] == 12_500
+
+
+def test_vertex_environment_does_not_mix_in_an_api_key(monkeypatch):
+    captured = {}
+
+    class Client:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+    monkeypatch.setenv("GEMINI_API_KEY", "must-not-be-passed-to-vertex")
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "google",
+        SimpleNamespace(genai=SimpleNamespace(Client=Client)),
+    )
+
+    GeminiTeacher(model="gemini-test")._new_client()
+
+    assert "api_key" not in captured
+    assert captured["http_options"]["api_version"] == "v1"
 
 
 def test_callable_provider_failure_does_not_retain_raw_exception_context():

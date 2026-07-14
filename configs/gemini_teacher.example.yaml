@@ -1,7 +1,9 @@
 # Reference values to translate into CLI flags; this file is not auto-loaded.
 # Every invocation requires --allow-external-data, acknowledging that Task,
 # Oracle, and selected sanitized case/evidence records are sent to Gemini.
-model: gemini-2.5-pro
+# Authentication comes only from GEMINI_API_KEY or the standard Vertex AI
+# environment variables; no credential path or secret belongs in this file.
+model: gemini-3.1-flash-lite
 data_classification: synthetic  # allowed: synthetic, public
 max_attempts: 3
 initial_backoff_seconds: 1.0

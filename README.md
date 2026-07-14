@@ -33,7 +33,7 @@
 python -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
-pytest -q
+python -m pytest -q
 ```
 
 训练服务器：
@@ -157,7 +157,28 @@ python scripts/import_public_data.py \
 
 ### Gemini 两跳轨迹
 
-设置 `GEMINI_API_KEY` 后：
+安装 Gemini SDK：
+
+```bash
+pip install -e '.[teacher]'
+```
+
+鉴权只从环境变量读取，任选一种方式。Gemini Developer API：
+
+```bash
+export GEMINI_API_KEY=...
+```
+
+或者 Vertex AI：
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+export GOOGLE_CLOUD_PROJECT=...
+export GOOGLE_CLOUD_LOCATION=global
+export GOOGLE_GENAI_USE_VERTEXAI=true
+```
+
+运行小批量合成：
 
 ```bash
 python scripts/generate_teacher_sft.py \
@@ -166,13 +187,15 @@ python scripts/generate_teacher_sft.py \
   data/fixtures/cases.jsonl \
   data/fixtures/evidence.jsonl \
   outputs/teacher_candidates.jsonl \
+  --model gemini-3.1-flash-lite \
   --allow-external-data \
   --max-records 100 \
-  --max-requests 100 \
-  --max-estimated-cost 5
+  --max-requests 100
 ```
 
 生成结果仍需经过本地封闭案例库、证据库和轨迹校验，模型不能自行创造 case/evidence ID。
+
+`Task.images` 为空时只发送文字；非空时读取本地 JPEG、PNG、WebP 或 GIF，并与文字 prompt 一起发送。本地路径只用于读取文件，不会进入 Gemini prompt。当前 Gemini 合成不下载 HTTP 图片，也不处理视频。
 
 ## 核心数据边界
 

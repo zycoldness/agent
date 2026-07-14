@@ -13,6 +13,7 @@ import os
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 
@@ -311,6 +312,52 @@ _ACTION_SCHEMA: dict[str, object] = {
 }
 _MAX_USAGE_TOKENS = 1_000_000_000
 _PROMPT_OVERHEAD_TOKENS = 4096
+_IMAGE_MIME_TYPES = {
+    ".gif": "image/gif",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+
+
+def _prompt_and_image_paths(request: Mapping[str, Any]) -> tuple[str, list[Path]]:
+    payload = dict(request)
+    task = payload.get("task")
+    image_paths: list[Path] = []
+    if isinstance(task, Mapping) and task.get("images"):
+        raw_images = task["images"]
+        if isinstance(raw_images, (str, bytes)) or not isinstance(raw_images, (list, tuple)):
+            raise ValueError("task images must be a list of local paths")
+        if any(not isinstance(path, str) or not path for path in raw_images):
+            raise ValueError("task images must be a list of local paths")
+        image_paths = [Path(path) for path in raw_images]
+        sanitized_task = dict(task)
+        sanitized_task["images"] = [f"<attached_image_{index}>" for index in range(len(image_paths))]
+        payload["task"] = sanitized_task
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False), image_paths
+
+
+def _gemini_contents(prompt: str, image_paths: list[Path]) -> tuple[object, int]:
+    if not image_paths:
+        return prompt, 0
+    try:
+        from google.genai import types
+    except ImportError:
+        raise RuntimeError("Gemini image support requires the optional 'teacher' dependency") from None
+    parts: list[object] = []
+    total_bytes = 0
+    for path in image_paths:
+        mime_type = _IMAGE_MIME_TYPES.get(path.suffix.lower())
+        if mime_type is None:
+            raise ValueError("teacher images must be JPEG, PNG, WebP, or GIF files")
+        try:
+            data = path.read_bytes()
+        except OSError:
+            raise ValueError("teacher image must be a readable local file") from None
+        total_bytes += len(data)
+        parts.append(types.Part.from_bytes(data=data, mime_type=mime_type))
+    return [*parts, prompt], total_bytes
 
 
 class GeminiTeacher:
@@ -378,17 +425,39 @@ class GeminiTeacher:
             raise RuntimeError(
                 "Gemini support requires the optional 'teacher' dependency"
             ) from None
-        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-        kwargs: dict[str, object] = {
-            "http_options": {"timeout": int(self._request_timeout_seconds * 1000)}
+        use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
         }
+        api_key = None if use_vertex else (
+            os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        )
+        http_options: dict[str, object] = {
+            "timeout": int(self._request_timeout_seconds * 1000)
+        }
+        if use_vertex:
+            http_options["api_version"] = "v1"
+        kwargs: dict[str, object] = {"http_options": http_options}
         if api_key:
             kwargs["api_key"] = api_key
         return genai.Client(**kwargs)
 
     def generate(self, request: Mapping[str, Any]) -> TeacherReply:
-        prompt = json.dumps(request, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-        worst_case_cost = self._worst_case_cost(prompt)
+        prompt, image_paths = _prompt_and_image_paths(request)
+        try:
+            contents, image_bytes = _gemini_contents(prompt, image_paths)
+        except (OSError, RuntimeError, ValueError):
+            raise TeacherRequestError(
+                "teacher image preparation failed",
+                TeacherUsage(
+                    provider="gemini",
+                    model=self.model,
+                    request_count=0,
+                    accounting_complete=False,
+                ),
+            ) from None
+        worst_case_cost = self._worst_case_cost(prompt, image_bytes)
         aggregate = _UsageAccumulator(
             "gemini",
             self.model,
@@ -420,7 +489,7 @@ class GeminiTeacher:
             try:
                 response = client.models.generate_content(
                     model=self.model,
-                    contents=prompt,
+                    contents=contents,
                     config={
                         "temperature": 0.2,
                         "candidate_count": 1,
@@ -503,7 +572,7 @@ class GeminiTeacher:
             metadata = None
         return self._normalize_usage(metadata)
 
-    def _worst_case_cost(self, prompt: str) -> float | None:
+    def _worst_case_cost(self, prompt: str, image_bytes: int = 0) -> float | None:
         if self._budget is None or self._budget.max_estimated_cost_usd is None:
             return None
         if (
@@ -513,7 +582,7 @@ class GeminiTeacher:
             or self._output_cost_per_million <= 0
         ):
             raise TeacherBudgetExceeded("cost_accounting_incomplete")
-        input_upper_bound = len(prompt.encode("utf-8")) + _PROMPT_OVERHEAD_TOKENS
+        input_upper_bound = len(prompt.encode("utf-8")) + image_bytes + _PROMPT_OVERHEAD_TOKENS
         return (
             input_upper_bound * self._input_cost_per_million
             + self._max_output_tokens * self._output_cost_per_million
