@@ -42,6 +42,7 @@ class PolicyView(BaseModel):
     active_policy: tuple[PolicyRule, ...] = Field(min_length=1)
     style: PolicyStyle
     transition: PolicyTransition
+    stage: Literal["before", "after"] = "after"
 
     @model_validator(mode="after")
     def reject_ambiguous_rules(self) -> "PolicyView":

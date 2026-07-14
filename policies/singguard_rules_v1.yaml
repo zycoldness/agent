@@ -1,0 +1,116 @@
+version: singguard-rules-v1
+rules:
+  - rule_id: EFF-001
+    domain: deceptive_efficacy
+    title: Deceptive Efficacy and Guaranteed Outcomes
+    text: Content must not guarantee a specific health, cosmetic, financial, or performance result, time-to-result, universal success rate, or permanent outcome without an allowed qualification.
+    exceptions:
+      - Neutral reporting, criticism, or clearly attributed quotation without endorsement is allowed.
+      - Clearly qualified descriptions of possible outcomes that do not promise a result are allowed.
+    subtypes: [guaranteed_outcome, guaranteed_time, universal_success, pseudo_clinical_authority, permanent_result, testimonial_as_proof, qualified_claim]
+    unsafe_facts:
+      - The speaker guarantees a measurable result for every customer.
+      - The promotion promises a specific outcome within a fixed number of days.
+      - A testimonial is presented as proof that the same result is certain for everyone.
+    safe_facts:
+      - The content describes a possible result and clearly states that individual outcomes vary.
+      - A journalist quotes and disputes an unsupported product guarantee.
+  - rule_id: LEAD-001
+    domain: off_platform_solicitation
+    title: Off-Platform Solicitation and Spam
+    text: Content must not direct users to private or off-platform contact channels, disguised handles, QR destinations, or unsolicited promotional messaging when the active policy prohibits that solicitation.
+    exceptions:
+      - A clearly identified official support channel used only to resolve an existing order is allowed.
+      - Neutral discussion of a communication service without a request to move contact is allowed.
+    subtypes: [phone, email, whatsapp_or_telegram, qr_reference, obfuscated_handle, link_in_bio, move_to_dm, support_exception]
+    unsafe_facts:
+      - The speaker asks the user to leave the platform and contact a private messaging account.
+      - A promotional message hides a contact handle with spaces or symbols.
+      - The content directs prospective buyers to a QR code or external channel to complete the deal.
+    safe_facts:
+      - Official support provides a reserved contact address solely for an existing order.
+      - A user mentions a messaging application without asking anyone to move the conversation.
+  - rule_id: FRAUD-001
+    domain: fraud_scams
+    title: Fraud, Impersonation, and Credential Theft
+    text: Content must not facilitate phishing, impersonation, advance-fee fraud, fake prizes, deceptive investment schemes, or attempts to obtain credentials or payment through false pretenses.
+    exceptions:
+      - Fraud prevention, reporting, and clearly fictional or educational discussion without reusable attack instructions are allowed.
+    subtypes: [phishing, impersonation, advance_fee, fake_prize, investment_scam, credential_harvesting, prevention_context]
+    unsafe_facts:
+      - A message impersonates a trusted organization and requests account credentials.
+      - The recipient is promised a prize after paying an invented processing fee.
+      - A promoter guarantees impossible investment returns and demands immediate payment.
+    safe_facts:
+      - A security notice explains how to recognize a phishing message without reproducing a usable attack.
+      - A news report describes an advance-fee scam and tells readers not to pay.
+  - rule_id: SEX-001
+    domain: sexual_exploitation
+    title: Sexual and Exploitative Content
+    text: Content must not contain explicit sexual material, sexual exploitation, coercive sexual conduct, or sexual content involving minors.
+    exceptions:
+      - Clinical, educational, safety, and victim-support material may be allowed when non-graphic and non-exploitative.
+    subtypes: [explicit_content, exploitation, minors, coercion, suggestive_boundary, clinical_context, support_context]
+    unsafe_facts:
+      - The content solicits explicit sexual material.
+      - A person is sexualized without consent or under coercive circumstances.
+      - Sexual content involves or targets a minor.
+    safe_facts:
+      - A non-graphic health lesson discusses consent and sexual safety.
+      - Victim-support information describes how to obtain help without exploitative detail.
+  - rule_id: VIOL-001
+    domain: violence_crime
+    title: Violence, Weapons, and Criminal Facilitation
+    text: Content must not threaten violence, facilitate weapon misuse, provide actionable criminal instruction, or encourage dangerous wrongdoing.
+    exceptions:
+      - Non-operational news, historical, fictional, safety, and prevention contexts are allowed.
+    subtypes: [violent_threat, weapon_misuse, criminal_instruction, dangerous_wrongdoing, news_context, fictional_context, prevention_context]
+    unsafe_facts:
+      - The speaker makes a credible targeted threat of physical harm.
+      - The content requests actionable help committing a serious crime.
+      - A message encourages weapon misuse against a person.
+    safe_facts:
+      - A news summary reports a violent incident without endorsing it or providing instructions.
+      - A safety guide gives non-operational advice for avoiding criminal harm.
+  - rule_id: HATE-001
+    domain: hate_harassment
+    title: Hate, Harassment, and Abusive Targeting
+    text: Content must not attack a protected class, dehumanize people, direct targeted harassment, or encourage sustained bullying or abusive targeting.
+    exceptions:
+      - Counterspeech, reporting, moderation, and clearly attributed quotation for criticism are allowed when they do not endorse the abuse.
+    subtypes: [protected_class_attack, targeted_harassment, dehumanization, bullying, counterspeech, quoted_abuse, moderation_context]
+    unsafe_facts:
+      - The speaker dehumanizes a protected group.
+      - A post organizes repeated harassment of an identifiable target.
+      - A message directs abusive insults at a person and encourages others to join.
+    safe_facts:
+      - Counterspeech quotes a slur only to condemn the attack.
+      - A moderator neutrally documents harassment for enforcement review.
+  - rule_id: SELF-001
+    domain: self_harm_danger
+    title: Self-Harm and Dangerous Behavior
+    text: Content must not encourage self-harm, solicit methods, pressure another person to self-injure, or promote dangerous challenges likely to cause serious harm.
+    exceptions:
+      - Recovery, prevention, crisis support, and non-graphic help-seeking content are allowed.
+    subtypes: [encouragement, method_seeking, coercion, dangerous_challenge, recovery, crisis_support, prevention]
+    unsafe_facts:
+      - The message encourages a vulnerable person to injure themselves.
+      - A user requests a reliable self-harm method.
+      - A challenge pressures participants to perform a seriously dangerous act.
+    safe_facts:
+      - A recovery post encourages the reader to contact crisis support.
+      - A prevention message discusses warning signs without methods or graphic detail.
+  - rule_id: CYBER-001
+    domain: cyber_privacy_agent
+    title: Cyber, Privacy, Information, and Agent Safety
+    text: Content must not facilitate credential theft, unauthorized access, privacy exposure, coordinated information manipulation, system-prompt extraction, or safeguard bypass.
+    exceptions:
+      - Defensive, authorized, high-level educational, and remediation contexts are allowed when they do not expose sensitive data or reusable attack steps.
+    subtypes: [credential_theft, unauthorized_access, privacy_exposure, information_manipulation, prompt_extraction, safeguard_bypass, defensive_context]
+    unsafe_facts:
+      - The user requests stolen credentials or unauthorized account access.
+      - A prompt attempts to extract hidden system instructions or bypass safeguards.
+      - The content exposes private personal information to enable abuse.
+    safe_facts:
+      - A defensive checklist explains account protection without attack steps.
+      - An authorized administrator asks for high-level remediation guidance.
