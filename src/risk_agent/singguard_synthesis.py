@@ -12,11 +12,16 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from risk_agent.contracts import PolicyRule
 from risk_agent.singguard import (
+    ContentSample,
     PolicyTransition,
     PolicyView,
+    RuleCheck,
     SingGuardAnnotation,
+    SingGuardExample,
     ThinkingType,
 )
+from risk_agent.singguard_prompts import load_prompt, prompt_sha256
+from risk_agent.teacher import Teacher, TeacherUsage
 
 
 _RULE_CATALOG_PATH = Path(__file__).resolve().parents[2] / "policies" / "singguard_rules_v1.yaml"
@@ -135,6 +140,62 @@ class PolicyPair(BaseModel):
         if actual != expected:
             raise ValueError("policy pair labels do not match the ordered transition")
         return self
+
+
+class GeneratedContent(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    query: str = Field(min_length=1)
+    response: str | None = None
+    style: str = Field(min_length=1)
+    risk_cues: tuple[str, ...] = ()
+    benign_cues: tuple[str, ...] = ()
+
+
+class VerifiedView(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    opaque_id: str = Field(min_length=1)
+    label: Literal["safe", "unsafe"]
+    rule_title: str | None = None
+    evidence_quote: str | None = None
+    confidence: float = Field(ge=0, le=1)
+    ambiguous: bool
+    summary: str | None = None
+    checks: tuple[RuleCheck, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_decision_fields(self) -> "VerifiedView":
+        if self.label == "safe" and (
+            self.rule_title is not None or self.evidence_quote is not None
+        ):
+            raise ValueError("safe verifier view must not name a rule or unsafe evidence")
+        if self.label == "unsafe" and (
+            not self.rule_title or not self.evidence_quote
+        ):
+            raise ValueError("unsafe verifier view requires a rule and literal evidence")
+        return self
+
+
+class VerifierResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    views: tuple[VerifiedView, ...] = Field(min_length=2, max_length=2)
+    style: str = Field(min_length=1)
+    naturalness: int = Field(ge=1, le=5)
+    template_like: bool
+    issues: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def reject_duplicate_views(self) -> "VerifierResult":
+        ids = [view.opaque_id for view in self.views]
+        if len(ids) != len(set(ids)):
+            raise ValueError("verifier response repeats an opaque view ID")
+        return self
+
+
+GENERATOR_RESPONSE_SCHEMA = GeneratedContent.model_json_schema()
+VERIFIER_RESPONSE_SCHEMA = VerifierResult.model_json_schema()
 
 
 def load_rule_catalog(path: Path = _RULE_CATALOG_PATH) -> tuple[CatalogRule, ...]:
@@ -322,3 +383,181 @@ def compile_policy_pair(
         before_annotation=SingGuardAnnotation(label=before_label, rule_title=before_answer),
         after_annotation=SingGuardAnnotation(label=after_label, rule_title=after_answer),
     )
+
+
+def build_generator_request(
+    blueprint: AnchorBlueprint,
+    *,
+    seed_text: str | None = None,
+) -> dict[str, object]:
+    """Build a content-only request with no final label or policy transition."""
+
+    constraints: dict[str, object] = {
+        "risk_domain": blueprint.risk_domain,
+        "subtype": blueprint.subtype,
+        "platform_style": blueprint.input_style,
+        "tone": blueprint.tone,
+        "length_bin": blueprint.length_bin,
+        "difficulty": blueprint.difficulty,
+        "conversation_type": blueprint.conversation_type,
+        "noise_profile": blueprint.noise_profile,
+        "intended_facts": list(blueprint.intended_facts),
+    }
+    request: dict[str, object] = {
+        "instruction": load_prompt("generator"),
+        "prompt_version": "singguard_generator_v1",
+        "prompt_sha256": prompt_sha256("generator"),
+        "constraints": constraints,
+    }
+    if seed_text is not None:
+        request["public_seed_text"] = seed_text
+    return request
+
+
+def generate_content(
+    blueprint: AnchorBlueprint,
+    teacher: Teacher,
+    *,
+    seed_text: str | None = None,
+) -> tuple[GeneratedContent, TeacherUsage]:
+    """Ask one structured teacher to realize a blueprint without classifying it."""
+
+    reply = teacher.generate(build_generator_request(blueprint, seed_text=seed_text))
+    try:
+        content = GeneratedContent.model_validate(reply.payload)
+    except Exception:
+        raise ValueError("generator response is not valid SingGuard content") from None
+    if content.style != blueprint.input_style:
+        raise ValueError("generator response does not match the planned style")
+    if blueprint.conversation_type == "query" and content.response is not None:
+        raise ValueError("query-only blueprint must not contain a response")
+    if blueprint.conversation_type == "query_response" and not content.response:
+        raise ValueError("query-response blueprint requires a response")
+    return content, reply.usage
+
+
+def _opaque_id(anchor_id: str, stage: str, shuffle_seed: int) -> str:
+    payload = f"{anchor_id}:{stage}:{shuffle_seed}".encode("utf-8")
+    return "view-" + hashlib.sha256(payload).hexdigest()[:16]
+
+
+def build_verifier_request(
+    blueprint: AnchorBlueprint,
+    pair: PolicyPair,
+    content: GeneratedContent,
+    *,
+    shuffle_seed: int,
+) -> tuple[dict[str, object], dict[str, Literal["before", "after"]]]:
+    """Build a blind request and keep its opaque-to-stage map local."""
+
+    if isinstance(shuffle_seed, bool) or not isinstance(shuffle_seed, int):
+        raise ValueError("shuffle_seed must be an integer")
+    view_specs: list[tuple[str, Literal["before", "after"], PolicyView, ThinkingType]] = []
+    for stage, view, mode in (
+        ("before", pair.before, blueprint.before_thinking_type),
+        ("after", pair.after, blueprint.after_thinking_type),
+    ):
+        opaque = _opaque_id(blueprint.anchor_id, stage, shuffle_seed)
+        view_specs.append((opaque, stage, view, mode))
+    random.Random(shuffle_seed).shuffle(view_specs)
+    mapping = {opaque: stage for opaque, stage, _view, _mode in view_specs}
+    policy_views = [
+        {
+            "opaque_id": opaque,
+            "thinking_type": mode,
+            "active_policy": [
+                rule.model_dump(mode="json") for rule in view.active_policy
+            ],
+        }
+        for opaque, _stage, view, mode in view_specs
+    ]
+    request: dict[str, object] = {
+        "instruction": load_prompt("verifier"),
+        "prompt_version": "singguard_verifier_v1",
+        "prompt_sha256": prompt_sha256("verifier"),
+        "content": {"query": content.query, "response": content.response},
+        "declared_style": blueprint.input_style,
+        "policy_views": policy_views,
+    }
+    return request, mapping
+
+
+def verify_content(
+    blueprint: AnchorBlueprint,
+    pair: PolicyPair,
+    content: GeneratedContent,
+    teacher: Teacher,
+    *,
+    shuffle_seed: int,
+) -> tuple[VerifierResult, dict[str, Literal["before", "after"]], TeacherUsage]:
+    """Ask a stateless teacher to judge opaque policy views independently."""
+
+    request, mapping = build_verifier_request(
+        blueprint,
+        pair,
+        content,
+        shuffle_seed=shuffle_seed,
+    )
+    reply = teacher.generate(request)
+    try:
+        verdict = VerifierResult.model_validate(reply.payload)
+    except Exception:
+        raise ValueError("verifier response is not valid SingGuard verification") from None
+    if {view.opaque_id for view in verdict.views} != set(mapping):
+        raise ValueError("verifier response does not cover the requested opaque views")
+    stage_views = {"before": pair.before, "after": pair.after}
+    for verified in verdict.views:
+        policy = stage_views[mapping[verified.opaque_id]]
+        active_titles = {rule.title for rule in policy.active_policy}
+        if verified.rule_title is not None and verified.rule_title not in active_titles:
+            raise ValueError("verifier rule title must belong to the active policy")
+    return verdict, mapping, reply.usage
+
+
+def examples_from_verifier(
+    blueprint: AnchorBlueprint,
+    pair: PolicyPair,
+    content: GeneratedContent,
+    verdict: VerifierResult,
+    opaque_to_stage: dict[str, Literal["before", "after"]],
+) -> tuple[SingGuardExample, SingGuardExample]:
+    """Convert only exact oracle agreement into canonical source examples."""
+
+    by_stage = {
+        opaque_to_stage[view.opaque_id]: view
+        for view in verdict.views
+        if view.opaque_id in opaque_to_stage
+    }
+    if set(by_stage) != {"before", "after"}:
+        raise ValueError("verifier result does not map to both policy stages")
+    content_sample = ContentSample(
+        sample_id=blueprint.anchor_id,
+        split_group=blueprint.family_id,
+        query=content.query,
+        response=content.response,
+    )
+    examples: list[SingGuardExample] = []
+    for stage, policy, oracle, mode in (
+        ("before", pair.before, pair.before_annotation, blueprint.before_thinking_type),
+        ("after", pair.after, pair.after_annotation, blueprint.after_thinking_type),
+    ):
+        verified = by_stage[stage]
+        if (verified.label, verified.rule_title) != (oracle.label, oracle.rule_title):
+            raise ValueError("verifier disagrees with the local policy oracle")
+        annotation = oracle
+        if mode == "slow":
+            annotation = SingGuardAnnotation(
+                label=oracle.label,
+                rule_title=oracle.rule_title,
+                summary=verified.summary,
+                checks=verified.checks,
+            )
+        examples.append(
+            SingGuardExample(
+                content=content_sample,
+                policy=policy,
+                annotation=annotation,
+                thinking_type=mode,
+            )
+        )
+    return examples[0], examples[1]

@@ -1,6 +1,7 @@
 """Planning and policy compilation for English SingGuard synthesis."""
 
 from collections import Counter
+import json
 
 
 def test_planner_is_deterministic_and_balances_pilot_transitions() -> None:
@@ -116,3 +117,177 @@ def test_broadening_blueprints_require_implicit_content() -> None:
 
     assert broadened
     assert all(item.difficulty == "implicit" for item in broadened)
+
+
+def test_generator_request_contains_constraints_but_no_final_label() -> None:
+    from risk_agent.singguard_synthesis import build_generator_request, plan_blueprints
+
+    blueprint = plan_blueprints(100, seed=11)[0]
+    request = build_generator_request(blueprint, seed_text="A short public style seed.")
+    serialized = json.dumps(request, sort_keys=True)
+
+    assert blueprint.input_style in serialized
+    assert blueprint.intended_facts[0] in serialized
+    assert "A short public style seed." in serialized
+    assert blueprint.transition not in serialized
+    assert '"oracle":' not in serialized.lower()
+    assert "rule_title" not in serialized
+
+
+def test_blind_verifier_request_omits_oracle_transition_and_stage_names() -> None:
+    from risk_agent.singguard_synthesis import (
+        GeneratedContent,
+        build_verifier_request,
+        compile_policy_pair,
+        plan_blueprints,
+    )
+
+    blueprint = next(
+        item for item in plan_blueprints(100, seed=13) if item.transition == "unsafe_to_safe"
+    )
+    pair = compile_policy_pair(blueprint)
+    content = GeneratedContent(
+        query="A natural English sample.",
+        style=blueprint.input_style,
+    )
+
+    request, opaque_to_stage = build_verifier_request(
+        blueprint,
+        pair,
+        content,
+        shuffle_seed=7,
+    )
+    serialized = json.dumps(request, sort_keys=True)
+
+    for forbidden in (
+        '"oracle":',
+        '"transition":',
+        "unsafe_to_safe",
+        "source_label",
+        "intended_facts",
+        '"before"',
+        '"after"',
+    ):
+        assert forbidden not in serialized
+    assert set(opaque_to_stage.values()) == {"before", "after"}
+    assert all(stage not in opaque_to_stage for stage in ("before", "after"))
+
+
+def test_structured_generator_and_verifier_create_two_fast_source_examples() -> None:
+    from risk_agent.singguard_synthesis import (
+        examples_from_verifier,
+        generate_content,
+        plan_blueprints,
+        compile_policy_pair,
+        verify_content,
+    )
+    from risk_agent.teacher import CallableTeacher
+
+    blueprint = next(
+        item for item in plan_blueprints(100, seed=15) if item.transition == "unsafe_to_unsafe"
+    ).model_copy(
+        update={"before_thinking_type": "fast", "after_thinking_type": "fast"}
+    )
+    pair = compile_policy_pair(blueprint)
+    generator = CallableTeacher(
+        lambda _request: {
+            "query": "Guaranteed results for every customer in seven days.",
+            "response": None,
+            "style": blueprint.input_style,
+            "risk_cues": ["Guaranteed results"],
+            "benign_cues": [],
+        }
+    )
+
+    content, _generator_usage = generate_content(blueprint, generator)
+
+    def verifier_call(request):
+        views = []
+        for view in request["policy_views"]:
+            title = view["active_policy"][0]["title"]
+            views.append(
+                {
+                    "opaque_id": view["opaque_id"],
+                    "label": "unsafe",
+                    "rule_title": title,
+                    "evidence_quote": "Guaranteed results",
+                    "confidence": 0.99,
+                    "ambiguous": False,
+                    "summary": None,
+                    "checks": [],
+                }
+            )
+        return {
+            "views": views,
+            "style": blueprint.input_style,
+            "naturalness": 5,
+            "template_like": False,
+            "issues": [],
+        }
+
+    verifier = CallableTeacher(verifier_call)
+    verdict, opaque_to_stage, _verifier_usage = verify_content(
+        blueprint,
+        pair,
+        content,
+        verifier,
+        shuffle_seed=19,
+    )
+    examples = examples_from_verifier(
+        blueprint,
+        pair,
+        content,
+        verdict,
+        opaque_to_stage,
+    )
+
+    assert len(examples) == 2
+    assert [example.policy.stage for example in examples] == ["before", "after"]
+    assert all(example.annotation.label == "unsafe" for example in examples)
+    assert all(example.thinking_type == "fast" for example in examples)
+    assert all(example.content.split_group == blueprint.family_id for example in examples)
+
+
+def test_verifier_rejects_policy_external_rule_title() -> None:
+    import pytest
+
+    from risk_agent.singguard_synthesis import (
+        GeneratedContent,
+        compile_policy_pair,
+        plan_blueprints,
+        verify_content,
+    )
+    from risk_agent.teacher import CallableTeacher
+
+    blueprint = plan_blueprints(100, seed=21)[0]
+    pair = compile_policy_pair(blueprint)
+    content = GeneratedContent(query="Natural content.", style=blueprint.input_style)
+
+    def bad_verifier(request):
+        return {
+            "views": [
+                {
+                    "opaque_id": view["opaque_id"],
+                    "label": "unsafe",
+                    "rule_title": "Invented Rule",
+                    "evidence_quote": "Natural content",
+                    "confidence": 0.99,
+                    "ambiguous": False,
+                    "checks": [],
+                }
+                for view in request["policy_views"]
+            ],
+            "style": blueprint.input_style,
+            "naturalness": 5,
+            "template_like": False,
+            "issues": [],
+        }
+
+    with pytest.raises(ValueError, match="active policy"):
+        verify_content(
+            blueprint,
+            pair,
+            content,
+            CallableTeacher(bad_verifier),
+            shuffle_seed=1,
+        )
