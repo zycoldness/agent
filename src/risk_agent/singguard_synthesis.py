@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import random
 from pathlib import Path
+from collections.abc import Mapping, Sequence
 from typing import Literal
 
 import yaml
@@ -21,7 +24,13 @@ from risk_agent.singguard import (
     ThinkingType,
 )
 from risk_agent.singguard_prompts import load_prompt, prompt_sha256
-from risk_agent.teacher import Teacher, TeacherUsage
+from risk_agent.teacher import (
+    Teacher,
+    TeacherBudget,
+    TeacherBudgetExceeded,
+    TeacherRequestError,
+    TeacherUsage,
+)
 
 
 _RULE_CATALOG_PATH = Path(__file__).resolve().parents[2] / "policies" / "singguard_rules_v1.yaml"
@@ -561,3 +570,274 @@ def examples_from_verifier(
             )
         )
     return examples[0], examples[1]
+
+
+def _atomic_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _atomic_jsonl(path: Path, rows: Sequence[object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        for row in rows:
+            if isinstance(row, BaseModel):
+                row = row.model_dump(mode="json")
+            handle.write(
+                json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                + "\n"
+            )
+    os.replace(temporary, path)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _coverage_complete(
+    planned: Sequence[AnchorBlueprint], accepted: Sequence[AnchorBlueprint]
+) -> bool:
+    for field in ("risk_domain", "transition", "input_style"):
+        if {getattr(item, field) for item in accepted} != {
+            getattr(item, field) for item in planned
+        }:
+            return False
+    return True
+
+
+def _verifier_agrees_with_oracle(
+    pair: PolicyPair,
+    verdict: VerifierResult,
+    mapping: Mapping[str, Literal["before", "after"]],
+) -> bool:
+    by_stage = {mapping[view.opaque_id]: view for view in verdict.views if view.opaque_id in mapping}
+    return set(by_stage) == {"before", "after"} and all(
+        (by_stage[stage].label, by_stage[stage].rule_title)
+        == (oracle.label, oracle.rule_title)
+        for stage, oracle in (
+            ("before", pair.before_annotation),
+            ("after", pair.after_annotation),
+        )
+    )
+
+
+def run_singguard_batch(
+    plan: Sequence[AnchorBlueprint],
+    *,
+    generator: Teacher,
+    verifier: Teacher,
+    budget: TeacherBudget,
+    output_dir: Path,
+    seed: int,
+    seed_texts: Mapping[str, str] | None = None,
+    seed_licenses: Mapping[str, str] | None = None,
+    max_retries: int = 2,
+    pilot: bool = False,
+) -> dict[str, object]:
+    """Generate, blind-verify, gate, audit, and export one immutable batch."""
+
+    from risk_agent.ms_swift_singguard import prepare_singguard_bundle
+    from risk_agent.singguard_quality import (
+        build_quality_report,
+        gate_candidate,
+        stratified_review_ids,
+    )
+
+    output_dir = output_dir.absolute()
+    if output_dir.exists():
+        raise ValueError("output directory must not exist")
+    if not plan:
+        raise ValueError("plan must not be empty")
+    if isinstance(max_retries, bool) or not isinstance(max_retries, int) or not 0 <= max_retries <= 2:
+        raise ValueError("max_retries must be an integer from zero to two")
+    if len({item.anchor_id for item in plan}) != len(plan):
+        raise ValueError("plan contains duplicate anchor IDs")
+
+    output_dir.mkdir(parents=True, exist_ok=False)
+    _atomic_jsonl(output_dir / "plan.jsonl", list(plan))
+    catalog = load_rule_catalog()
+    accepted_rows: list[dict[str, object]] = []
+    accepted_blueprints: list[AnchorBlueprint] = []
+    rejected_rows: list[dict[str, object]] = []
+    existing_texts: list[str] = []
+    first_pass_agreements = 0
+    near_duplicate_rejections = 0
+    stopped_reason: str | None = None
+
+    for plan_index, blueprint in enumerate(plan):
+        pair = compile_policy_pair(blueprint, catalog=catalog)
+        accepted = False
+        for attempt in range(max_retries + 1):
+            try:
+                content, _generator_usage = generate_content(
+                    blueprint,
+                    generator,
+                    seed_text=(seed_texts or {}).get(blueprint.anchor_id),
+                )
+                verdict, opaque_to_stage, _verifier_usage = verify_content(
+                    blueprint,
+                    pair,
+                    content,
+                    verifier,
+                    shuffle_seed=seed + plan_index * 7 + attempt,
+                )
+                if attempt == 0 and _verifier_agrees_with_oracle(
+                    pair, verdict, opaque_to_stage
+                ):
+                    first_pass_agreements += 1
+                gate = gate_candidate(
+                    blueprint,
+                    pair,
+                    content,
+                    verdict,
+                    opaque_to_stage,
+                    existing_texts=existing_texts,
+                    source_text=(seed_texts or {}).get(blueprint.anchor_id),
+                )
+                codes = gate.codes
+            except (ValueError, KeyError, TypeError):
+                codes = ("schema",)
+                content = None
+                verdict = None
+                opaque_to_stage = {}
+            except (TeacherRequestError, TeacherBudgetExceeded) as error:
+                stopped_reason = (
+                    error.reason if isinstance(error, TeacherBudgetExceeded) else "provider_error"
+                )
+                break
+
+            if not codes and content is not None and verdict is not None:
+                examples = examples_from_verifier(
+                    blueprint,
+                    pair,
+                    content,
+                    verdict,
+                    opaque_to_stage,
+                )
+                row = {
+                    "anchor_id": blueprint.anchor_id,
+                    "attempt": attempt + 1,
+                    "blueprint": blueprint.model_dump(mode="json"),
+                    "content": content.model_dump(mode="json"),
+                    "examples": [example.model_dump(mode="json") for example in examples],
+                    "source": {
+                        "used": blueprint.anchor_id in (seed_texts or {}),
+                        "license": (seed_licenses or {}).get(blueprint.anchor_id),
+                    },
+                }
+                accepted_rows.append(row)
+                accepted_blueprints.append(blueprint)
+                existing_texts.append(_combined_content_for_batch(content))
+                accepted = True
+                break
+
+            rejected_rows.append(
+                {
+                    "anchor_id": blueprint.anchor_id,
+                    "attempt": attempt + 1,
+                    "codes": list(codes),
+                }
+            )
+            near_duplicate_rejections += int("near_duplicate" in codes)
+
+        _atomic_jsonl(output_dir / "accepted.jsonl", accepted_rows)
+        _atomic_jsonl(output_dir / "rejected.jsonl", rejected_rows)
+        _atomic_json(
+            output_dir / "checkpoint.json",
+            {
+                "schema": "singguard-checkpoint-v1",
+                "completed_anchors": plan_index + int(accepted or stopped_reason is None),
+                "accepted_anchors": len(accepted_rows),
+                "status": "incomplete" if stopped_reason else "running",
+                "budget": budget.as_dict(),
+            },
+        )
+        if stopped_reason:
+            break
+
+    rejection_codes = tuple(tuple(row["codes"]) for row in rejected_rows)
+    licenses = tuple(
+        license_name
+        for row in accepted_rows
+        if (license_name := row["source"]["license"]) is not None
+    )
+    report = build_quality_report(
+        plan,
+        accepted_blueprints,
+        rejection_codes=rejection_codes,
+        first_pass_agreements=first_pass_agreements,
+        first_pass_attempts=len(plan),
+        near_duplicate_rejections=near_duplicate_rejections,
+        licenses=licenses,
+    )
+    coverage = _coverage_complete(plan, accepted_blueprints)
+    report["pilot_gates"]["near_duplicate_rate"] = (
+        near_duplicate_rejections / len(plan) <= 0.05
+    )
+    report["pilot_gates"]["quota_coverage"] = coverage
+    _atomic_json(output_dir / "quality_report.json", report)
+    review_ids = set(stratified_review_ids(accepted_blueprints, fraction=0.10, seed=seed))
+    _atomic_jsonl(
+        output_dir / "review_sample.jsonl",
+        [row for row in accepted_rows if row["anchor_id"] in review_ids],
+    )
+
+    gates_pass = all(report["pilot_gates"].values()) if pilot else True
+    complete = stopped_reason is None and len(accepted_rows) == len(plan) and gates_pass
+    if complete:
+        examples_path = output_dir / ".accepted_examples.jsonl"
+        _atomic_jsonl(
+            examples_path,
+            [example for row in accepted_rows for example in row["examples"]],
+        )
+        prepare_singguard_bundle(examples_path, output_dir / "ms_swift", seed=seed)
+        examples_path.unlink()
+
+    manifest: dict[str, object] = {
+        "schema": "singguard-batch-v1",
+        "status": "complete" if complete else "incomplete",
+        "reason": stopped_reason if stopped_reason else (None if gates_pass else "quality_gates"),
+        "seed": seed,
+        "planned_anchors": len(plan),
+        "accepted_anchors": len(accepted_rows),
+        "accepted_examples": len(accepted_rows) * 2,
+        "rejected_attempts": len(rejected_rows),
+        "budget": budget.as_dict(),
+        "artifacts": {
+            name: _sha256_file(output_dir / name)
+            for name in (
+                "plan.jsonl",
+                "accepted.jsonl",
+                "rejected.jsonl",
+                "quality_report.json",
+                "review_sample.jsonl",
+            )
+        },
+    }
+    _atomic_json(output_dir / "manifest.json", manifest)
+    _atomic_json(
+        output_dir / "checkpoint.json",
+        {
+            "schema": "singguard-checkpoint-v1",
+            "completed_anchors": len(accepted_rows),
+            "accepted_anchors": len(accepted_rows),
+            "status": manifest["status"],
+            "budget": budget.as_dict(),
+        },
+    )
+    return manifest
+
+
+def _combined_content_for_batch(content: GeneratedContent) -> str:
+    return "\n".join(part for part in (content.query, content.response) if part)

@@ -186,6 +186,53 @@ def _distribution(items: Iterable[AnchorBlueprint], field: str) -> dict[str, int
     return dict(sorted(Counter(str(getattr(item, field)) for item in items).items()))
 
 
+def _blueprint_distributions(items: Sequence[AnchorBlueprint]) -> dict[str, dict[str, int]]:
+    distributions = {
+        field: _distribution(items, field)
+        for field in (
+            "risk_domain",
+            "subtype",
+            "input_style",
+            "tone",
+            "length_bin",
+            "difficulty",
+            "transition",
+            "transformation",
+        )
+    }
+    distributions["thinking_type"] = dict(
+        sorted(
+            Counter(
+                mode
+                for item in items
+                for mode in (item.before_thinking_type, item.after_thinking_type)
+            ).items()
+        )
+    )
+    labels = {
+        "unsafe_to_unsafe": ("before:unsafe", "after:unsafe"),
+        "unsafe_to_safe": ("before:unsafe", "after:safe"),
+        "safe_to_unsafe": ("before:safe", "after:unsafe"),
+        "safe_to_safe": ("before:safe", "after:safe"),
+    }
+    distributions["stage_label"] = dict(
+        sorted(Counter(label for item in items for label in labels[item.transition]).items())
+    )
+    return distributions
+
+
+def _empty_domain_transition_cells(items: Sequence[AnchorBlueprint]) -> list[str]:
+    domains = sorted({item.risk_domain for item in items})
+    transitions = sorted({item.transition for item in items})
+    occupied = {(item.risk_domain, item.transition) for item in items}
+    return [
+        f"{domain}|{transition}"
+        for domain in domains
+        for transition in transitions
+        if (domain, transition) not in occupied
+    ]
+
+
 def build_quality_report(
     planned: Sequence[AnchorBlueprint],
     accepted: Sequence[AnchorBlueprint],
@@ -238,13 +285,10 @@ def build_quality_report(
             "final_acceptance": acceptance >= 0.90,
             "dqs": dqs >= 90.0,
         },
-        "planned_distributions": {
-            field: _distribution(planned, field)
-            for field in ("risk_domain", "transition", "input_style", "difficulty")
-        },
-        "accepted_distributions": {
-            field: _distribution(accepted, field)
-            for field in ("risk_domain", "transition", "input_style", "difficulty")
+        "planned_distributions": _blueprint_distributions(planned),
+        "accepted_distributions": _blueprint_distributions(accepted),
+        "empty_contingency_cells": {
+            "risk_domain|transition": _empty_domain_transition_cells(accepted),
         },
         "rejection_counts": dict(sorted(rejection_counts.items())),
         "license_counts": dict(sorted(Counter(licenses).items())),

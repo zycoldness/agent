@@ -291,3 +291,150 @@ def test_verifier_rejects_policy_external_rule_title() -> None:
             CallableTeacher(bad_verifier),
             shuffle_seed=1,
         )
+
+
+def test_batch_retries_one_candidate_and_exports_audited_bundle(tmp_path) -> None:
+    import hashlib
+    import json
+
+    from risk_agent.singguard_synthesis import plan_blueprints, run_singguard_batch
+    from risk_agent.teacher import CallableTeacher, TeacherBudget
+
+    plan = tuple(
+        item.model_copy(
+            update={
+                "transition": "unsafe_to_unsafe",
+                "transformation": "rewrite",
+                "before_thinking_type": "fast",
+                "after_thinking_type": "fast",
+                "conversation_type": "query",
+            }
+        )
+        for item in plan_blueprints(32, seed=47)
+    )
+    generation_number = 0
+    verifier_number = 0
+
+    def generate(request):
+        nonlocal generation_number
+        generation_number += 1
+        fingerprint = hashlib.sha256(
+            f"{generation_number}:{json.dumps(request['constraints'], sort_keys=True)}".encode()
+        ).hexdigest()
+        return {
+            "query": f"{fingerprint} Guaranteed outcome.",
+            "response": None,
+            "style": request["constraints"]["platform_style"],
+            "risk_cues": ["Guaranteed outcome"],
+            "benign_cues": [],
+        }
+
+    def verify(request):
+        nonlocal verifier_number
+        verifier_number += 1
+        views = []
+        for view in request["policy_views"]:
+            views.append(
+                {
+                    "opaque_id": view["opaque_id"],
+                    "label": "unsafe",
+                    "rule_title": view["active_policy"][0]["title"],
+                    "evidence_quote": "Guaranteed outcome",
+                    "confidence": 0.50 if verifier_number == 1 else 0.99,
+                    "ambiguous": False,
+                    "summary": None,
+                    "checks": [],
+                }
+            )
+        return {
+            "views": views,
+            "style": request["declared_style"],
+            "naturalness": 5,
+            "template_like": False,
+            "issues": [],
+        }
+
+    output = tmp_path / "pilot"
+    budget = TeacherBudget(max_requests=100)
+    result = run_singguard_batch(
+        plan,
+        generator=CallableTeacher(generate, budget=budget),
+        verifier=CallableTeacher(verify, budget=budget),
+        budget=budget,
+        output_dir=output,
+        seed=47,
+        pilot=True,
+    )
+
+    expected = {
+        "plan.jsonl",
+        "accepted.jsonl",
+        "rejected.jsonl",
+        "quality_report.json",
+        "review_sample.jsonl",
+        "manifest.json",
+        "checkpoint.json",
+    }
+    assert expected <= {path.name for path in output.iterdir()}
+    assert {
+        "train.jsonl",
+        "dev.jsonl",
+        "holdout.jsonl",
+        "manifest.json",
+    } == {path.name for path in (output / "ms_swift").iterdir()}
+    assert result["status"] == "complete"
+    assert result["accepted_anchors"] == 32
+    assert result["accepted_examples"] == 64
+    quality = json.loads((output / "quality_report.json").read_text(encoding="utf-8"))
+    assert quality["first_pass_agreement_rate"] == 1.0
+    rejected = [
+        json.loads(line)
+        for line in (output / "rejected.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert rejected[0]["codes"] == ["low_confidence"]
+    assert "request" not in json.dumps(rejected).lower()
+    source_rows = [
+        json.loads(line)
+        for line in (output / "accepted.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(source_rows) == 32
+    assert all(len(row["examples"]) == 2 for row in source_rows)
+    all_sft_rows = sum(
+        len((output / "ms_swift" / f"{split}.jsonl").read_text(encoding="utf-8").splitlines())
+        for split in ("train", "dev", "holdout")
+    )
+    assert all_sft_rows == 64
+    split_groups = {}
+    for split in ("train", "dev", "holdout"):
+        for line in (output / "ms_swift" / f"{split}.jsonl").read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            user_text = row["messages"][1]["content"]
+            split_groups.setdefault(user_text, set()).add(split)
+    assert all(len(splits) == 1 for splits in split_groups.values())
+
+
+def test_batch_refuses_existing_output_before_provider_calls(tmp_path) -> None:
+    import pytest
+
+    from risk_agent.singguard_synthesis import plan_blueprints, run_singguard_batch
+    from risk_agent.teacher import CallableTeacher, TeacherBudget
+
+    output = tmp_path / "existing"
+    output.mkdir()
+    calls = 0
+
+    def provider(_request):
+        nonlocal calls
+        calls += 1
+        return {}
+
+    with pytest.raises(ValueError, match="must not exist"):
+        run_singguard_batch(
+            plan_blueprints(32, seed=1),
+            generator=CallableTeacher(provider),
+            verifier=CallableTeacher(provider),
+            budget=TeacherBudget(max_requests=100),
+            output_dir=output,
+            seed=1,
+        )
+    assert calls == 0

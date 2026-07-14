@@ -217,6 +217,21 @@ def test_quality_report_and_review_sample_are_deterministic() -> None:
     assert report["dqs"] >= 90
     assert report["pilot_gates"]["first_pass_agreement"] is True
     assert report["pilot_gates"]["final_acceptance"] is True
+    assert set(report["planned_distributions"]) >= {
+        "risk_domain",
+        "subtype",
+        "input_style",
+        "tone",
+        "length_bin",
+        "difficulty",
+        "transition",
+        "transformation",
+        "thinking_type",
+        "stage_label",
+    }
+    assert sum(report["planned_distributions"]["thinking_type"].values()) == 200
+    assert sum(report["planned_distributions"]["stage_label"].values()) == 200
+    assert "risk_domain|transition" in report["empty_contingency_cells"]
     assert first == second
     assert len(first) == 9
     domains = {item.anchor_id: item.risk_domain for item in accepted}
