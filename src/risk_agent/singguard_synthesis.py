@@ -7,7 +7,7 @@ import json
 import os
 import random
 from pathlib import Path
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
 
 import yaml
@@ -730,6 +730,7 @@ def run_singguard_batch(
     max_retries: int = 2,
     pilot: bool = False,
     resume: bool = False,
+    progress: Callable[[dict[str, object]], object] | None = None,
 ) -> dict[str, object]:
     """Generate, blind-verify, gate, audit, and export one immutable batch."""
 
@@ -808,17 +809,41 @@ def run_singguard_batch(
         completed_count = 0
     stopped_reason: str | None = None
 
+    def emit(phase: str, *, anchor_id: str | None = None, attempt: int | None = None) -> None:
+        if progress is None:
+            return
+        event: dict[str, object] = {
+            "phase": phase,
+            "completed": completed_count,
+            "total": len(plan),
+            "accepted": len(accepted_rows),
+            "rejected": len(rejected_rows),
+            "requests": budget.request_count,
+        }
+        if anchor_id is not None:
+            event["anchor_id"] = anchor_id
+        if attempt is not None:
+            event["attempt"] = attempt
+        try:
+            progress(event)
+        except Exception:
+            pass
+
+    emit("start")
+
     for plan_index in range(completed_count, len(plan)):
         blueprint = plan[plan_index]
         pair = compile_policy_pair(blueprint, catalog=catalog)
         accepted = False
         for attempt in range(max_retries + 1):
             try:
+                emit("generate", anchor_id=blueprint.anchor_id, attempt=attempt + 1)
                 content, _generator_usage = generate_content(
                     blueprint,
                     generator,
                     seed_text=seed_texts.get(blueprint.anchor_id),
                 )
+                emit("verify", anchor_id=blueprint.anchor_id, attempt=attempt + 1)
                 verdict, opaque_to_stage, _verifier_usage = verify_content(
                     blueprint,
                     pair,
@@ -889,6 +914,8 @@ def run_singguard_batch(
                 }
             )
             near_duplicate_rejections += int("near_duplicate" in codes)
+            if attempt < max_retries:
+                emit("retry", anchor_id=blueprint.anchor_id, attempt=attempt + 2)
 
         if not stopped_reason:
             completed_count = plan_index + 1
@@ -906,7 +933,9 @@ def run_singguard_batch(
             },
         )
         if stopped_reason:
+            emit("stopped", anchor_id=blueprint.anchor_id)
             break
+        emit("anchor_complete", anchor_id=blueprint.anchor_id)
 
     rejection_codes = tuple(tuple(row["codes"]) for row in rejected_rows)
     licenses = tuple(
@@ -985,6 +1014,7 @@ def run_singguard_batch(
             **fingerprints,
         },
     )
+    emit("complete" if complete else "incomplete")
     return manifest
 
 

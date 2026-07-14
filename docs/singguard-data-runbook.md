@@ -87,6 +87,11 @@ python scripts/generate_singguard_data.py outputs/singguard-pilot-v1 \
   --pilot
 ```
 
+The command renders a live terminal progress bar on stderr with the current
+`generate` / `verify` / `retry` phase, completed anchors, accepted anchors,
+rejected attempts, provider requests, elapsed time, and ETA. The final manifest
+remains the only stdout JSON object, so it can still be redirected or parsed.
+
 If the command stops because of a transient provider failure or request budget,
 keep the directory and resume with the identical arguments plus a sufficiently
 large total request limit:

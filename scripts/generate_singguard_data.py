@@ -5,6 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
+import time
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -19,6 +22,58 @@ from risk_agent.singguard_synthesis import (
     run_singguard_batch,
 )
 from risk_agent.teacher import GeminiTeacher, TeacherBudget
+
+
+class ProgressBar:
+    """Small stderr progress renderer that keeps stdout machine-readable."""
+
+    def __init__(
+        self,
+        *,
+        total: int,
+        stream: Callable[[str], object] = sys.stderr.write,
+        clock: Callable[[], float] = time.monotonic,
+        width: int = 24,
+    ) -> None:
+        self.total = max(1, total)
+        self._stream = stream
+        self._clock = clock
+        self._width = width
+        self._started: float | None = None
+
+    def __call__(self, event: Mapping[str, object]) -> None:
+        now = self._clock()
+        if self._started is None:
+            self._started = now
+        completed = min(self.total, max(0, int(event.get("completed", 0))))
+        ratio = completed / self.total
+        filled = round(ratio * self._width)
+        bar = "#" * filled + "-" * (self._width - filled)
+        elapsed = max(0.0, now - self._started)
+        if completed:
+            eta_seconds = elapsed / completed * (self.total - completed)
+            eta = _duration(eta_seconds)
+        else:
+            eta = "--"
+        phase = str(event.get("phase", "working"))
+        line = (
+            f"\r[{bar}] {completed:>{len(str(self.total))}}/{self.total} "
+            f"{ratio * 100:5.1f}% {phase:<15} "
+            f"accepted={int(event.get('accepted', 0))} "
+            f"rejected={int(event.get('rejected', 0))} "
+            f"requests={int(event.get('requests', 0))} "
+            f"elapsed={_duration(elapsed)} ETA={eta}"
+        )
+        if phase in {"complete", "incomplete", "stopped"}:
+            line += "\n"
+        self._stream(line)
+
+
+def _duration(seconds: float) -> str:
+    seconds = max(0, round(seconds))
+    minutes, second = divmod(seconds, 60)
+    hours, minute = divmod(minutes, 60)
+    return f"{hours:02d}:{minute:02d}:{second:02d}"
 
 
 def _write_jsonl(path: Path, rows: tuple[AnchorBlueprint, ...]) -> None:
@@ -176,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
             max_retries=args.max_retries,
             pilot=args.pilot,
             resume=args.resume,
+            progress=ProgressBar(total=len(plan)),
         )
     except (OSError, ValueError) as error:
         parser.error(str(error))

@@ -117,3 +117,23 @@ def test_singguard_generation_cli_help_and_plan_only_need_no_credentials(
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "planned"
     assert manifest["planned_anchors"] == 100
+
+
+def test_singguard_progress_bar_is_terminal_friendly() -> None:
+    from scripts.generate_singguard_data import ProgressBar
+
+    writes = []
+    clock = iter((10.0, 12.0, 14.0))
+    progress = ProgressBar(total=10, stream=writes.append, clock=lambda: next(clock))
+
+    progress({"phase": "start", "completed": 0, "accepted": 0, "rejected": 0, "requests": 0})
+    progress({"phase": "verify", "completed": 4, "accepted": 4, "rejected": 1, "requests": 9})
+    progress({"phase": "complete", "completed": 10, "accepted": 9, "rejected": 2, "requests": 22})
+
+    rendered = "".join(writes)
+    assert "40.0%" in rendered
+    assert "verify" in rendered
+    assert "accepted=4" in rendered
+    assert "requests=9" in rendered
+    assert "ETA=" in rendered
+    assert rendered.endswith("\n")

@@ -356,6 +356,7 @@ def test_batch_retries_one_candidate_and_exports_audited_bundle(tmp_path) -> Non
 
     output = tmp_path / "pilot"
     budget = TeacherBudget(max_requests=100)
+    progress_events = []
     result = run_singguard_batch(
         plan,
         generator=CallableTeacher(generate, budget=budget),
@@ -364,6 +365,7 @@ def test_batch_retries_one_candidate_and_exports_audited_bundle(tmp_path) -> Non
         output_dir=output,
         seed=47,
         pilot=True,
+        progress=progress_events.append,
     )
 
     expected = {
@@ -411,6 +413,16 @@ def test_batch_retries_one_candidate_and_exports_audited_bundle(tmp_path) -> Non
             user_text = row["messages"][1]["content"]
             split_groups.setdefault(user_text, set()).add(split)
     assert all(len(splits) == 1 for splits in split_groups.values())
+    assert progress_events[0]["phase"] == "start"
+    assert {event["phase"] for event in progress_events} >= {
+        "generate",
+        "verify",
+        "retry",
+        "complete",
+    }
+    assert progress_events[-1]["completed"] == 32
+    assert progress_events[-1]["accepted"] == 32
+    assert all("request" not in event for event in progress_events)
 
 
 def test_batch_refuses_existing_output_before_provider_calls(tmp_path) -> None:
