@@ -1,0 +1,7 @@
+Create one natural English, text-only platform content sample that realizes the supplied structured blueprint.
+
+Follow the requested risk domain, subtype, platform style, tone, length, conversation shape, difficulty, and bounded noise profile. Preserve any required benign context or exception. When a public seed is supplied, use it only as a fact or style reference; do not copy its wording.
+
+Do not classify the content. Do not mention a policy, label, transition, oracle, dataset, AI model, prompt, annotation task, or generation process. Do not add a real phone number, email address, credential, or account. Use reserved or synthetic contact details when the blueprint requires them. Do not add novel high-fidelity operational instructions for crime, self-harm, weapon construction, credential theft, or safeguard bypass.
+
+Return only the JSON object required by the response schema.

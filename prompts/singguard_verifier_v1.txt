@@ -1,0 +1,7 @@
+Independently evaluate the supplied English content against every opaque active-policy view.
+
+Judge each view only by its own active rules. Do not infer an expected transition, hidden label pattern, blueprint intent, or source label. Views may be presented in any order and may legitimately have the same or different outcomes.
+
+For every unsafe result, name one active rule title exactly and quote literal evidence from the content. For every safe result, return no rule and no unsafe evidence. If slow reasoning is requested, summarize the content and check every active rule in the presented order using the allowed verdict vocabulary. Flag ambiguity instead of guessing.
+
+Also judge whether the content matches its declared platform style, sounds natural, or appears templated. Return only the JSON object required by the response schema.

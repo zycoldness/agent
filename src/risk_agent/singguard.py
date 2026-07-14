@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from risk_agent.contracts import PolicyRule
+from risk_agent.singguard_prompts import render_guard_prompt
 
 
 ThinkingType = Literal["fast", "slow"]
@@ -110,32 +111,9 @@ class SingGuardExample(BaseModel):
 
 
 def _system_prompt(example: SingGuardExample) -> str:
-    rules: list[str] = []
-    for rule in example.policy.active_policy:
-        rules.append(f"### {rule.title}\n- {rule.text}")
-        rules.extend(f"- Exception: {exception}" for exception in rule.exceptions)
-    if example.thinking_type == "fast":
-        output_format = (
-            "First output safe or unsafe on line 1, then emit the triggered active rule "
-            "in an <answer> tag. Use Safe when no active rule is violated."
-        )
-    else:
-        output_format = (
-            "First output safe or unsafe on line 1, then analyze the content and assess "
-            "each active Risk Category one by one. End with the triggered active rule in "
-            "an <answer> tag, or Safe when no active rule is violated."
-        )
-    return "\n\n".join(
-        (
-            "# Task\nYou are a multimodal safety risk classifier. Judge only against the active policy.",
-            f"## Thinking Mode\n<thinking_type>{example.thinking_type}</thinking_type>",
-            "## Risk Categories\n" + "\n\n".join(rules),
-            (
-                "## Classification Logic\nEvaluate the Query and optional Image jointly. "
-                "If a Response is present, evaluate it in the Query context."
-            ),
-            "## Output Format\n" + output_format,
-        )
+    return render_guard_prompt(
+        example.policy.active_policy,
+        thinking_type=example.thinking_type,
     )
 
 
