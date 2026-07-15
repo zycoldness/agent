@@ -125,12 +125,14 @@ _REPAIR_REQUIREMENTS = {
         "Preserve all three named reasoning steps and the reasoning and answer tags."
     ),
     "slow_rule_evidence": (
-        "Every active-rule line, including NOT APPLICABLE and NOT HIT, must include "
-        "non-empty evidence after the verdict period."
+        "Every HIT, NOT HIT, and OBSERVED BUT NOT UNSAFE rule line must include "
+        "non-empty evidence after the verdict period. A bare NOT APPLICABLE verdict "
+        "is valid."
     ),
     "slow_rule_order": "Check every active rule exactly once in policy order.",
     "slow_verdict_consistency": (
-        "The final label and answer must exactly match every rule marked HIT."
+        "Change only the first-line label and answer as needed to match the existing "
+        "HIT verdicts. Do not change any Step 2 verdict or its evidence."
     ),
 }
 
@@ -484,15 +486,26 @@ class GeminiAgentProvider(GeminiTeacher):
         candidate: str,
         validation_code: str,
     ) -> AgentTurn:
-        """Make one fresh, tool-free request that only repairs output grammar."""
+        """Make one fresh, tool-free request for format or trace consistency."""
 
         types = self._types()
+        if validation_code == "slow_verdict_consistency":
+            consistency_guard = (
+                "You may change the first-line label and answer so they match the "
+                "existing HIT verdicts, but you must not change any Step 2 verdict "
+                "or its evidence. "
+            )
+        else:
+            consistency_guard = (
+                "Do not change the moderation label or triggered rule, and do not "
+                "change any Step 2 verdict. "
+            )
         repair_instruction = (
             "\n\n# Output Repair\n"
             "The previous candidate failed deterministic output validation. The only "
             "permitted changes are output serialization and the minimum wording needed "
-            "to fill the exact Output Format structure above. Do not change the "
-            "moderation label or triggered rule. Do not call tools, add commentary, "
+            "to fill the exact Output Format structure above. "
+            f"{consistency_guard}Do not call tools, add commentary, "
             "omit required steps, or introduce policy categories that are not active."
         )
         repair_user = (
@@ -564,6 +577,13 @@ def _validation_code(error: ValueError) -> str:
     if "grammar" in message:
         return "output_grammar"
     return "completion_validation"
+
+
+def _repair_failure_code(error: ValueError) -> str:
+    message = str(error)
+    if message.startswith("Gemini ") or message.startswith("repair "):
+        return "provider_turn_invalid"
+    return _validation_code(error)
 
 
 def _validate_candidate(
@@ -1001,7 +1021,7 @@ def run_generation_batch(
         if isinstance(provider_model, str) and provider_model:
             provider_info["model"] = provider_model
     fingerprints: dict[str, object] = {
-        "contract_version": "singguard-active-policy-v2",
+        "contract_version": "singguard-active-policy-v3",
         "policy_sha256": _fingerprint(
             [policy.model_dump(mode="json") for policy in policies]
         ),
@@ -1194,7 +1214,7 @@ def run_generation_batch(
                     )
                     break
                 except ValueError as repair_error:
-                    repair_code = _validation_code(repair_error)
+                    repair_code = _repair_failure_code(repair_error)
                 else:
                     if repair_code is None:
                         accepted_rows.append(
@@ -1211,6 +1231,21 @@ def run_generation_batch(
                         )
                         repaired += 1
                         sample_repaired = True
+                        event_log.write(
+                            {
+                                "event": "repair_succeeded",
+                                "sample_id": sample.sample_id,
+                            }
+                        )
+                if repair_code is not None:
+                    event_log.write(
+                        {
+                            "event": "repair_failed",
+                            "sample_id": sample.sample_id,
+                            "code": repair_code,
+                            "candidate_present": repaired_candidate is not None,
+                        }
+                    )
             if repaired_candidate is None or repair_code is not None:
                 codes = [error.code]
                 if repair_code is not None:

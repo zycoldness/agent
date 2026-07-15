@@ -90,10 +90,13 @@ For each sample, the pipeline:
 3. executes each allowed tool locally and sends the real result back to Gemini;
 4. accepts at most two sequential calls;
 5. enforces the complete ordered sequence for `tool_policy=required` samples;
-6. validates the final `fast` or exact three-step `slow` completion;
-7. makes at most one fresh, tool-free serialization-repair request;
-8. checks hidden semantic expectations without exposing them to the model;
-9. writes either an accepted training row or a sanitized rejection.
+6. validates the final `fast` or three-step `slow` completion, tolerating one
+   blank line after the label while preserving the original text;
+7. requires evidence for `HIT`, `NOT HIT`, and `OBSERVED BUT NOT UNSAFE`, while
+   allowing a bare `NOT APPLICABLE` verdict;
+8. makes at most one fresh, tool-free format/consistency-repair request;
+9. checks hidden semantic expectations without exposing them to the model;
+10. writes either an accepted training row or a sanitized rejection.
 
 ## 5. Resume safely
 
@@ -141,6 +144,8 @@ provider status, attempt number, retry delay, token accounting, model, backend,
 and `google-genai` version. They intentionally exclude raw exception text,
 request/response bodies, prompts, candidates, tool arguments/results, API keys,
 project IDs, credential paths, and service-account data.
+`repair_succeeded` and `repair_failed` events expose only a stable failure code
+and whether a repaired candidate existed; they never include candidate text.
 
 ```bash
 tail -n 30 outputs/singguard-v3/events.jsonl

@@ -101,11 +101,11 @@ class ParsedCompletion(BaseModel):
 
 
 _FAST_COMPLETION_RE = re.compile(
-    r"\A(safe|unsafe)\n<answer>([^<]+)</answer>\Z",
+    r"\A(safe|unsafe)\n{1,2}<answer>([^<]+)</answer>\Z",
     re.DOTALL,
 )
 _SLOW_COMPLETION_RE = re.compile(
-    r"\A(safe|unsafe)\n<reasoning>\n(.+)\n</reasoning>\n"
+    r"\A(safe|unsafe)\n{1,2}<reasoning>\n(.+)\n</reasoning>\n"
     r"<answer>([^<]+)</answer>\Z",
     re.DOTALL,
 )
@@ -150,7 +150,8 @@ def validate_completion(
     reasoning = None if thinking_type == "fast" else match.group(2)
     answer_group = 2 if thinking_type == "fast" else 3
     answers = _answer_lines(match.group(answer_group))
-    _validate_answers(label, answers, active_titles)
+    if reasoning is None:
+        _validate_answers(label, answers, active_titles)
 
     if reasoning is not None:
         summary_marker = "[Step 1] Content Summary\n"
@@ -186,11 +187,17 @@ def validate_completion(
             if matched_title is None:
                 raise ValueError("slow completion checks an inactive policy rule")
             suffix = line[len(f"- {matched_title}: ") :]
-            verdict = next(
-                (item for item in _VERDICTS if suffix.startswith(f"{item}. ")),
-                None,
-            )
-            if verdict is None or not suffix[len(verdict) + 2 :].strip():
+            if suffix == "NOT APPLICABLE.":
+                verdict = "NOT APPLICABLE"
+            else:
+                verdict = next(
+                    (item for item in _VERDICTS if suffix.startswith(f"{item}. ")),
+                    None,
+                )
+            if verdict is None or (
+                verdict != "NOT APPLICABLE"
+                and not suffix[len(verdict) + 2 :].strip()
+            ):
                 raise ValueError("slow completion rule check has invalid evidence")
             observed_titles.append(matched_title)
             if verdict == "HIT":
@@ -199,6 +206,7 @@ def validate_completion(
             raise ValueError("slow completion must check rules in active policy order")
         if label == "safe" and hit_titles:
             raise ValueError("safe slow completion must not contain a hit")
+        _validate_answers(label, answers, active_titles)
         expected_hit_answers = tuple(
             title for title in active_titles if title in hit_titles
         )

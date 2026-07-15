@@ -15,8 +15,8 @@ image data can be added after the text pipeline and evaluation gates are stable.
 - direct Gemini generation from the full system prompt and conversation;
 - zero to two real sequential tool calls with deterministic local results and an
   optional sample-level `required` call sequence;
-- strict slow-format validation, hidden smoke-oracle checks, and one tool-free
-  serialization repair attempt;
+- policy-strict slow validation with bounded blank-line tolerance, hidden
+  smoke-oracle checks, and one tool-free format/consistency repair attempt;
 - redacted rejection artifacts, request/cost budgets, progress, and safe resume;
 - ms-swift SFT, GRPO, and OPSD/GKD shell entry points.
 
@@ -74,6 +74,9 @@ Provider failures in the manifest and event log include only the request stage,
 exception type, HTTP code/status, attempts, SDK version, backend type, and model
 name. Prompts, candidates, tool arguments/results, raw provider bodies,
 credentials, project IDs, and credential paths are deliberately excluded.
+Repair outcomes are logged separately as `repair_succeeded` or `repair_failed`;
+failure events contain only a bounded reason code and whether repaired text was
+available.
 
 The bundled six-row smoke input contains hidden `expected_label` and
 `expected_answers` fields. They are used only by local quality gates and are

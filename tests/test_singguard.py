@@ -169,6 +169,21 @@ def test_validate_fast_completion_preserves_multiple_active_answers() -> None:
     assert parsed.original == completion
 
 
+def test_validate_fast_completion_accepts_one_blank_line_after_label() -> None:
+    from risk_agent.singguard import validate_completion
+
+    completion = "safe\n\n<answer>Safe</answer>"
+
+    parsed = validate_completion(
+        completion,
+        thinking_type="fast",
+        active_titles=("Rule A",),
+    )
+
+    assert parsed.label == "safe"
+    assert parsed.original == completion
+
+
 def test_validate_slow_completion_requires_every_rule_in_order() -> None:
     from risk_agent.singguard import validate_completion
 
@@ -190,6 +205,72 @@ def test_validate_slow_completion_requires_every_rule_in_order() -> None:
 
     assert parsed.label == "unsafe"
     assert parsed.answers == ("Deceptive Efficacy",)
+
+
+def test_validate_slow_completion_accepts_one_blank_line_after_label() -> None:
+    from risk_agent.singguard import validate_completion
+
+    completion = (
+        "unsafe\n\n<reasoning>\n"
+        "[Step 1] Content Summary\nA private destination is supplied.\n\n"
+        "[Step 2] Check Risk Categories\n"
+        "- Off-Platform Solicitation: HIT. The destination is off platform.\n\n"
+        "[Step 3] Final Judgment\nThe active rule is violated.\n"
+        "</reasoning>\n<answer>Off-Platform Solicitation</answer>"
+    )
+
+    parsed = validate_completion(
+        completion,
+        thinking_type="slow",
+        active_titles=("Off-Platform Solicitation",),
+    )
+
+    assert parsed.label == "unsafe"
+    assert parsed.original == completion
+
+
+def test_validate_slow_completion_allows_bare_not_applicable() -> None:
+    from risk_agent.singguard import validate_completion
+
+    completion = (
+        "safe\n<reasoning>\n"
+        "[Step 1] Content Summary\nThe user asks for crisis support.\n\n"
+        "[Step 2] Check Risk Categories\n"
+        "- Self-Harm: NOT HIT. This is help-seeking content.\n"
+        "- Violence: NOT APPLICABLE.\n\n"
+        "[Step 3] Final Judgment\nThe request is permitted.\n"
+        "</reasoning>\n<answer>Safe</answer>"
+    )
+
+    parsed = validate_completion(
+        completion,
+        thinking_type="slow",
+        active_titles=("Self-Harm", "Violence"),
+    )
+
+    assert parsed.label == "safe"
+
+
+def test_validate_slow_completion_reports_label_hit_inconsistency() -> None:
+    import pytest
+
+    from risk_agent.singguard import validate_completion
+
+    completion = (
+        "safe\n<reasoning>\n"
+        "[Step 1] Content Summary\nThe response requests an advance fee.\n\n"
+        "[Step 2] Check Risk Categories\n"
+        "- Fraud: HIT. It instructs the user to pay before receiving a prize.\n\n"
+        "[Step 3] Final Judgment\nThe response facilitates advance-fee fraud.\n"
+        "</reasoning>\n<answer>Fraud</answer>"
+    )
+
+    with pytest.raises(ValueError, match="safe slow completion must not contain a hit"):
+        validate_completion(
+            completion,
+            thinking_type="slow",
+            active_titles=("Fraud",),
+        )
 
 
 def test_validate_slow_completion_rejects_reordered_rule_checks() -> None:

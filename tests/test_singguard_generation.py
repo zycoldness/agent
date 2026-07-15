@@ -62,7 +62,10 @@ def _environment() -> ToolEnvironment:
 
 
 def test_bundled_smoke_plan_has_complete_hidden_oracles_and_tool_targets() -> None:
-    from risk_agent.singguard_generation import load_moderation_samples
+    from risk_agent.singguard_generation import (
+        load_active_policies,
+        load_moderation_samples,
+    )
 
     samples = load_moderation_samples(Path("data/content_samples.jsonl"))
 
@@ -73,6 +76,14 @@ def test_bundled_smoke_plan_has_complete_hidden_oracles_and_tool_targets() -> No
     assert all(
         sample.tool_names for sample in samples if sample.tool_policy == "required"
     )
+    policies = load_active_policies(Path("data/active_policies.jsonl"))
+    cyber_rule = next(
+        rule
+        for policy in policies
+        for rule in policy.rules
+        if rule.rule_id == "CYBER-001"
+    )
+    assert "request or attempt system-prompt extraction" in cyber_rule.text
 
 
 def test_agent_executes_two_tools_then_records_final_completion() -> None:
@@ -524,9 +535,66 @@ def test_gemini_repair_receives_exact_format_only_contract() -> None:
     assert "Do not change the moderation label or triggered rule" in repair_system
     repair_user = sent[0]["contents"][0]["parts"][0]["text"]
     assert "[validation_error]: slow_rule_evidence" in repair_user
-    assert "including NOT APPLICABLE" in repair_user
+    assert "HIT, NOT HIT, and OBSERVED BUT NOT UNSAFE" in repair_user
     assert "[rejected_candidate]:\nsafe" in repair_user
     assert "tools" not in captured
+
+
+def test_gemini_consistency_repair_may_change_label_but_not_hit_verdicts() -> None:
+    from risk_agent.singguard_generation import GeminiAgentProvider
+    from risk_agent.teacher import TeacherBudget
+
+    captured: dict[str, object] = {}
+
+    class Models:
+        def generate_content(self, **kwargs):
+            return SimpleNamespace(
+                function_calls=[],
+                text="unsafe\n<answer>Fraud</answer>",
+                candidates=[SimpleNamespace(content={"role": "model"})],
+                usage_metadata=SimpleNamespace(
+                    prompt_token_count=8,
+                    candidates_token_count=3,
+                ),
+            )
+
+    class Part:
+        @staticmethod
+        def from_text(*, text):
+            captured["user"] = text
+            return {"text": text}
+
+    class Content:
+        def __new__(cls, *, role, parts):
+            return {"role": role, "parts": parts}
+
+    def config(**kwargs):
+        captured["system"] = kwargs["system_instruction"]
+        return kwargs
+
+    provider = GeminiAgentProvider(
+        model="gemini-test",
+        client_factory=lambda: SimpleNamespace(models=Models()),
+        types_module=SimpleNamespace(
+            GenerateContentConfig=config,
+            Part=Part,
+            Content=Content,
+        ),
+        budget=TeacherBudget(max_requests=1),
+        max_attempts=1,
+    )
+
+    provider.repair(
+        system="system",
+        user="[user]: prize",
+        candidate="safe\n<answer>Fraud</answer>",
+        validation_code="slow_verdict_consistency",
+    )
+
+    assert "may change the first-line label and answer" in captured["system"]
+    assert "must not change any Step 2 verdict" in captured["system"]
+    assert "Do not change the You may change" not in captured["system"]
+    assert "match the existing HIT verdicts" in captured["user"]
 
 
 def test_gemini_does_not_retry_non_transient_provider_error() -> None:
@@ -1031,6 +1099,44 @@ def test_batch_repairs_one_invalid_completion_without_replaying_tools(tmp_path: 
     assert provider.repair_calls[0]["validation_code"] == "output_grammar"
 
 
+def test_batch_records_safe_reason_when_repair_has_no_final_text(tmp_path: Path) -> None:
+    from risk_agent.singguard_generation import AgentTurn, run_generation_batch
+    from risk_agent.teacher import TeacherBudget
+
+    class EmptyRepairProvider(FakeAgentProvider):
+        def repair(self, **kwargs):
+            raise ValueError("Gemini returned neither a tool call nor final text")
+
+    output = tmp_path / "empty-repair"
+    manifest = run_generation_batch(
+        policies=(_policy(),),
+        samples=(
+            ModerationSample(
+                sample_id="empty-repair",
+                policy_id="commerce-v1",
+                thinking_type="fast",
+                query="Neutral.",
+            ),
+        ),
+        provider=EmptyRepairProvider([AgentTurn(content="not valid output")]),
+        environment=_environment(),
+        output_dir=output,
+        budget=TeacherBudget(max_requests=10),
+    )
+
+    rejected = json.loads((output / "rejected.jsonl").read_text(encoding="utf-8"))
+    events = [
+        json.loads(line)
+        for line in (output / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    repair_event = next(event for event in events if event["event"] == "repair_failed")
+
+    assert manifest["repaired_samples"] == 0
+    assert rejected["codes"] == ["output_grammar", "repair_provider_turn_invalid"]
+    assert repair_event["code"] == "provider_turn_invalid"
+    assert repair_event["candidate_present"] is False
+
+
 def test_batch_reports_specific_missing_slow_evidence_to_repair(tmp_path: Path) -> None:
     from risk_agent.singguard_generation import AgentTurn, run_generation_batch
     from risk_agent.teacher import TeacherBudget
@@ -1039,13 +1145,13 @@ def test_batch_reports_specific_missing_slow_evidence_to_repair(tmp_path: Path) 
         "safe\n<reasoning>\n"
         "[Step 1] Content Summary\nNeutral content.\n\n"
         "[Step 2] Check Risk Categories\n"
-        "- Off-Platform Solicitation: NOT APPLICABLE.\n\n"
+        "- Off-Platform Solicitation: NOT HIT.\n\n"
         "[Step 3] Final Judgment\nNo rule is violated.\n"
         "</reasoning>\n<answer>Safe</answer>"
     )
     valid = invalid.replace(
-        "NOT APPLICABLE.",
-        "NOT APPLICABLE. The content contains no destination.",
+        "NOT HIT.",
+        "NOT HIT. The content contains no destination.",
     )
 
     class RepairingProvider(FakeAgentProvider):
@@ -1194,6 +1300,10 @@ def test_manifest_counts_accepted_modes_and_required_tool_coverage(tmp_path: Pat
     assert manifest["required_tool_samples"] == 1
     assert manifest["required_tool_accepted"] == 1
     assert manifest["schema"] == "singguard-active-policy-batch-v2"
+    checkpoint = json.loads(
+        (output / "checkpoint.json").read_text(encoding="utf-8")
+    )
+    assert checkpoint["contract_version"] == "singguard-active-policy-v3"
     assert manifest["attempted_tool_call_count"] == 1
     assert manifest["accepted_tool_call_count"] == 1
     assert "tool_call_count" not in manifest
