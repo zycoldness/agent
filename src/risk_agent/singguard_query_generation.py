@@ -6,6 +6,7 @@ import hashlib
 import re
 import unicodedata
 from collections.abc import Mapping
+from ipaddress import ip_address
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal
@@ -153,6 +154,35 @@ _BENIGN_SECRET_TOKEN_RE = re.compile(
 )
 _ACCOUNT_RE = re.compile(
     r"\b(?:bank\s+)?account\s+(?:number|no\.?|#)\s*[:=]?\s*\d{8,20}\b",
+    re.IGNORECASE,
+)
+_SSN_RE = re.compile(r"(?<!\d)\d{3}[- .]\d{2}[- .]\d{4}(?!\d)")
+_DOB_VALUE_RE = re.compile(
+    r"(?P<label>\b(?:dob|date[- ]of[- ]birth|birth[- ]date|birthdate)\s*[:=]?\s*)"
+    r"\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}\b",
+    re.IGNORECASE,
+)
+_GOVERNMENT_ID_RE = re.compile(
+    r"\b(?:passport|national(?:[- ](?:id|identifier|identification))?|"
+    r"government(?:[- ]id)?|tax(?:payer)?(?:[- ]id)?|"
+    r"driver'?s?\s+licen[cs]e|social[- ]security|ssn)\s*"
+    r"(?:number|no\.?|id|identifier|#)?\s*[:=#-]?\s*"
+    r"[A-Z0-9][A-Z0-9./-]{5,31}\b",
+    re.IGNORECASE,
+)
+_LABELED_IDENTIFIER_RE = re.compile(
+    r"\b(?:customer|member|employee|user|recipient|client|case|record|external)\s+"
+    r"(?:id|identifier|number)\s*[:=#-]?\s*"
+    r"[A-Z0-9][A-Z0-9./-]{5,31}\b",
+    re.IGNORECASE,
+)
+_IPV4_CANDIDATE_RE = re.compile(r"(?<![\w:])(?:\d{1,3}\.){3}\d{1,3}(?![\w:])")
+_IPV6_CANDIDATE_RE = re.compile(
+    r"(?<![0-9A-F:])(?:[0-9A-F]{0,4}:){2,7}[0-9A-F]{0,4}(?![0-9A-F:])",
+    re.IGNORECASE,
+)
+_MAC_ADDRESS_RE = re.compile(
+    r"(?<![0-9A-F])(?:[0-9A-F]{2}[:-]){5}[0-9A-F]{2}(?![0-9A-F])",
     re.IGNORECASE,
 )
 _STREET_ADDRESS_RE = re.compile(
@@ -351,6 +381,23 @@ def _redact_source_seed(text: str) -> str:
         else "[URL]",
         redacted,
     )
+    redacted = _SSN_RE.sub("[SSN]", redacted)
+    redacted = _DOB_VALUE_RE.sub(
+        lambda match: f"{match.group('label')}[DOB]", redacted
+    )
+    redacted = _GOVERNMENT_ID_RE.sub("[GOVERNMENT_ID]", redacted)
+    redacted = _LABELED_IDENTIFIER_RE.sub("[IDENTIFIER]", redacted)
+
+    def redact_network_identifier(match: re.Match[str]) -> str:
+        try:
+            ip_address(match.group())
+        except ValueError:
+            return match.group()
+        return "[NETWORK_ID]"
+
+    redacted = _IPV4_CANDIDATE_RE.sub(redact_network_identifier, redacted)
+    redacted = _IPV6_CANDIDATE_RE.sub(redact_network_identifier, redacted)
+    redacted = _MAC_ADDRESS_RE.sub("[NETWORK_ID]", redacted)
     redacted = _ACCOUNT_RE.sub("[ACCOUNT]", redacted)
     redacted = _ORDER_IDENTIFIER_RE.sub("[ORDER_ID]", redacted)
 
@@ -391,9 +438,13 @@ def _source_text_for(
     source_id_counts: Mapping[str, int],
 ) -> str:
     tuple_key = (source_ref.source, source_ref.source_id)
-    if tuple_key in source_texts:
+    tuple_match = tuple_key in source_texts
+    bare_match = source_ref.source_id in source_texts
+    if tuple_match and bare_match:
+        raise ValueError("source text lookup is ambiguous")
+    if tuple_match:
         return _redact_source_seed(source_texts[tuple_key])
-    if source_ref.source_id in source_texts:
+    if bare_match:
         if source_id_counts[source_ref.source_id] != 1:
             raise ValueError("source text bare ID lookup is ambiguous")
         return _redact_source_seed(source_texts[source_ref.source_id])
@@ -470,7 +521,7 @@ def build_content_request(
     blueprints: tuple[QueryBlueprint, ...],
     *,
     policies: tuple[ActivePolicy, ...],
-    source_texts: Mapping[str, str],
+    source_texts: Mapping[object, str],
 ) -> dict[str, object]:
     """Build a content-only Gemini request with no provider orchestration."""
 

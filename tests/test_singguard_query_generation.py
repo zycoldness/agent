@@ -283,6 +283,49 @@ def test_content_request_preserves_reserved_test_and_synthetic_seed_identifiers(
     assert request["items"][0]["source_seed"]["text"] == safe_identifiers  # type: ignore[index]
 
 
+def test_content_request_redacts_government_date_and_network_identifiers() -> None:
+    from risk_agent.singguard_query_generation import build_content_request
+
+    raw_seed = (
+        "SSN 123-45-6789; passport number X12345678; DOB 01/02/1990; "
+        "IP 203.0.113.42; IPv6 2001:db8:85a3::8a2e:370:7334; "
+        "national ID AB-9876543; customer ID: CUST-246810."
+    )
+    request = build_content_request(
+        (_unsafe_blueprint(source_ref=_source_ref()),),
+        policies=_content_policies(),
+        source_texts={("source-a", "shared"): raw_seed},  # type: ignore[dict-item]
+    )
+    redacted = request["items"][0]["source_seed"]["text"]  # type: ignore[index]
+    assert "[SSN]" in redacted
+    assert redacted.count("[GOVERNMENT_ID]") == 2
+    assert "[DOB]" in redacted
+    assert redacted.count("[NETWORK_ID]") == 2
+    assert "[IDENTIFIER]" in redacted
+    for raw_value in (
+        "123-45-6789",
+        "X12345678",
+        "01/02/1990",
+        "203.0.113.42",
+        "2001:db8:85a3::8a2e:370:7334",
+        "AB-9876543",
+        "CUST-246810",
+    ):
+        assert raw_value not in redacted
+
+
+def test_content_request_keeps_benign_style_seed_useful() -> None:
+    from risk_agent.singguard_query_generation import build_content_request
+
+    benign = "brisk playful captions with soft watercolor product imagery"
+    request = build_content_request(
+        (_unsafe_blueprint(source_ref=_source_ref()),),
+        policies=_content_policies(),
+        source_texts={("source-a", "shared"): benign},  # type: ignore[dict-item]
+    )
+    assert request["items"][0]["source_seed"]["text"] == benign  # type: ignore[index]
+
+
 def test_content_request_preserves_shape_and_multiple_policy_order() -> None:
     from risk_agent.singguard_query_generation import build_content_request
 
@@ -424,6 +467,20 @@ def test_content_request_rejects_noninjective_colon_qualified_source_keys() -> N
             blueprints,
             policies=_content_policies(),
             source_texts={"a:b:c": "must not resolve both references"},
+        )
+
+
+def test_content_request_rejects_simultaneous_tuple_and_bare_source_matches() -> None:
+    from risk_agent.singguard_query_generation import build_content_request
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        build_content_request(
+            (_unsafe_blueprint(source_ref=_source_ref("source-a", "unique-id")),),
+            policies=_content_policies(),
+            source_texts={
+                ("source-a", "unique-id"): "tuple seed",
+                "unique-id": "bare seed",
+            },  # type: ignore[dict-item]
         )
 
 
