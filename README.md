@@ -39,7 +39,7 @@ needs the repository in editable mode:
 pip install -e '.[dev]'
 ```
 
-## Generate the first SFT batch
+## Generate the smoke batch
 
 Use either `GEMINI_API_KEY`, or Vertex AI environment variables. A blank Vertex
 template is provided at `configs/vertex_ai.env.example`; never commit credentials.
@@ -59,7 +59,7 @@ python scripts/generate_singguard_data.py \
   --request-timeout 120
 ```
 
-The result is directly trainable:
+The output uses the trainable ms-swift schema:
 
 - `train.jsonl`: accepted ms-swift `messages` rows;
 - `rejected.jsonl`: sanitized invalid candidates and deterministic reason codes;
@@ -69,6 +69,12 @@ The result is directly trainable:
   trajectories while `accepted_tool_call_count` counts trainable rows only;
 - `events.jsonl`: crash-safe, append-only operational events for provider
   attempts, retries, tool boundaries, validation, and per-sample outcomes.
+
+The bundled `data/content_samples.jsonl` contains only six fixed contract-smoke
+examples. Use its output to inspect prompt, tool, and ms-swift serialization;
+do not treat it as a production SFT corpus. Query-only examples are exported as
+raw content without a literal role prefix. Query-response examples use a compact
+JSON object with `query` and `response` fields.
 
 Provider failures in the manifest and event log include only the request stage,
 exception type, HTTP code/status, attempts, SDK version, backend type, and model

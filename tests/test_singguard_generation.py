@@ -29,7 +29,7 @@ class FakeAgentProvider:
         tool_specs: tuple[dict[str, object], ...],
     ) -> object:
         assert system.startswith("# Task")
-        assert user.startswith("[user]:")
+        assert user and not user.startswith("[user]:")
         return self._turns.popleft()
 
     def continue_with_tool_result(
@@ -1303,7 +1303,7 @@ def test_manifest_counts_accepted_modes_and_required_tool_coverage(tmp_path: Pat
     checkpoint = json.loads(
         (output / "checkpoint.json").read_text(encoding="utf-8")
     )
-    assert checkpoint["contract_version"] == "singguard-active-policy-v4"
+    assert checkpoint["contract_version"] == "singguard-active-policy-v5"
     assert manifest["attempted_tool_call_count"] == 1
     assert manifest["accepted_tool_call_count"] == 1
     assert "tool_call_count" not in manifest

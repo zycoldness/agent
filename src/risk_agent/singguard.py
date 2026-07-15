@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Literal
 
@@ -250,9 +251,13 @@ def build_initial_messages(
 
     if sample.policy_id != policy.policy_id:
         raise ValueError("sample policy_id does not match the active policy")
-    lines = [f"[user]: {sample.query}"]
+    content = sample.query
     if sample.response is not None:
-        lines.append(f"[assistant]: {sample.response}")
+        content = json.dumps(
+            {"query": sample.query, "response": sample.response},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
     return (
         Message(
             role="system",
@@ -264,5 +269,5 @@ def build_initial_messages(
                 ),
             ),
         ),
-        Message(role="user", content="\n".join(lines)),
+        Message(role="user", content=content),
     )

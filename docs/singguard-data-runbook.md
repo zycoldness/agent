@@ -26,6 +26,11 @@ hashed with the sample plan and checked after generation, but never sent to
 Gemini or exported into `train.jsonl`. The first version does not use images.
 Every `policy_id` must resolve to exactly one active policy set.
 
+The bundled file is a six-row contract smoke plan, not a training corpus.
+Query-only content is passed through verbatim without a `[user]` prefix. When a
+model response is present, the pair is serialized as compact JSON with `query`
+and `response` fields.
+
 The deterministic tool environment is stored under `data/tool_env`:
 
 - `cases.jsonl` for `search_cases`;

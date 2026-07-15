@@ -34,9 +34,7 @@ def test_build_prompt_injects_all_active_rules_once() -> None:
     assert messages[0].content.count("### Deceptive Efficacy") == 1
     assert messages[0].content.count("### Off-Platform Solicitation") == 1
     assert "<thinking_type>slow</thinking_type>" in messages[0].content
-    assert messages[1].content == (
-        "[user]: Guaranteed to lose ten pounds in seven days."
-    )
+    assert messages[1].content == "Guaranteed to lose ten pounds in seven days."
 
 
 def test_build_prompt_renders_query_response_conversation() -> None:
@@ -63,8 +61,8 @@ def test_build_prompt_renders_query_response_conversation() -> None:
     messages = build_initial_messages(policy, sample)
 
     assert messages[1].content == (
-        "[user]: Is this prize message real?\n"
-        "[assistant]: Pay the processing fee to collect it."
+        '{"query":"Is this prize message real?",'
+        '"response":"Pay the processing fee to collect it."}'
     )
 
 
