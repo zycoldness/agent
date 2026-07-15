@@ -50,6 +50,43 @@ _SOURCE_WEIGHTS = {
     "civil_comments": 100,
     "amazon_esci": 80,
 }
+_ALLOWED_FORMS = {
+    "uci_sms_spam": {
+        "short_ad",
+        "private_message",
+        "support_exchange",
+        "social_post",
+    },
+    "uci_youtube_spam": {
+        "comment",
+        "social_post",
+        "livestream_pitch",
+        "short_ad",
+    },
+    "nemotron_aegis_v2": {
+        "short_ad",
+        "social_post",
+        "livestream_pitch",
+        "product_listing",
+        "comment",
+        "private_message",
+        "support_exchange",
+        "search_or_neutral",
+    },
+    "civil_comments": {
+        "comment",
+        "social_post",
+        "livestream_pitch",
+        "support_exchange",
+    },
+    "amazon_esci": {
+        "product_listing",
+        "search_or_neutral",
+        "short_ad",
+        "social_post",
+        "livestream_pitch",
+    },
+}
 
 
 def _seed_record(number: int, *, source: str = "nemotron_aegis_v2") -> SeedRecord:
@@ -83,6 +120,19 @@ def _seed_records(count: int) -> tuple[SeedRecord, ...]:
         _seed_record(number, source=source)
         for source, allocation in allocations.items()
         for number in range(allocation)
+    )
+
+
+def _policies_without_exceptions() -> tuple[ActivePolicy, ...]:
+    return tuple(
+        policy.model_copy(
+            update={
+                "rules": tuple(
+                    rule.model_copy(update={"exceptions": ()}) for rule in policy.rules
+                )
+            }
+        )
+        for policy in _policies()
     )
 
 
@@ -510,9 +560,10 @@ def test_governed_sources_are_crossed_with_label_and_thinking() -> None:
         "uci_sms_spam": {"fast": 7, "slow": 3},
         "uci_youtube_spam": {"fast": 4, "slow": 1},
         "nemotron_aegis_v2": {"fast": 4, "slow": 2},
-        "civil_comments": {"fast": 4, "slow": 1},
+        "civil_comments": {"fast": 3, "slow": 2},
         "amazon_esci": {"fast": 3, "slow": 1},
     }
+    assert Counter(row.thinking_type for row in governed) == {"fast": 21, "slow": 9}
     for source, thinking_counts in expected_thinking.items():
         source_rows = [row for row in governed if row.source_ref.source == source]
         assert Counter(row.thinking_type for row in source_rows) == thinking_counts
@@ -521,47 +572,89 @@ def test_governed_sources_are_crossed_with_label_and_thinking() -> None:
 
 
 def test_governed_sources_are_assigned_only_to_compatible_forms() -> None:
-    allowed = {
-        "uci_sms_spam": {
-            "short_ad",
-            "private_message",
-            "support_exchange",
-            "social_post",
-        },
-        "uci_youtube_spam": {
-            "comment",
-            "social_post",
-            "livestream_pitch",
-            "short_ad",
-        },
-        "nemotron_aegis_v2": {
-            "short_ad",
-            "social_post",
-            "livestream_pitch",
-            "product_listing",
-            "comment",
-            "private_message",
-            "support_exchange",
-            "search_or_neutral",
-        },
-        "civil_comments": {
-            "comment",
-            "social_post",
-            "livestream_pitch",
-            "support_exchange",
-        },
-        "amazon_esci": {
-            "product_listing",
-            "search_or_neutral",
-            "short_ad",
-            "social_post",
-            "livestream_pitch",
-        },
-    }
-
     for row in _plan(seed=3_685):
         if row.source_ref is not None:
-            assert row.content_form in allowed[row.source_ref.source]
+            assert row.content_form in _ALLOWED_FORMS[row.source_ref.source]
+
+
+@pytest.mark.parametrize(
+    ("count", "expected"),
+    (
+        (100, {"fast": 21, "slow": 9}),
+        (500, {"fast": 105, "slow": 45}),
+        (2_000, {"fast": 420, "slow": 180}),
+    ),
+)
+def test_governed_thinking_has_exact_global_scaled_marginal(
+    count: int, expected: dict[str, int]
+) -> None:
+    governed = [row for row in _plan(count=count) if row.source_ref is not None]
+
+    assert Counter(row.thinking_type for row in governed) == expected
+
+
+def _assert_full_governed_constraints(rows: tuple, *, count: int) -> None:
+    source_targets = {
+        100: {
+            "uci_sms_spam": 10,
+            "uci_youtube_spam": 5,
+            "nemotron_aegis_v2": 6,
+            "civil_comments": 5,
+            "amazon_esci": 4,
+        },
+        500: {
+            "uci_sms_spam": 50,
+            "uci_youtube_spam": 25,
+            "nemotron_aegis_v2": 30,
+            "civil_comments": 25,
+            "amazon_esci": 20,
+        },
+    }[count]
+    thinking_target = {
+        100: {"fast": 21, "slow": 9},
+        500: {"fast": 105, "slow": 45},
+    }[count]
+    governed = [row for row in rows if row.source_ref is not None]
+    assert Counter(row.source_ref.source for row in governed) == source_targets
+    assert Counter(row.thinking_type for row in governed) == thinking_target
+    assert Counter(row.intended_label for row in governed) == {
+        "safe": len(governed) // 2,
+        "unsafe": len(governed) // 2,
+    }
+    for row in governed:
+        assert row.content_form in _ALLOWED_FORMS[row.source_ref.source]
+    for source in source_targets:
+        labels = Counter(
+            row.intended_label for row in governed if row.source_ref.source == source
+        )
+        assert abs(labels["safe"] - labels["unsafe"]) <= 1
+
+
+@pytest.mark.parametrize("seed", (2_243, 5_837))
+def test_capacity_aware_source_assignment_handles_greedy_regressions(seed: int) -> None:
+    from risk_agent.singguard_query_generation import plan_blueprints
+
+    rows = plan_blueprints(
+        _policies_without_exceptions(),
+        count=100,
+        seed=seed,
+        seed_records=_seed_records(700),
+    )
+
+    _assert_full_governed_constraints(rows, count=100)
+
+
+def test_full_source_quotas_are_feasible_across_bounded_seed_sweeps() -> None:
+    from risk_agent.singguard_query_generation import plan_blueprints
+
+    policies = _policies_without_exceptions()
+    seeds = _seed_records(700)
+    for seed in (*range(100), 5_837):
+        rows = plan_blueprints(policies, count=100, seed=seed, seed_records=seeds)
+        _assert_full_governed_constraints(rows, count=100)
+    for seed in range(10):
+        rows = plan_blueprints(policies, count=500, seed=seed, seed_records=seeds)
+        _assert_full_governed_constraints(rows, count=500)
 
 
 def test_one_source_shortfall_is_filled_synthetically_not_from_other_sources() -> None:

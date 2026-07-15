@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+from collections import deque
 from collections.abc import Mapping, Sequence
 from fractions import Fraction
 from typing import Literal, TypeVar
@@ -385,13 +386,27 @@ def _source_cell_counts(
     source_counts: Mapping[str, int],
 ) -> dict[str, dict[tuple[str, str], int]]:
     safe_counts = _source_label_allocations(source_counts)
+    total_sources = sum(source_counts.values())
+    target_fast = _apportion(_THINKING_QUOTAS, total_sources)["fast"]
+    exact_fast = {
+        source: Fraction(amount * _THINKING_QUOTAS["fast"], _BASE_COUNT)
+        for source, amount in source_counts.items()
+    }
+    fast_counts = {source: int(value) for source, value in exact_fast.items()}
+    remaining_fast = target_fast - sum(fast_counts.values())
+    fast_remainder_order = sorted(
+        source_counts,
+        key=lambda source: exact_fast[source] - fast_counts[source],
+        reverse=True,
+    )
+    for source in fast_remainder_order[:remaining_fast]:
+        fast_counts[source] += 1
     result: dict[str, dict[tuple[str, str], int]] = {}
     for source, amount in source_counts.items():
         safe = safe_counts[source]
         unsafe = amount - safe
-        thinking = _apportion(_THINKING_QUOTAS, amount)
-        fast = thinking["fast"]
-        slow = thinking["slow"]
+        fast = fast_counts[source]
+        slow = amount - fast
         ideal_safe_fast = Fraction(safe * fast, amount) if amount else Fraction(0)
         safe_fast = int(ideal_safe_fast + Fraction(1, 2))
         safe_fast = max(max(0, safe - slow), min(safe_fast, min(safe, fast)))
@@ -404,6 +419,71 @@ def _source_cell_counts(
         if any(value < 0 for value in result[source].values()):
             raise RuntimeError("internal source crossing produced a negative cell")
     return result
+
+
+def _allocate_source_forms(
+    demands: Mapping[str, int], capacities: Mapping[str, int]
+) -> dict[str, dict[str, int]]:
+    source_node = ("terminal", "source")
+    sink_node = ("terminal", "sink")
+    adjacency: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    residual: dict[tuple[tuple[str, str], tuple[str, str]], int] = {}
+
+    def add_edge(
+        start: tuple[str, str], end: tuple[str, str], capacity: int
+    ) -> None:
+        adjacency.setdefault(start, []).append(end)
+        adjacency.setdefault(end, []).append(start)
+        residual[(start, end)] = capacity
+        residual[(end, start)] = 0
+
+    for source, demand in demands.items():
+        source_demand_node = ("source", source)
+        add_edge(source_node, source_demand_node, demand)
+        for form in capacities:
+            if form in _SOURCE_FORM_COMPATIBILITY[source]:
+                add_edge(source_demand_node, ("form", form), demand)
+    for form, capacity in capacities.items():
+        add_edge(("form", form), sink_node, capacity)
+
+    assigned = 0
+    while True:
+        parents: dict[tuple[str, str], tuple[str, str] | None] = {source_node: None}
+        queue = deque((source_node,))
+        while queue and sink_node not in parents:
+            node = queue.popleft()
+            for neighbor in adjacency[node]:
+                if neighbor not in parents and residual[(node, neighbor)] > 0:
+                    parents[neighbor] = node
+                    queue.append(neighbor)
+        if sink_node not in parents:
+            break
+        path_capacity = sum(demands.values())
+        node = sink_node
+        while parents[node] is not None:
+            parent = parents[node]
+            path_capacity = min(path_capacity, residual[(parent, node)])
+            node = parent
+        node = sink_node
+        while parents[node] is not None:
+            parent = parents[node]
+            residual[(parent, node)] -= path_capacity
+            residual[(node, parent)] += path_capacity
+            node = parent
+        assigned += path_capacity
+
+    if assigned != sum(demands.values()):
+        raise RuntimeError(
+            "source/form compatibility cannot satisfy governed quota in stratum"
+        )
+    return {
+        source: {
+            form: demand - residual[(('source', source), ('form', form))]
+            for form in capacities
+            if form in _SOURCE_FORM_COMPATIBILITY[source]
+        }
+        for source, demand in demands.items()
+    }
 
 
 def _assign_source_refs(
@@ -429,40 +509,43 @@ def _assign_source_refs(
     cell_counts = _source_cell_counts(source_counts)
     refs: list[SourceRef | None] = [None] * count
     available = set(range(count))
-    assignment_order = (
-        "uci_sms_spam",
-        "uci_youtube_spam",
-        "civil_comments",
-        "amazon_esci",
-        "nemotron_aegis_v2",
-    )
-    for source in assignment_order:
-        records = selected[source]
-        record_offset = 0
-        for (label, thinking_type), needed in cell_counts[source].items():
-            candidates = [
-                index
-                for index in available
-                if labels[index] == label
-                and thinking_types[index] == thinking_type
-                and forms[index] in _SOURCE_FORM_COMPATIBILITY[source]
-            ]
-            rng.shuffle(candidates)
-            if len(candidates) < needed:
-                raise RuntimeError(
-                    f"source/form compatibility cannot satisfy {source!r} quota"
-                )
-            for index in candidates[:needed]:
-                record = records[record_offset]
-                record_offset += 1
-                refs[index] = SourceRef(
-                    source=record.source,
-                    source_id=record.source_id,
-                    content_hash=record.content_hash,
-                )
-                available.remove(index)
-        if record_offset != len(records):
-            raise RuntimeError("internal source assignment left records unused")
+    record_offsets = {source: 0 for source in selected}
+    cells = (("safe", "fast"), ("safe", "slow"), ("unsafe", "fast"), ("unsafe", "slow"))
+    for cell in cells:
+        label, thinking_type = cell
+        candidates = [
+            index
+            for index in available
+            if labels[index] == label and thinking_types[index] == thinking_type
+        ]
+        capacities = {
+            form: sum(forms[index] == form for index in candidates)
+            for form in _FORM_QUOTAS
+        }
+        demands = {
+            source: source_cells[cell] for source, source_cells in cell_counts.items()
+        }
+        allocation = _allocate_source_forms(demands, capacities)
+        indices_by_form = {
+            form: [index for index in candidates if forms[index] == form]
+            for form in _FORM_QUOTAS
+        }
+        for form_indices in indices_by_form.values():
+            rng.shuffle(form_indices)
+        for source, form_counts in allocation.items():
+            for form, amount in form_counts.items():
+                for _ in range(amount):
+                    index = indices_by_form[form].pop()
+                    record = selected[source][record_offsets[source]]
+                    record_offsets[source] += 1
+                    refs[index] = SourceRef(
+                        source=record.source,
+                        source_id=record.source_id,
+                        content_hash=record.content_hash,
+                    )
+                    available.remove(index)
+    if any(record_offsets[source] != len(records) for source, records in selected.items()):
+        raise RuntimeError("internal source assignment left records unused")
     return refs
 
 
