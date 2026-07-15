@@ -18,20 +18,28 @@ sources:
     enabled: true
   - source: amazon_esci
     dataset_url: https://github.com/amazon-science/esci-data
-    artifact_url: https://github.com/amazon-science/esci-data
+    artifact_url: https://media.githubusercontent.com/media/amazon-science/esci-data/7916cdf6ab75a462e77f20ab40428a10923998d5/shopping_queries_dataset/shopping_queries_dataset_examples.parquet
     license: Apache-2.0
     usage_scope: research_only
     source_role: style_seed
-    adapter: catalog_only
-    enabled: false
+    adapter: esci_query_parquet
+    dataset_id: parquet
+    revision: 7916cdf6ab75a462e77f20ab40428a10923998d5
+    split: train
+    max_records: 1000
+    enabled: true
   - source: nemotron_aegis_v2
     dataset_url: https://huggingface.co/datasets/nvidia/Aegis-AI-Content-Safety-Dataset-2.0
     artifact_url: https://huggingface.co/datasets/nvidia/Aegis-AI-Content-Safety-Dataset-2.0
     license: CC-BY-4.0
     usage_scope: research_only
     source_role: hard_negative
-    adapter: catalog_only
-    enabled: false
+    adapter: hf_aegis_v2
+    dataset_id: nvidia/Aegis-AI-Content-Safety-Dataset-2.0
+    revision: d86bb8bedff51d25ac834ab7838f1cc61acb7a2c
+    split: train
+    max_records: 2000
+    enabled: true
   - source: wildguardmix
     dataset_url: https://huggingface.co/datasets/allenai/wildguardmix
     artifact_url: https://huggingface.co/datasets/allenai/wildguardmix
@@ -62,8 +70,12 @@ sources:
     license: CC0-1.0
     usage_scope: research_only
     source_role: hard_negative
-    adapter: catalog_only
-    enabled: false
+    adapter: hf_civil_comments
+    dataset_id: google/civil_comments
+    revision: f2970eb3a55777454c94069077cc8d9b5866312d
+    split: train
+    max_records: 2000
+    enabled: true
   - source: ftc_fda_public_records
     dataset_url: https://www.ftc.gov/news-events/topics/truth-advertising/health-claims
     artifact_url: https://www.ftc.gov/news-events/topics/truth-advertising/health-claims
