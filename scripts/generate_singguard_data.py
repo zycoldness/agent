@@ -68,6 +68,15 @@ def _duration(seconds: float) -> str:
     return f"{hours:02d}:{minute:02d}:{second:02d}"
 
 
+def _exit_code(manifest: Mapping[str, object]) -> int:
+    if manifest.get("status") != "complete":
+        return 2
+    quality_gate = manifest.get("quality_gate")
+    if not isinstance(quality_gate, Mapping) or quality_gate.get("status") == "fail":
+        return 3
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("active_policies", type=Path)
@@ -131,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, RuntimeError, ValueError) as error:
         parser.error(str(error))
     print(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
-    return 0 if manifest["status"] == "complete" else 2
+    return _exit_code(manifest)
 
 
 if __name__ == "__main__":

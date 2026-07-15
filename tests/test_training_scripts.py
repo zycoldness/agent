@@ -116,3 +116,18 @@ def test_singguard_progress_bar_is_terminal_friendly() -> None:
     assert "requests=9" in rendered
     assert "ETA=" in rendered
     assert rendered.endswith("\n")
+
+
+def test_singguard_cli_exit_code_distinguishes_execution_and_quality() -> None:
+    from scripts.generate_singguard_data import _exit_code
+
+    assert _exit_code({"status": "incomplete"}) == 2
+    assert _exit_code(
+        {"status": "complete", "quality_gate": {"status": "fail"}}
+    ) == 3
+    assert _exit_code(
+        {"status": "complete", "quality_gate": {"status": "pass"}}
+    ) == 0
+    assert _exit_code(
+        {"status": "complete", "quality_gate": {"status": "not_evaluated"}}
+    ) == 0

@@ -17,11 +17,28 @@ Conduct independent evaluations across the following dimensions:
 
 Judge only against the active Risk Categories above. If none is violated, classify the content as safe.
 
-## Output Format
-If thinking_type is fast, first output safe or unsafe on line 1, then emit the triggered active rule in an <answer> tag. Use Safe when no active rule is violated.
+{{TOOL_INSTRUCTIONS}}
 
-If thinking_type is slow, first output safe or unsafe on line 1, then analyze the content and assess each active Risk Category one by one. Finish with the triggered active rule in an <answer> tag, or Safe when no active rule is violated.
+## Output Format
+If thinking_type is fast, first output safe or unsafe on line 1, then emit every triggered active rule in an <answer> tag, one title per line. Use Safe when no active rule is violated.
+
+If thinking_type is slow, use exactly this structure and preserve the active-rule order shown below:
+
+safe|unsafe
+<reasoning>
+[Step 1] Content Summary
+<concise summary>
+
+[Step 2] Check Risk Categories
+{{SLOW_RULE_CHECKS}}
+
+[Step 3] Final Judgment
+<policy-grounded final judgment>
+</reasoning>
+<answer><one or more HIT active rule titles, one per line, or Safe></answer>
+
+Replace every angle-bracket placeholder with content. Select exactly one uppercase verdict for every rule and keep the period before its non-empty evidence. Do not add text outside this structure. A safe result must have no HIT verdict and must answer Safe. Every unsafe answer must be an active rule marked HIT.
 
 If thinking_type is fast-slow, first output only safe or unsafe. Stop there for a confident early exit; otherwise continue using the slow format and finish with an <answer> tag.
 
-The <answer> value must be one active rule title exactly, or Safe.
+Every <answer> value must be an active rule title exactly, one per line, or the single value Safe.

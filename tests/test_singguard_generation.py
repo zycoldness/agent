@@ -60,6 +60,20 @@ def _environment() -> ToolEnvironment:
     return ToolEnvironment.load(Path("data/tool_env"))
 
 
+def test_bundled_smoke_plan_has_complete_hidden_oracles_and_tool_targets() -> None:
+    from risk_agent.singguard_generation import load_moderation_samples
+
+    samples = load_moderation_samples(Path("data/content_samples.jsonl"))
+
+    assert len(samples) == 6
+    assert all(sample.expected_label is not None for sample in samples)
+    assert sum(sample.thinking_type == "slow" for sample in samples) == 4
+    assert sum(sample.tool_policy == "required" for sample in samples) == 3
+    assert all(
+        sample.tool_names for sample in samples if sample.tool_policy == "required"
+    )
+
+
 def test_agent_executes_two_tools_then_records_final_completion() -> None:
     from risk_agent.singguard_generation import AgentTurn, generate_example
 
@@ -131,6 +145,35 @@ def test_agent_accepts_direct_no_tool_completion() -> None:
 
     assert generated.trajectory == ()
     assert generated.parsed.label == "safe"
+
+
+def test_agent_rejects_final_answer_before_required_tool_call() -> None:
+    from risk_agent.singguard_generation import (
+        AgentTurn,
+        GenerationRejected,
+        generate_example,
+    )
+
+    sample = ModerationSample(
+        sample_id="sample-required",
+        policy_id="commerce-v1",
+        thinking_type="fast",
+        query="Message me privately.",
+        tool_names=("inspect_destination",),
+        tool_policy="required",
+    )
+    provider = FakeAgentProvider(
+        turns=[
+            AgentTurn(
+                content="unsafe\n<answer>Off-Platform Solicitation</answer>"
+            )
+        ]
+    )
+
+    with pytest.raises(GenerationRejected) as captured:
+        generate_example(_policy(), sample, provider, _environment())
+
+    assert captured.value.code == "required_tool_missing"
 
 
 def test_agent_rejects_tool_not_enabled_for_sample() -> None:
@@ -275,6 +318,58 @@ def test_gemini_adapter_maps_function_call_and_response() -> None:
     }
     assert captured["config"]["system_instruction"] == "system prompt"
     assert budget.as_dict()["request_count"] == 2
+
+
+def test_gemini_repair_receives_exact_format_only_contract() -> None:
+    from risk_agent.singguard_generation import GeminiAgentProvider
+    from risk_agent.singguard_prompts import render_guard_prompt
+    from risk_agent.teacher import TeacherBudget
+
+    captured: dict[str, object] = {}
+    sent: list[object] = []
+
+    class Chat:
+        def send_message(self, message):
+            sent.append(message)
+            return SimpleNamespace(
+                function_calls=[],
+                text="safe\n<answer>Safe</answer>",
+                usage_metadata=SimpleNamespace(
+                    prompt_token_count=8,
+                    candidates_token_count=3,
+                ),
+            )
+
+    class Chats:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return Chat()
+
+    types_module = SimpleNamespace(
+        GenerateContentConfig=lambda **kwargs: kwargs,
+    )
+    provider = GeminiAgentProvider(
+        model="gemini-test",
+        client_factory=lambda: SimpleNamespace(chats=Chats()),
+        types_module=types_module,
+        budget=TeacherBudget(max_requests=1),
+        max_attempts=1,
+    )
+    system = render_guard_prompt(_policy().rules, thinking_type="fast")
+
+    provider.repair(
+        system=system,
+        user="[user]: neutral",
+        candidate="The content is safe.",
+        validation_code="output_grammar",
+    )
+
+    repair_system = captured["config"]["system_instruction"]
+    assert "The only permitted changes are output serialization" in repair_system
+    assert "Do not change the moderation label or triggered rule" in repair_system
+    assert "[validation_error]: output_grammar" in sent[0]
+    assert "[rejected_candidate]:\nThe content is safe." in sent[0]
+    assert "tools" not in captured["config"]
 
 
 def test_batch_writes_accepted_rows_and_specific_rejection(tmp_path: Path) -> None:
@@ -434,6 +529,44 @@ def test_batch_repairs_one_invalid_completion_without_replaying_tools(tmp_path: 
     assert provider.repair_calls[0]["validation_code"] == "output_grammar"
 
 
+def test_batch_rejects_semantic_label_mismatch_without_format_repair(tmp_path: Path) -> None:
+    from risk_agent.singguard_generation import AgentTurn, run_generation_batch
+    from risk_agent.teacher import TeacherBudget
+
+    sample = ModerationSample(
+        sample_id="known-unsafe",
+        policy_id="commerce-v1",
+        thinking_type="fast",
+        query="Message me privately to place the order.",
+        expected_label="unsafe",
+        expected_answers=("Off-Platform Solicitation",),
+    )
+
+    class SemanticProvider(FakeAgentProvider):
+        def repair(self, **kwargs):
+            raise AssertionError("semantic mismatches must not be format-repaired")
+
+    output = tmp_path / "semantic-reject"
+    manifest = run_generation_batch(
+        policies=(_policy(),),
+        samples=(sample,),
+        provider=SemanticProvider(
+            [AgentTurn(content="safe\n<answer>Safe</answer>")]
+        ),
+        environment=_environment(),
+        output_dir=output,
+        budget=TeacherBudget(max_requests=10),
+    )
+
+    rejected = json.loads(
+        (output / "rejected.jsonl").read_text(encoding="utf-8")
+    )
+    assert manifest["accepted_samples"] == 0
+    assert rejected["codes"] == ["semantic_label_mismatch"]
+    assert "expected_label" not in rejected["candidate"]
+    assert manifest["quality_gate"]["status"] == "fail"
+
+
 def test_rejected_candidate_is_redacted_and_truncated(tmp_path: Path) -> None:
     from risk_agent.singguard_generation import AgentTurn, run_generation_batch
     from risk_agent.teacher import TeacherBudget
@@ -461,3 +594,60 @@ def test_rejected_candidate_is_redacted_and_truncated(tmp_path: Path) -> None:
     assert "top-secret" not in rejected["candidate"]
     assert "user@example.com" not in rejected["candidate"]
     assert rejected["candidate"].endswith("...[truncated]")
+
+
+def test_manifest_counts_accepted_modes_and_required_tool_coverage(tmp_path: Path) -> None:
+    from risk_agent.singguard_generation import AgentTurn, run_generation_batch
+    from risk_agent.teacher import TeacherBudget
+
+    sample = ModerationSample(
+        sample_id="required-slow",
+        policy_id="commerce-v1",
+        thinking_type="slow",
+        query="Contact w-h-a-t-s-a-p-p:user123.",
+        tool_names=("inspect_destination",),
+        tool_policy="required",
+        expected_label="unsafe",
+        expected_answers=("Off-Platform Solicitation",),
+    )
+    completion = (
+        "unsafe\n<reasoning>\n"
+        "[Step 1] Content Summary\nA private destination is supplied.\n\n"
+        "[Step 2] Check Risk Categories\n"
+        "- Off-Platform Solicitation: HIT. The destination is off platform.\n\n"
+        "[Step 3] Final Judgment\nThe active rule is violated.\n"
+        "</reasoning>\n<answer>Off-Platform Solicitation</answer>"
+    )
+    provider = FakeAgentProvider(
+        [
+            AgentTurn(
+                tool_call=ToolCall(
+                    name="inspect_destination",
+                    arguments={"indicator": "w-h-a-t-s-a-p-p:user123"},
+                )
+            ),
+            AgentTurn(content=completion),
+        ]
+    )
+    output = tmp_path / "manifest-metrics"
+
+    manifest = run_generation_batch(
+        policies=(_policy(),),
+        samples=(sample,),
+        provider=provider,
+        environment=_environment(),
+        output_dir=output,
+        budget=TeacherBudget(max_requests=10),
+    )
+
+    assert manifest["accepted_thinking_type_counts"] == {"fast": 0, "slow": 1}
+    assert manifest["required_tool_samples"] == 1
+    assert manifest["required_tool_accepted"] == 1
+    assert manifest["tool_call_count"] == 1
+    assert manifest["quality_gate"] == {
+        "status": "pass",
+        "expected_samples": 1,
+        "expected_accepted": 1,
+        "required_tool_samples": 1,
+        "required_tool_accepted": 1,
+    }

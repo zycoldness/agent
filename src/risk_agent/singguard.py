@@ -44,6 +44,23 @@ class ModerationSample(BaseModel):
     query: str = Field(min_length=1)
     response: str | None = None
     tool_names: tuple[str, ...] = ()
+    tool_policy: Literal["auto", "required"] = "auto"
+    expected_label: Literal["safe", "unsafe"] | None = None
+    expected_answers: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_hidden_expectation(self) -> "ModerationSample":
+        if self.tool_policy == "required" and not self.tool_names:
+            raise ValueError("required tool policy needs at least one tool")
+        if len(self.expected_answers) != len(set(self.expected_answers)):
+            raise ValueError("expected answers must be unique")
+        if self.expected_label is None and self.expected_answers:
+            raise ValueError("expected answers require an expected label")
+        if self.expected_label == "safe" and self.expected_answers:
+            raise ValueError("safe expectations must not name a rule")
+        if self.expected_label == "unsafe" and not self.expected_answers:
+            raise ValueError("unsafe expectations must name an active rule")
+        return self
 
 
 class Message(BaseModel):
@@ -210,6 +227,9 @@ def build_initial_messages(
             content=render_guard_prompt(
                 policy.rules,
                 thinking_type=sample.thinking_type,
+                required_tools=(
+                    sample.tool_names if sample.tool_policy == "required" else ()
+                ),
             ),
         ),
         Message(role="user", content="\n".join(lines)),

@@ -68,6 +68,56 @@ def test_build_prompt_renders_query_response_conversation() -> None:
     )
 
 
+def test_hidden_semantic_expectations_are_not_rendered_into_the_prompt() -> None:
+    from risk_agent.singguard import ActivePolicy, ModerationSample, build_initial_messages
+
+    policy = ActivePolicy(
+        policy_id="policy-1",
+        rules=(PolicyRule(rule_id="A", title="Rule A", text="Rule A text."),),
+    )
+    sample = ModerationSample(
+        sample_id="sample-expected",
+        policy_id="policy-1",
+        thinking_type="fast",
+        query="Risky example.",
+        expected_label="unsafe",
+        expected_answers=("Rule A",),
+    )
+
+    messages = build_initial_messages(policy, sample)
+
+    serialized = "\n".join(message.content for message in messages)
+    assert "expected_label" not in serialized
+    assert "expected_answers" not in serialized
+
+
+def test_required_tool_sequence_is_explicit_in_the_system_prompt() -> None:
+    from risk_agent.singguard import ActivePolicy, ModerationSample, build_initial_messages
+
+    policy = ActivePolicy(
+        policy_id="policy-1",
+        rules=(PolicyRule(rule_id="A", title="Rule A", text="Rule A text."),),
+    )
+    sample = ModerationSample(
+        sample_id="sample-tools",
+        policy_id="policy-1",
+        thinking_type="slow",
+        query="Inspect this ambiguous content.",
+        tool_names=("inspect_destination", "get_content_context"),
+        tool_policy="required",
+    )
+
+    system = build_initial_messages(policy, sample)[0].content
+
+    assert "You MUST call every tool below exactly once" in system
+    assert "1. inspect_destination" in system
+    assert "2. get_content_context" in system
+    assert system.index("1. inspect_destination") < system.index(
+        "2. get_content_context"
+    )
+    assert "Only after the final tool response" in system
+
+
 def test_active_policy_rejects_duplicate_rule_titles() -> None:
     import pytest
 

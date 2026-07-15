@@ -13,8 +13,10 @@ image data can be added after the text pipeline and evaluation gates are stable.
 - one complete active policy set per sample, containing one or more rules;
 - SingGuard `fast` and `slow` output modes;
 - direct Gemini generation from the full system prompt and conversation;
-- zero to two real sequential tool calls with deterministic local results;
-- strict local completion validation and one tool-free format repair attempt;
+- zero to two real sequential tool calls with deterministic local results and an
+  optional sample-level `required` call sequence;
+- strict slow-format validation, hidden smoke-oracle checks, and one tool-free
+  serialization repair attempt;
 - redacted rejection artifacts, request/cost budgets, progress, and safe resume;
 - ms-swift SFT, GRPO, and OPSD/GKD shell entry points.
 
@@ -62,7 +64,13 @@ The result is directly trainable:
 - `train.jsonl`: accepted ms-swift `messages` rows;
 - `rejected.jsonl`: sanitized invalid candidates and deterministic reason codes;
 - `checkpoint.json`: progress, budget accounting, and input/prompt fingerprints;
-- `manifest.json`: final observable counts and status.
+- `manifest.json`: execution status, accepted-mode/tool coverage, and a separate
+  semantic `quality_gate` result.
+
+The bundled six-row smoke input contains hidden `expected_label` and
+`expected_answers` fields. They are used only by local quality gates and are
+never rendered into Gemini's prompt or the exported SFT row. Do not train unless
+`manifest.json` reports `quality_gate.status=pass`.
 
 If a request budget or provider failure interrupts the batch, rerun the identical
 command with a sufficiently large total budget and `--resume`. Resume is refused
@@ -89,6 +97,8 @@ Supported tools are `search_cases`, `verify_claim`, `inspect_destination`, and
 `get_content_context`. The final answer is normal SingGuard text, not another
 tool call. In ms-swift JSONL, calls and results use the `tool_call` and
 `tool_response` roles, while the top-level `tools` field is a JSON string.
+For a required trajectory, the sample lists tools in execution order and the
+pipeline rejects missing, extra, or reordered calls.
 
 ## SFT
 

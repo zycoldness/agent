@@ -102,6 +102,13 @@ class GenerationRejected(ValueError):
         self.trajectory = trajectory
 
 
+_REPAIRABLE_CODES = {
+    "output_grammar",
+    "slow_rule_order",
+    "completion_validation",
+}
+
+
 class GeminiAgentProvider(GeminiTeacher):
     """Stateful Gemini chat adapter using native sequential function calls."""
 
@@ -297,10 +304,11 @@ class GeminiAgentProvider(GeminiTeacher):
         types = self._types()
         repair_instruction = (
             "\n\n# Output Repair\n"
-            "The previous candidate failed deterministic validation. Preserve its "
-            "moderation judgment, but return only a completion that exactly follows "
-            "the required SingGuard output grammar. Do not call tools, add commentary, "
-            "or introduce policy categories that are not active."
+            "The previous candidate failed deterministic output validation. The only "
+            "permitted changes are output serialization and the minimum wording needed "
+            "to fill the exact Output Format structure above. Do not change the "
+            "moderation label or triggered rule. Do not call tools, add commentary, "
+            "omit required steps, or introduce policy categories that are not active."
         )
         repair_user = (
             f"{user}\n\n[validation_error]: {validation_code}"
@@ -363,6 +371,24 @@ def _validate_candidate(
     )
 
 
+def _semantic_mismatch(
+    parsed: ParsedCompletion,
+    *,
+    policy: ActivePolicy,
+    sample: ModerationSample,
+) -> str | None:
+    if sample.expected_label is None:
+        return None
+    active_titles = {rule.title for rule in policy.rules}
+    if any(answer not in active_titles for answer in sample.expected_answers):
+        raise ValueError("expected answer does not belong to the active policy")
+    if parsed.label != sample.expected_label:
+        return "semantic_label_mismatch"
+    if sample.expected_label == "unsafe" and parsed.answers != sample.expected_answers:
+        return "semantic_answer_mismatch"
+    return None
+
+
 def generate_example(
     policy: ActivePolicy,
     sample: ModerationSample,
@@ -379,6 +405,12 @@ def generate_example(
         raise ValueError("max_tool_calls must be between zero and two")
     if len(sample.tool_names) != len(set(sample.tool_names)):
         raise ValueError("sample tool names must be unique")
+    if sample.tool_policy == "required" and len(sample.tool_names) > max_tool_calls:
+        raise ValueError("required tool sequence exceeds the tool call limit")
+    if sample.expected_label == "unsafe":
+        active_titles = {rule.title for rule in policy.rules}
+        if any(answer not in active_titles for answer in sample.expected_answers):
+            raise ValueError("expected answer does not belong to the active policy")
     serialized_tools = tools_json(sample.tool_names) if sample.tool_names else None
     declarations = tool_declarations(sample.tool_names)
     initial = build_initial_messages(policy, sample)
@@ -396,6 +428,17 @@ def generate_example(
             raise ValueError("requested tool is not enabled for this sample")
         if calls >= max_tool_calls:
             raise ValueError("tool call limit exceeded")
+        if sample.tool_policy == "required":
+            if calls >= len(sample.tool_names):
+                raise GenerationRejected(
+                    "required_tool_extra",
+                    trajectory=tuple(trajectory),
+                )
+            if call.name != sample.tool_names[calls]:
+                raise GenerationRejected(
+                    "required_tool_order",
+                    trajectory=tuple(trajectory),
+                )
         result = environment.execute(call)
         trajectory.extend(
             (
@@ -409,6 +452,12 @@ def generate_example(
     completion = turn.content
     if completion is None:
         raise ValueError("agent did not produce a final completion")
+    if sample.tool_policy == "required" and calls != len(sample.tool_names):
+        raise GenerationRejected(
+            "required_tool_missing",
+            candidate=completion,
+            trajectory=tuple(trajectory),
+        )
     try:
         parsed = _validate_candidate(completion, policy=policy, sample=sample)
     except ValueError as error:
@@ -417,6 +466,13 @@ def generate_example(
             candidate=completion,
             trajectory=tuple(trajectory),
         ) from None
+    semantic_code = _semantic_mismatch(parsed, policy=policy, sample=sample)
+    if semantic_code is not None:
+        raise GenerationRejected(
+            semantic_code,
+            candidate=completion,
+            trajectory=tuple(trajectory),
+        )
     return GeneratedExample(
         initial_messages=initial,
         trajectory=tuple(trajectory),
@@ -683,7 +739,11 @@ def run_generation_batch(
             repair = getattr(provider, "repair", None)
             repaired_candidate: str | None = None
             repair_code: str | None = None
-            if callable(repair) and error.candidate is not None:
+            if (
+                error.code in _REPAIRABLE_CODES
+                and callable(repair)
+                and error.candidate is not None
+            ):
                 initial = build_initial_messages(
                     policy_by_id[sample.policy_id], sample
                 )
@@ -699,8 +759,13 @@ def run_generation_batch(
                     if repair_turn.tool_call is not None or repair_turn.content is None:
                         raise ValueError("repair must return final text without tools")
                     repaired_candidate = repair_turn.content
-                    _validate_candidate(
+                    repaired_parsed = _validate_candidate(
                         repaired_candidate,
+                        policy=policy_by_id[sample.policy_id],
+                        sample=sample,
+                    )
+                    repair_code = _semantic_mismatch(
+                        repaired_parsed,
                         policy=policy_by_id[sample.policy_id],
                         sample=sample,
                     )
@@ -713,19 +778,20 @@ def run_generation_batch(
                 except ValueError as repair_error:
                     repair_code = _validation_code(repair_error)
                 else:
-                    accepted_rows.append(
-                        render_training_row(
-                            initial,
-                            repaired_candidate,
-                            tools_json=(
-                                tools_json(sample.tool_names)
-                                if sample.tool_names
-                                else None
-                            ),
-                            trajectory=error.trajectory,
+                    if repair_code is None:
+                        accepted_rows.append(
+                            render_training_row(
+                                initial,
+                                repaired_candidate,
+                                tools_json=(
+                                    tools_json(sample.tool_names)
+                                    if sample.tool_names
+                                    else None
+                                ),
+                                trajectory=error.trajectory,
+                            )
                         )
-                    )
-                    repaired += 1
+                        repaired += 1
             if repaired_candidate is None or repair_code is not None:
                 codes = [error.code]
                 if repair_code is not None:
@@ -772,6 +838,39 @@ def run_generation_batch(
         emit("sample_complete", sample.sample_id)
 
     status = "complete" if stopped_reason is None and completed == len(samples) else "incomplete"
+    rejected_ids = {
+        row["sample_id"]
+        for row in rejected_rows
+        if isinstance(row.get("sample_id"), str)
+    }
+    accepted_samples = tuple(
+        sample for sample in samples[:completed] if sample.sample_id not in rejected_ids
+    )
+    if len(accepted_samples) != len(accepted_rows):
+        raise RuntimeError("accepted and rejected batch accounting is inconsistent")
+    expected_samples = sum(
+        sample.expected_label is not None for sample in samples[:completed]
+    )
+    expected_accepted = sum(
+        sample.expected_label is not None for sample in accepted_samples
+    )
+    required_tool_samples = sum(
+        sample.tool_policy == "required" for sample in samples[:completed]
+    )
+    required_tool_accepted = sum(
+        sample.tool_policy == "required" for sample in accepted_samples
+    )
+    if status != "complete":
+        quality_status = "incomplete"
+    elif expected_samples == 0:
+        quality_status = "not_evaluated"
+    elif (
+        expected_accepted == expected_samples
+        and required_tool_accepted == required_tool_samples
+    ):
+        quality_status = "pass"
+    else:
+        quality_status = "fail"
     manifest: dict[str, object] = {
         "schema": "singguard-active-policy-batch-v1",
         "status": status,
@@ -785,11 +884,24 @@ def run_generation_batch(
             mode: sum(sample.thinking_type == mode for sample in samples[:completed])
             for mode in ("fast", "slow")
         },
+        "accepted_thinking_type_counts": {
+            mode: sum(sample.thinking_type == mode for sample in accepted_samples)
+            for mode in ("fast", "slow")
+        },
+        "required_tool_samples": required_tool_samples,
+        "required_tool_accepted": required_tool_accepted,
         "tool_call_count": sum(
             message["role"] == "tool_call"
             for row in accepted_rows
             for message in row["messages"]
         ),
+        "quality_gate": {
+            "status": quality_status,
+            "expected_samples": expected_samples,
+            "expected_accepted": expected_accepted,
+            "required_tool_samples": required_tool_samples,
+            "required_tool_accepted": required_tool_accepted,
+        },
         "budget": budget.as_dict(),
     }
     _atomic_json(output_dir / "manifest.json", manifest)

@@ -6,7 +6,9 @@
 contain one or more simultaneously active rules.
 
 `data/content_samples.jsonl` contains English text conversations and the tools
-that Gemini may call while producing supervision.
+that Gemini may call while producing supervision. Bundled smoke rows also carry
+hidden semantic expectations and mark selected tool sequences as required;
+neither expectation field is exposed to Gemini or the exported SFT examples.
 
 `data/tool_env` is a deterministic synthetic lookup environment for real tool
 trajectory generation. It is not an oracle or production moderation evidence.

@@ -25,6 +25,22 @@ def test_runtime_policy_replaces_default_taxonomy() -> None:
     assert len(prompt_sha256("guard")) == 64
 
 
+def test_slow_prompt_exposes_the_exact_validator_grammar() -> None:
+    from risk_agent.singguard_prompts import render_guard_prompt
+
+    prompt = render_guard_prompt((_rule(),), thinking_type="slow")
+
+    assert "<reasoning>" in prompt
+    assert "[Step 1] Content Summary" in prompt
+    assert "[Step 2] Check Risk Categories" in prompt
+    assert "[Step 3] Final Judgment" in prompt
+    assert (
+        "- Guaranteed Outcome: <HIT | NOT HIT | NOT APPLICABLE | "
+        "OBSERVED BUT NOT UNSAFE>. <evidence>"
+    ) in prompt
+    assert "Do not add text outside this structure" in prompt
+
+
 def test_agent_prompt_extends_policy_core_with_bounded_tools() -> None:
     from risk_agent.singguard_prompts import render_agent_prompt
 

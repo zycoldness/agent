@@ -16,11 +16,15 @@ one or many simultaneously active rules:
 `data/content_samples.jsonl` contains the target conversations:
 
 ```json
-{"sample_id":"sample-1","policy_id":"commerce-v1","thinking_type":"fast","query":"Guaranteed results in seven days.","tool_names":["verify_claim"]}
+{"sample_id":"sample-1","policy_id":"commerce-v1","thinking_type":"slow","query":"Guaranteed results in seven days.","tool_names":["verify_claim"],"tool_policy":"required","expected_label":"unsafe","expected_answers":["Deceptive Efficacy"]}
 ```
 
-Optional fields are `response` and `tool_names`. The first version does not use
-images. Every `policy_id` must resolve to exactly one active policy set.
+Optional fields are `response`, `tool_names`, `tool_policy`, `expected_label`,
+and `expected_answers`. `tool_policy=required` makes `tool_names` an exact,
+ordered call sequence. Expectations are local quality-oracle fields: they are
+hashed with the sample plan and checked after generation, but never sent to
+Gemini or exported into `train.jsonl`. The first version does not use images.
+Every `policy_id` must resolve to exactly one active policy set.
 
 The deterministic tool environment is stored under `data/tool_env`:
 
@@ -85,9 +89,11 @@ For each sample, the pipeline:
 2. gives the prompt and conversation to Gemini;
 3. executes each allowed tool locally and sends the real result back to Gemini;
 4. accepts at most two sequential calls;
-5. validates the final `fast` or `slow` completion exactly;
-6. makes at most one fresh, tool-free grammar-repair request;
-7. writes either an accepted training row or a sanitized rejection.
+5. enforces the complete ordered sequence for `tool_policy=required` samples;
+6. validates the final `fast` or exact three-step `slow` completion;
+7. makes at most one fresh, tool-free serialization-repair request;
+8. checks hidden semantic expectations without exposing them to the model;
+9. writes either an accepted training row or a sanitized rejection.
 
 ## 5. Resume safely
 
@@ -114,7 +120,8 @@ and the guard prompt. It never silently mixes versions.
 
 Review:
 
-- `manifest.json`: status, accepted/rejected/repaired counts, modes, tool calls,
+- `manifest.json`: execution status, accepted/rejected/repaired counts,
+  accepted-mode distribution, required-tool coverage, semantic `quality_gate`,
   and budget accounting;
 - `train.jsonl`: complete prompts, real trajectories, and original accepted
   Gemini text;
@@ -123,12 +130,20 @@ Review:
 
 Minimum first-batch checks:
 
+- `status` is `complete` and `quality_gate.status` is `pass`;
+- all six smoke expectations are accepted;
+- all three required-tool samples are accepted and `tool_call_count` is three;
 - every system prompt includes the intended complete active policy;
 - safe/unsafe and `fast`/`slow` distributions match the reviewed sample plan;
 - `slow` traces check every active rule in policy order;
 - tool results are relevant, deterministic, and not copied from an oracle;
 - repaired rows are manually inspected as a separate slice;
 - near duplicates and templated wording are not dominating the batch.
+
+`status=complete` means only that every planned row was processed. It does not
+mean the batch is trainable; that decision belongs to `quality_gate` plus human
+review. The CLI exits with code 2 for an incomplete run and code 3 when execution
+completes but the semantic quality gate fails.
 
 Do not hand-edit accepted rows. Correct prompts, policies, samples, or tool data
 and create a new versioned output directory.
