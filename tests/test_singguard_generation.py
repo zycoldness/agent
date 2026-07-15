@@ -237,6 +237,18 @@ def test_gemini_adapter_maps_function_call_and_response() -> None:
     from risk_agent.singguard_generation import GeminiAgentProvider
     from risk_agent.teacher import TeacherBudget
 
+    model_content = {
+        "role": "model",
+        "parts": [
+            {
+                "function_call": {
+                    "name": "search_cases",
+                    "args": {"query": "guaranteed claim"},
+                },
+                "thought_signature": b"opaque-signature",
+            }
+        ],
+    }
     responses = deque(
         [
             SimpleNamespace(
@@ -247,6 +259,7 @@ def test_gemini_adapter_maps_function_call_and_response() -> None:
                     )
                 ],
                 text=None,
+                candidates=[SimpleNamespace(content=model_content)],
                 usage_metadata=SimpleNamespace(
                     prompt_token_count=10,
                     candidates_token_count=3,
@@ -255,6 +268,9 @@ def test_gemini_adapter_maps_function_call_and_response() -> None:
             SimpleNamespace(
                 function_calls=[],
                 text="safe\n<answer>Safe</answer>",
+                candidates=[
+                    SimpleNamespace(content={"role": "model", "turn": "final"})
+                ],
                 usage_metadata=SimpleNamespace(
                     prompt_token_count=12,
                     candidates_token_count=4,
@@ -262,33 +278,41 @@ def test_gemini_adapter_maps_function_call_and_response() -> None:
             ),
         ]
     )
-    sent: list[object] = []
+    sent: list[dict[str, object]] = []
     captured: dict[str, object] = {}
 
-    class Chat:
-        def send_message(self, message):
-            sent.append(message)
+    class Models:
+        def generate_content(self, **kwargs):
+            sent.append(kwargs)
             return responses.popleft()
 
-    class Chats:
-        def create(self, **kwargs):
-            captured.update(kwargs)
-            return Chat()
-
     class Part:
+        @staticmethod
+        def from_text(*, text):
+            return {"text": text}
+
         @staticmethod
         def from_function_response(*, name, response):
             return {"name": name, "response": response}
 
+    class Content:
+        def __new__(cls, *, role, parts):
+            return {"role": role, "parts": parts}
+
+    def config(**kwargs):
+        captured.update(kwargs)
+        return kwargs
+
     types_module = SimpleNamespace(
-        GenerateContentConfig=lambda **kwargs: kwargs,
+        GenerateContentConfig=config,
         Tool=lambda **kwargs: kwargs,
         Part=Part,
+        Content=Content,
     )
     budget = TeacherBudget(max_requests=2)
     provider = GeminiAgentProvider(
         model="gemini-test",
-        client_factory=lambda: SimpleNamespace(chats=Chats()),
+        client_factory=lambda: SimpleNamespace(models=Models()),
         types_module=types_module,
         budget=budget,
         max_attempts=1,
@@ -312,11 +336,19 @@ def test_gemini_adapter_maps_function_call_and_response() -> None:
 
     assert first.tool_call.name == "search_cases"
     assert second.content == "safe\n<answer>Safe</answer>"
-    assert sent[-1] == {
-        "name": "search_cases",
-        "response": {"status": "ok", "results": []},
+    user_content = {"role": "user", "parts": [{"text": "[user]: content"}]}
+    tool_content = {
+        "role": "tool",
+        "parts": [
+            {
+                "name": "search_cases",
+                "response": {"status": "ok", "results": []},
+            }
+        ],
     }
-    assert captured["config"]["system_instruction"] == "system prompt"
+    assert sent[0]["contents"] == [user_content]
+    assert sent[-1]["contents"] == [user_content, model_content, tool_content]
+    assert captured["system_instruction"] == "system prompt"
     assert budget.as_dict()["request_count"] == 2
 
 
@@ -328,29 +360,40 @@ def test_gemini_repair_receives_exact_format_only_contract() -> None:
     captured: dict[str, object] = {}
     sent: list[object] = []
 
-    class Chat:
-        def send_message(self, message):
-            sent.append(message)
+    class Models:
+        def generate_content(self, **kwargs):
+            sent.append(kwargs)
             return SimpleNamespace(
                 function_calls=[],
                 text="safe\n<answer>Safe</answer>",
+                candidates=[SimpleNamespace(content={"role": "model"})],
                 usage_metadata=SimpleNamespace(
                     prompt_token_count=8,
                     candidates_token_count=3,
                 ),
             )
 
-    class Chats:
-        def create(self, **kwargs):
-            captured.update(kwargs)
-            return Chat()
+    class Part:
+        @staticmethod
+        def from_text(*, text):
+            return {"text": text}
+
+    class Content:
+        def __new__(cls, *, role, parts):
+            return {"role": role, "parts": parts}
+
+    def config(**kwargs):
+        captured.update(kwargs)
+        return kwargs
 
     types_module = SimpleNamespace(
-        GenerateContentConfig=lambda **kwargs: kwargs,
+        GenerateContentConfig=config,
+        Part=Part,
+        Content=Content,
     )
     provider = GeminiAgentProvider(
         model="gemini-test",
-        client_factory=lambda: SimpleNamespace(chats=Chats()),
+        client_factory=lambda: SimpleNamespace(models=Models()),
         types_module=types_module,
         budget=TeacherBudget(max_requests=1),
         max_attempts=1,
@@ -364,12 +407,13 @@ def test_gemini_repair_receives_exact_format_only_contract() -> None:
         validation_code="output_grammar",
     )
 
-    repair_system = captured["config"]["system_instruction"]
+    repair_system = captured["system_instruction"]
     assert "The only permitted changes are output serialization" in repair_system
     assert "Do not change the moderation label or triggered rule" in repair_system
-    assert "[validation_error]: output_grammar" in sent[0]
-    assert "[rejected_candidate]:\nThe content is safe." in sent[0]
-    assert "tools" not in captured["config"]
+    repair_user = sent[0]["contents"][0]["parts"][0]["text"]
+    assert "[validation_error]: output_grammar" in repair_user
+    assert "[rejected_candidate]:\nThe content is safe." in repair_user
+    assert "tools" not in captured
 
 
 def test_gemini_retry_events_keep_safe_provider_diagnostics_only() -> None:
@@ -386,21 +430,28 @@ def test_gemini_retry_events_keep_safe_provider_diagnostics_only() -> None:
         def __str__(self) -> str:
             return "api_key=never-log-this raw provider details"
 
-    class Chat:
-        def send_message(self, message):
+    class Models:
+        def generate_content(self, **kwargs):
             raise FakeAPIError()
 
-    class Chats:
-        def create(self, **kwargs):
-            return Chat()
+    class Part:
+        @staticmethod
+        def from_text(*, text):
+            return {"text": text}
+
+    class Content:
+        def __new__(cls, *, role, parts):
+            return {"role": role, "parts": parts}
 
     types_module = SimpleNamespace(
         GenerateContentConfig=lambda **kwargs: kwargs,
+        Part=Part,
+        Content=Content,
     )
     budget = TeacherBudget(max_requests=2)
     provider = GeminiAgentProvider(
         model="gemini-test",
-        client_factory=lambda: SimpleNamespace(chats=Chats()),
+        client_factory=lambda: SimpleNamespace(models=Models()),
         types_module=types_module,
         budget=budget,
         max_attempts=2,
@@ -751,10 +802,10 @@ def test_batch_persists_sanitized_provider_failure_and_stops_cleanly(
         def __str__(self) -> str:
             return "Bearer never-persist-this provider body"
 
-    class Chat:
+    class Models:
         calls = 0
 
-        def send_message(self, message):
+        def generate_content(self, **kwargs):
             self.calls += 1
             if self.calls == 1:
                 return SimpleNamespace(
@@ -765,6 +816,11 @@ def test_batch_persists_sanitized_provider_failure_and_stops_cleanly(
                         )
                     ],
                     text=None,
+                    candidates=[
+                        SimpleNamespace(
+                            content={"role": "model", "turn": "tool-call"}
+                        )
+                    ],
                     usage_metadata=SimpleNamespace(
                         prompt_token_count=10,
                         candidates_token_count=3,
@@ -772,25 +828,30 @@ def test_batch_persists_sanitized_provider_failure_and_stops_cleanly(
                 )
             raise FakeServerError()
 
-    class Chats:
-        def create(self, **kwargs):
-            return Chat()
-
     monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
 
     class Part:
         @staticmethod
+        def from_text(*, text):
+            return {"text": text}
+
+        @staticmethod
         def from_function_response(*, name, response):
             return {"name": name, "response": response}
+
+    class Content:
+        def __new__(cls, *, role, parts):
+            return {"role": role, "parts": parts}
 
     budget = TeacherBudget(max_requests=3)
     provider = GeminiAgentProvider(
         model="gemini-test",
-        client_factory=lambda: SimpleNamespace(chats=Chats()),
+        client_factory=lambda: SimpleNamespace(models=Models()),
         types_module=SimpleNamespace(
             GenerateContentConfig=lambda **kwargs: kwargs,
             Tool=lambda **kwargs: kwargs,
             Part=Part,
+            Content=Content,
         ),
         budget=budget,
         max_attempts=2,

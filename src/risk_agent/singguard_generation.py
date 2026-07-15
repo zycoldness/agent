@@ -149,7 +149,9 @@ class GeminiAgentProvider(GeminiTeacher):
             budget=budget,
         )
         self._types_module = types_module
-        self._chat: object | None = None
+        self._client: object | None = None
+        self._config: object | None = None
+        self._history: list[object] = []
         self._context_text = ""
         self._event_sink = event_sink
         self._sample_id: str | None = None
@@ -236,8 +238,9 @@ class GeminiAgentProvider(GeminiTeacher):
         return types
 
     def _send(self, message: object, *, stage: str) -> object:
-        if self._chat is None:
-            raise RuntimeError("Gemini agent chat has not been started")
+        if self._client is None or self._config is None:
+            raise RuntimeError("Gemini agent session has not been started")
+        request_contents = [*self._history, message]
         aggregate = _UsageAccumulator(
             "gemini",
             self.model,
@@ -258,7 +261,11 @@ class GeminiAgentProvider(GeminiTeacher):
                 max_attempts=self._max_attempts,
             )
             try:
-                response = self._chat.send_message(message)
+                response = self._client.models.generate_content(
+                    model=self.model,
+                    contents=request_contents,
+                    config=self._config,
+                )
             except Exception as error:
                 usage = aggregate.add(None, None)
                 diagnostic = self._failure_diagnostic(
@@ -316,6 +323,14 @@ class GeminiAgentProvider(GeminiTeacher):
                 output_tokens=usage.output_tokens,
                 accounting_complete=usage.accounting_complete,
             )
+            try:
+                response_content = response.candidates[0].content
+            except Exception:
+                raise ValueError("Gemini response content is unavailable") from None
+            if response_content is None:
+                raise ValueError("Gemini response content is unavailable")
+            # Preserve the exact model content so Gemini 3 thought signatures survive.
+            self._history = [*request_contents, response_content]
             return response
         raise RuntimeError("unreachable Gemini retry state")
 
@@ -364,10 +379,12 @@ class GeminiAgentProvider(GeminiTeacher):
                 types.Tool(function_declarations=list(tool_specs))
             ]
         try:
-            client = self._new_client()
-            self._chat = client.chats.create(
-                model=self.model,
-                config=types.GenerateContentConfig(**config_kwargs),
+            self._client = self._new_client()
+            self._config = types.GenerateContentConfig(**config_kwargs)
+            self._history = []
+            user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=user)],
             )
         except Exception as error:
             diagnostic = self._failure_diagnostic(
@@ -387,7 +404,7 @@ class GeminiAgentProvider(GeminiTeacher):
                 diagnostic,
             ) from None
         self._context_text = f"{system}\n{user}"
-        response = self._send(user, stage="initial")
+        response = self._send(user_content, stage="initial")
         return self._to_turn(response)
 
     def continue_with_tool_result(
@@ -405,7 +422,8 @@ class GeminiAgentProvider(GeminiTeacher):
             name=call.name,
             response=payload,
         )
-        response = self._send(part, stage="tool_response")
+        tool_content = types.Content(role="tool", parts=[part])
+        response = self._send(tool_content, stage="tool_response")
         return self._to_turn(response)
 
     def repair(
@@ -432,14 +450,16 @@ class GeminiAgentProvider(GeminiTeacher):
             f"\n[rejected_candidate]:\n{candidate}"
         )
         try:
-            client = self._new_client()
-            self._chat = client.chats.create(
-                model=self.model,
-                config=types.GenerateContentConfig(
-                    system_instruction=system + repair_instruction,
-                    temperature=0.0,
-                    max_output_tokens=self._max_output_tokens,
-                ),
+            self._client = self._new_client()
+            self._config = types.GenerateContentConfig(
+                system_instruction=system + repair_instruction,
+                temperature=0.0,
+                max_output_tokens=self._max_output_tokens,
+            )
+            self._history = []
+            repair_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=repair_user)],
             )
         except Exception as error:
             diagnostic = self._failure_diagnostic(
@@ -459,7 +479,7 @@ class GeminiAgentProvider(GeminiTeacher):
                 diagnostic,
             ) from None
         self._context_text = f"{system}{repair_instruction}\n{repair_user}"
-        return self._to_turn(self._send(repair_user, stage="repair"))
+        return self._to_turn(self._send(repair_content, stage="repair"))
 
 
 def _tool_call_content(call: ToolCall) -> str:
