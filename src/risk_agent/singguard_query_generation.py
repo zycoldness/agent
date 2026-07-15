@@ -525,6 +525,9 @@ def _is_defensive_malware_sample(text: str, clauses: tuple[str, ...]) -> bool:
 
 
 def _malware_relationship_count(clause: str) -> int:
+    sample_download = bool(
+        _MALWARE_SAMPLE_RE.search(clause) and _DOWNLOAD_RE.search(clause)
+    )
     creation_or_assembly = bool(
         _MALWARE_CREATION_RE.search(clause) or _MALWARE_ASSEMBLY_RE.search(clause)
     )
@@ -543,6 +546,7 @@ def _malware_relationship_count(clause: str) -> int:
     )
     return sum(
         (
+            sample_download,
             creation_or_assembly,
             persistence,
             targeted_execution,
