@@ -36,12 +36,28 @@ _META_LANGUAGE_RES = tuple(
     for pattern in (
         r"\bdataset\s+(?:training\s+)?sample\b",
         r"\btraining\s+sample\b",
-        r"\bexpected\s+label\b",
         r"\boracle\s+answer\b",
         r"\bannotat(?:or|ion)\s+instruction\b",
         r"\bactive[- ]policy\s+(?:rule\s+)?id\b",
         r"\brule[- ]id\s+metadata\b",
         r"\bgenerate\s+(?:an?\s+)?(?:safe|unsafe)\s+example\b",
+    )
+)
+_CLASSIFICATION_LABEL_RE = re.compile(
+    r"\b(?:dataset|training|gold|target|correct|expected)\s+label\b",
+    re.IGNORECASE,
+)
+_LABEL_LEAKAGE_CONTEXT_RES = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        (
+            r"\blabel\b(?:\s+\w+){0,5}\s+"
+            r"(?:(?:is|as)\s+|should\s+be\s+)?(?:safe|unsafe)\b"
+            r"(?!\s+(?:to|for)\b)"
+        ),
+        r"\bgenerated\s+(?:sample|example|item|output|response|content)\b",
+        r"\b(?:oracle|annotat(?:or|ion))\b",
+        r"\b(?:policy|rule(?:[- ]id)?)\s+metadata\b",
     )
 )
 _EMAIL_RE = re.compile(
@@ -57,12 +73,22 @@ _DOMAIN_RE = re.compile(
     r"(?<![\w@.-])([A-Z0-9-]+(?:\.[A-Z0-9-]+)*\.[A-Z]{2,})(?![\w.-])",
     re.IGNORECASE,
 )
-_HANDLE_RE = re.compile(r"(?<![\w@])@([A-Z0-9_]{2,32})\b", re.IGNORECASE)
+_HANDLE_RE = re.compile(r"(?<![\w@])@([A-Z0-9_]{1,32})\b", re.IGNORECASE)
 _PHONE_RE = re.compile(r"(?<![\w-])(?:\+?\d[\s().-]*){10,15}(?![\w-])")
 _CARD_RE = re.compile(r"(?<![\w-])(?:\d[ -]?){13,19}(?![\w-])")
-_CREDENTIAL_RE = re.compile(
-    r"\b(?:api[_ -]?key|access[_ -]?token|secret|password|passwd|pwd)\b"
-    r"\s*(?:is|=|:)\s*[\"']?[A-Z0-9_./+\-]{6,}",
+_ORDER_IDENTIFIER_RE = re.compile(
+    r"\b(?:order|tracking)\s+(?:id|number|no\.?|#)\s*[:#=\-]?\s*"
+    r"[A-Z0-9][A-Z0-9-]{5,31}\b",
+    re.IGNORECASE,
+)
+_KNOWN_SECRET_PREFIX_RE = re.compile(
+    r"\b(?:sk_(?:live|test)|pk_(?:live|test)|gh[pousr]_|AKIA)"
+    r"[A-Z0-9_\-]{8,}\b",
+    re.IGNORECASE,
+)
+_SECRET_AFTER_KEYWORD_RE = re.compile(
+    r"\b(?:api[_ -]?key|access[_ -]?token|credential|secret|password|passwd|pwd)\b"
+    r"\s*(?:(?:is)\s+|[:=]\s*|\s+)[\"']?([A-Z0-9_./+\-]{6,})",
     re.IGNORECASE,
 )
 _ACCOUNT_RE = re.compile(
@@ -71,13 +97,16 @@ _ACCOUNT_RE = re.compile(
 )
 _SEQUENCE_RE = re.compile(r"\b(?:first|then|next|finally|step\s+\d+)\b", re.IGNORECASE)
 _HARM_DOMAIN_RE = re.compile(
-    r"\b(?:weapon|explosive|detonator|credential\s+theft|clone\s+the\s+login|"
-    r"malware|ransomware|payload)\b",
+    r"\b(?:weapons?|explosive|detonator|ammonium\s+nitrate|fuel\s+oil|"
+    r"steel\s+pipe|timed\s+ignition|ignition(?:\s+(?:circuit|timer))?|"
+    r"(?:detonation|explosive)\s+(?:fuse|timer)|ammunition|credential\s+theft|"
+    r"clone\s+the\s+login|malware|ransomware|payload)\b",
     re.IGNORECASE,
 )
 _HARM_ACTION_RE = re.compile(
-    r"\b(?:mix|pack|ignite|detonate|clone|capture|exfiltrate|write|download|"
-    r"configure|execute|deploy|install)\w*\b",
+    r"\b(?:mix|combine|pack|place|attach|assemble|load|connect|wire|insert|seal|"
+    r"ignite|detonate|clone|capture|exfiltrate|write|download|configure|execute|"
+    r"deploy|install)\w*\b",
     re.IGNORECASE,
 )
 
@@ -217,6 +246,14 @@ def _is_english_dominant(text: str) -> bool:
     )
 
 
+def _contains_generation_meta_language(text: str) -> bool:
+    if any(pattern.search(text) for pattern in _META_LANGUAGE_RES):
+        return True
+    return bool(_CLASSIFICATION_LABEL_RE.search(text)) and any(
+        pattern.search(text) for pattern in _LABEL_LEAKAGE_CONTEXT_RES
+    )
+
+
 def _rejected(code: str) -> GateResult:
     return GateResult(accepted=False, code=code)
 
@@ -245,6 +282,18 @@ def _luhn_valid(digits: str) -> bool:
     return checksum % 10 == 0
 
 
+def _contains_credential_secret(text: str) -> bool:
+    if _KNOWN_SECRET_PREFIX_RE.search(text):
+        return True
+    for match in _SECRET_AFTER_KEYWORD_RE.finditer(text):
+        value = match.group(1)
+        if len(value) >= 10 and any(character.isalpha() for character in value) and any(
+            character.isdigit() for character in value
+        ):
+            return True
+    return False
+
+
 def _contains_external_identifier(text: str) -> bool:
     email_matches = list(_EMAIL_RE.finditer(text))
     if any(not _reserved_test_host(match.group(2)) for match in email_matches):
@@ -261,11 +310,14 @@ def _contains_external_identifier(text: str) -> bool:
         return True
     scrubbed = _blank_spans(scrubbed, domain_matches)
 
+    order_matches = list(_ORDER_IDENTIFIER_RE.finditer(scrubbed))
+    scrubbed = _blank_spans(scrubbed, order_matches)
+
     for match in _HANDLE_RE.finditer(scrubbed):
         handle = match.group(1).casefold()
         if not handle.startswith(("synthetic_", "test_", "example_")):
             return True
-    if _CREDENTIAL_RE.search(scrubbed) or _ACCOUNT_RE.search(scrubbed):
+    if _contains_credential_secret(scrubbed) or _ACCOUNT_RE.search(scrubbed):
         return True
     if _PHONE_RE.search(scrubbed):
         return True
@@ -322,7 +374,7 @@ def gate_content(
         return _rejected("literal_role_wrapper")
     if not _is_english_dominant(combined):
         return _rejected("wrong_language")
-    if any(pattern.search(combined) for pattern in _META_LANGUAGE_RES):
+    if _contains_generation_meta_language(combined):
         return _rejected("generation_meta_language")
     if _contains_external_identifier(combined):
         return _rejected("pii_or_external_identifier")

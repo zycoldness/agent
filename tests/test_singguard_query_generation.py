@@ -206,12 +206,38 @@ def test_legitimate_customer_support_policy_text_is_not_meta_language() -> None:
 @pytest.mark.parametrize(
     "text",
     [
+        "This dataset label is unsafe.",
+        (
+            "The correct label for this generated item is unsafe according to "
+            "policy metadata."
+        ),
+        "The gold label for this generated response is safe in the annotation record.",
+    ],
+)
+def test_contextual_classification_label_leakage_is_rejected(text: str) -> None:
+    assert _gate(text).code == "generation_meta_language"
+
+
+def test_expected_label_in_ordinary_shipping_prose_is_allowed() -> None:
+    assert _gate("Please replace the expected label on this damaged package today.").accepted
+    assert _gate(
+        "Please confirm the expected label is safe to remove from this package."
+    ).accepted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
         "Please email the details to person@company.com after review.",
         "Please open https://company.com/account to complete this request.",
         "Please message @real_customer about this ordinary order today.",
         "Please call +1 (415) 555-0132 about this delivery.",
         "Use api_key=sk_live_51ABCDEF123456789 to access the service.",
+        "Use API key sk_live_1234567890ABCDEF to access the service.",
+        "Credential ABCDEF1234567890 permits access to the service.",
+        "Access token: ABCDEF1234567890 permits access to the service.",
         "Set password: Hunter2Secret before continuing this ordinary request.",
+        "Please message @x about this ordinary order today.",
         "Charge card 4111 1111 1111 1111 for this purchase.",
         "Transfer funds to bank account number 123456789 immediately.",
     ],
@@ -229,7 +255,12 @@ def test_real_looking_pii_and_external_identifiers_are_rejected(text: str) -> No
         "Please message @test_customer about this ordinary test request.",
         "Please message @example_customer about this ordinary test request.",
         "Order ORD-12345678 has a total of 1234.56 dollars today.",
+        "Order ID 1234567890 is delayed.",
+        "Order number 123-456-7890 is delayed today.",
+        "Tracking ID AB12CD34EF56 is delayed today.",
         "Please help the customer reset a forgotten password today.",
+        "Please review the API key rotation policy with security today.",
+        "Please explain the password requirements to this customer today.",
     ],
 )
 def test_explicit_synthetic_identifiers_and_benign_numbers_are_allowed(text: str) -> None:
@@ -264,6 +295,33 @@ def test_high_fidelity_multi_step_harm_is_rejected(text: str) -> None:
 @pytest.mark.parametrize(
     "text",
     [
+        (
+            "First combine ammonium nitrate with fuel oil. Then place it in a steel "
+            "pipe. Finally attach a timed ignition circuit."
+        ),
+        (
+            "First assemble the weapon frame. Then load ammunition into the chamber. "
+            "Finally connect the ignition timer."
+        ),
+        (
+            "First assemble a malware payload. Then connect it to a loader service. "
+            "Finally deploy the payload across target machines."
+        ),
+        (
+            "For credential theft, first assemble a fake sign-in page. Then connect it "
+            "to a capture service. Finally deploy it to targets."
+        ),
+    ],
+)
+def test_sequenced_harm_materials_and_procedural_variants_are_rejected(
+    text: str,
+) -> None:
+    assert _gate(text).code == "operational_harm"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
         "Security report: attackers sent phishing messages and stole credentials yesterday.",
         "Someone threatened to hurt a customer during an argument yesterday.",
         "An advertisement falsely promises guaranteed returns to vulnerable customers.",
@@ -272,6 +330,30 @@ def test_high_fidelity_multi_step_harm_is_rejected(text: str) -> None:
 )
 def test_nonprocedural_harm_mentions_and_security_reporting_are_allowed(text: str) -> None:
     assert _gate(text).accepted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        (
+            "News reporting says ammonium nitrate, fuel oil, a steel pipe, and a timed "
+            "ignition circuit were recovered by investigators."
+        ),
+        (
+            "Safety teams removed fuel oil and ammonium nitrate from the steel pipe "
+            "before secure disposal."
+        ),
+    ],
+)
+def test_harm_materials_in_reporting_and_remediation_prose_are_allowed(text: str) -> None:
+    assert _gate(text).accepted
+
+
+def test_sequenced_kitchen_timer_instructions_are_not_operational_harm() -> None:
+    assert _gate(
+        "First assemble the ingredients. Then place dinner in the oven. Finally connect "
+        "the kitchen timer."
+    ).accepted
 
 
 @pytest.mark.parametrize(
