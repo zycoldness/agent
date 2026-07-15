@@ -155,6 +155,22 @@ _ACCOUNT_RE = re.compile(
     r"\b(?:bank\s+)?account\s+(?:number|no\.?|#)\s*[:=]?\s*\d{8,20}\b",
     re.IGNORECASE,
 )
+_STREET_ADDRESS_RE = re.compile(
+    r"\b\d{1,6}\s+(?:[A-Z0-9.'-]+\s+){0,5}"
+    r"(?:street|st\.?|road|rd\.?|avenue|ave\.?|boulevard|blvd\.?|"
+    r"lane|ln\.?|drive|dr\.?|court|ct\.?|terrace|ter\.?|way)\b"
+    r"(?:,\s*[A-Z][A-Z .'-]+)?(?:\s+\d{5}(?:-\d{4})?)?",
+    re.IGNORECASE,
+)
+_LABELED_PERSON_RE = re.compile(
+    r"\b(name|contact|recipient)\s*:\s*"
+    r"[A-Z][A-Z'-]+(?:\s+[A-Z][A-Z'-]+){1,3}",
+    re.IGNORECASE,
+)
+_TITLE_CASE_PERSON_RE = re.compile(
+    r"(?<![\w])(?:[A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?)"
+    r"(?:\s+[A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?){1,3}(?![\w])"
+)
 _SEQUENCE_RE = re.compile(r"\b(?:first|then|next|finally|step\s+\d+)\b", re.IGNORECASE)
 _CLAUSE_SPLIT_RE = re.compile(
     r"[.!?;]+|\b(?:first|then|next|finally|step\s+\d+)\b[:,]?",
@@ -288,7 +304,11 @@ def parse_content_batch(
 
     parsed: list[GeneratedContent] = []
     for raw_item in raw_items:
-        if not isinstance(raw_item, Mapping):
+        if not isinstance(raw_item, Mapping) or set(raw_item) != {
+            "blueprint_id",
+            "query",
+            "response",
+        }:
             raise ValueError("content batch contains an invalid item")
         try:
             parsed.append(GeneratedContent.model_validate(raw_item, strict=True))
@@ -312,13 +332,52 @@ def _prompt_bytes() -> bytes:
 def _redact_source_seed(text: str) -> str:
     if type(text) is not str:
         raise TypeError("source text must be a string")
-    redacted = re.sub(
-        r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
-        "[EMAIL]",
+    redacted = _EMAIL_RE.sub(
+        lambda match: match.group()
+        if _reserved_test_host(match.group(2))
+        else "[EMAIL]",
         text,
     )
-    redacted = re.sub(r"(?i)https?://\S+", "[URL]", redacted)
-    redacted = re.sub(r"(?<!\w)\+?\d[\d\s().-]{7,}\d(?!\w)", "[PHONE]", redacted)
+    redacted = _EXPLICIT_URL_RE.sub(
+        lambda match: match.group()
+        if (host := _explicit_url_host(match.group())) is not None
+        and _reserved_test_host(host)
+        else "[URL]",
+        redacted,
+    )
+    redacted = _DOMAIN_RE.sub(
+        lambda match: match.group()
+        if _reserved_test_host(match.group(1))
+        else "[URL]",
+        redacted,
+    )
+    redacted = _ACCOUNT_RE.sub("[ACCOUNT]", redacted)
+    redacted = _ORDER_IDENTIFIER_RE.sub("[ORDER_ID]", redacted)
+
+    for pattern in (_EXPLICIT_SECRET_VALUE_RE, _BARE_SECRET_VALUE_RE):
+        redacted = pattern.sub(
+            lambda match: match.group().replace(match.group(1), "[SECRET]"),
+            redacted,
+        )
+    redacted = _KNOWN_SECRET_PREFIX_RE.sub("[SECRET]", redacted)
+
+    def redact_payment_card(match: re.Match[str]) -> str:
+        digits = "".join(character for character in match.group() if character.isdigit())
+        return "[PAYMENT_CARD]" if _luhn_valid(digits) else match.group()
+
+    redacted = _CARD_RE.sub(redact_payment_card, redacted)
+    redacted = _STREET_ADDRESS_RE.sub("[ADDRESS]", redacted)
+    redacted = _HANDLE_RE.sub(
+        lambda match: match.group()
+        if match.group(1).casefold().startswith(("synthetic_", "test_", "example_"))
+        else "[HANDLE]",
+        redacted,
+    )
+    redacted = _PHONE_RE.sub("[PHONE]", redacted)
+    redacted = _LABELED_PERSON_RE.sub(
+        lambda match: f"{match.group(1)}: [PERSON]", redacted
+    )
+    redacted = _TITLE_CASE_PERSON_RE.sub("[PERSON]", redacted)
     redacted = " ".join(redacted.split())
     if not redacted or len(redacted) > MAX_SOURCE_CHARS:
         raise ValueError("source text must be nonblank and at most 5000 characters")
@@ -332,12 +391,8 @@ def _source_text_for(
     source_id_counts: Mapping[str, int],
 ) -> str:
     tuple_key = (source_ref.source, source_ref.source_id)
-    string_key = f"{source_ref.source}:{source_ref.source_id}"
-    qualified_matches = [key for key in (tuple_key, string_key) if key in source_texts]
-    if len(qualified_matches) > 1:
-        raise ValueError("source text lookup contains colliding qualified keys")
-    if qualified_matches:
-        return _redact_source_seed(source_texts[qualified_matches[0]])
+    if tuple_key in source_texts:
+        return _redact_source_seed(source_texts[tuple_key])
     if source_ref.source_id in source_texts:
         if source_id_counts[source_ref.source_id] != 1:
             raise ValueError("source text bare ID lookup is ambiguous")
@@ -346,19 +401,7 @@ def _source_text_for(
 
 
 def _policy_payload(policy: ActivePolicy) -> dict[str, object]:
-    return {
-        "policy_id": policy.policy_id,
-        "rules": [
-            {
-                "rule_id": rule.rule_id,
-                "title": rule.title,
-                "description": rule.text,
-                "allowed_exceptions": list(rule.exceptions),
-                "priority": rule.priority,
-            }
-            for rule in policy.rules
-        ],
-    }
+    return policy.model_dump(mode="json")
 
 
 def _blueprint_payload(
@@ -382,13 +425,15 @@ def _blueprint_payload(
         "intended_answers": list(blueprint.intended_answers),
     }
     if blueprint.target_exception_rule_id is not None:
-        rule_title = next(
-            rule.title
+        target_rule = next(
+            rule
             for rule in policy.rules
             if rule.rule_id == blueprint.target_exception_rule_id
         )
+        if blueprint.target_exception not in target_rule.exceptions:
+            raise ValueError("blueprint target exception must be a documented exception")
         intended_target["safe_exception_context"] = {
-            "rule_title": rule_title,
+            "rule_title": target_rule.title,
             "exception": blueprint.target_exception,
             "hard_negative": True,
         }
