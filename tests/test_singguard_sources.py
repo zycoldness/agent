@@ -416,6 +416,99 @@ def test_max_records_counts_accepted_rows_without_overconsuming(tmp_path) -> Non
     assert manifest["record_count"] == 2
 
 
+def test_sms_max_records_stops_before_later_malformed_rows(tmp_path) -> None:
+    from risk_agent.singguard_sources import fetch_configured_seeds
+
+    catalog = _write_catalog(
+        tmp_path,
+        """  - source: limited_sms
+    dataset_url: https://example.com/sms
+    artifact_url: https://example.com/sms.zip
+    license: CC-BY-4.0
+    usage_scope: research_only
+    source_role: style_seed
+    adapter: uci_sms_zip
+    enabled: true
+    max_records: 2
+""",
+    )
+    payload = _zip_bytes(
+        {
+            "SMSSpamCollection": (
+                "ham\tfirst accepted\n"
+                "\n"
+                "spam\tsecond accepted\n"
+                "this malformed row must not be consumed\n"
+            )
+        }
+    )
+
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=payload)
+        )
+    ) as client:
+        manifest = fetch_configured_seeds(
+            catalog,
+            tmp_path / "seeds",
+            client=client,
+            retrieved_at=RETRIEVED_AT,
+        )
+
+    assert manifest["record_count"] == 2
+    assert [row["source_id"] for row in _read_rows(tmp_path / "seeds")] == [
+        "sms-000001",
+        "sms-000003",
+    ]
+
+
+def test_youtube_max_records_spans_members_and_stops_rows_and_members(tmp_path) -> None:
+    from risk_agent.singguard_sources import fetch_configured_seeds
+
+    catalog = _write_catalog(
+        tmp_path,
+        """  - source: limited_youtube
+    dataset_url: https://example.com/youtube
+    artifact_url: https://example.com/youtube.zip
+    license: CC-BY-4.0
+    usage_scope: research_only
+    source_role: style_seed
+    adapter: uci_youtube_zip
+    enabled: true
+    max_records: 2
+""",
+    )
+    payload = _zip_bytes(
+        {
+            "Youtube01.csv": "COMMENT_ID,CONTENT,CLASS\none,first accepted,0\n",
+            "Youtube02.csv": (
+                "COMMENT_ID,CONTENT,CLASS\n"
+                "two,second accepted,1\n"
+                "three,,0\n"
+            ),
+            "Youtube03.csv": "WRONG,COLUMNS\nnot,consumed\n",
+        }
+    )
+
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=payload)
+        )
+    ) as client:
+        manifest = fetch_configured_seeds(
+            catalog,
+            tmp_path / "seeds",
+            client=client,
+            retrieved_at=RETRIEVED_AT,
+        )
+
+    assert manifest["record_count"] == 2
+    assert [row["text"] for row in _read_rows(tmp_path / "seeds")] == [
+        "first accepted",
+        "second accepted",
+    ]
+
+
 @pytest.mark.parametrize(
     "updates",
     [
@@ -519,6 +612,23 @@ def test_enabled_sources_rejects_unknown_and_duplicate_before_calls(tmp_path) ->
                 enabled_sources=selection,
             )
     assert called is False
+
+
+def test_enabled_sources_rejects_known_disabled_source_before_calls(tmp_path) -> None:
+    from risk_agent.singguard_sources import fetch_configured_seeds
+
+    calls: list[str] = []
+    with pytest.raises(ValueError, match="disabled"):
+        fetch_configured_seeds(
+            CATALOG,
+            tmp_path / "seeds",
+            dataset_loader=lambda spec: calls.append("loader") or [],
+            enabled_sources=("wildguardmix",),
+            retrieved_at=RETRIEVED_AT,
+        )
+
+    assert calls == []
+    assert not (tmp_path / "seeds").exists()
 
 
 def test_explicit_selection_calls_only_selected_external_loader(tmp_path) -> None:

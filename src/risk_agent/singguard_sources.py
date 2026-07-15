@@ -400,6 +400,8 @@ def _parse_sms(spec: SourceSpec, payload: bytes, retrieved_at: str) -> list[Seed
                 retrieved_at=retrieved_at,
             )
         )
+        if len(records) >= spec.max_records:
+            return records
     return records
 
 
@@ -432,6 +434,8 @@ def _parse_youtube(spec: SourceSpec, payload: bytes, retrieved_at: str) -> list[
                     retrieved_at=retrieved_at,
                 )
             )
+            if len(records) >= spec.max_records:
+                return records
     return records
 
 
@@ -504,6 +508,9 @@ def _select_sources(
     unknown = [name for name in enabled_sources if name not in by_name]
     if unknown:
         raise ValueError(f"enabled_sources contains unknown source: {unknown[0]}")
+    disabled = [name for name in enabled_sources if not by_name[name].enabled]
+    if disabled:
+        raise ValueError(f"enabled_sources contains disabled source: {disabled[0]}")
     return tuple(by_name[name] for name in enabled_sources)
 
 
