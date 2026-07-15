@@ -166,6 +166,48 @@ Gemini must not invent tool results. Every recorded tool message comes from the
 local executor. The complete multi-turn trajectory is stored in ms-swift
 `messages` format, including tool schemas when required by ms-swift.
 
+### Minimal tool protocol
+
+Version 1 uses sequential tool calls only. A call is represented as:
+
+```json
+{"name":"search_cases","arguments":{"query":"guaranteed weight loss","top_k":3}}
+```
+
+A successful response is represented as:
+
+```json
+{"status":"ok","results":[{"case_id":"case-001","summary":"A fixed result was guaranteed."}]}
+```
+
+An execution failure is represented as:
+
+```json
+{"status":"error","error":"invalid_arguments"}
+```
+
+The exported ms-swift messages use `role: tool_call` and
+`role: tool_response`, with each `content` value serialized as a JSON string.
+The row-level `tools` field is also serialized as the JSON string required by
+ms-swift. The Gemini adapter maps Gemini-native `functionCall` and
+`functionResponse` parts to and from this internal representation.
+
+Because calls are sequential and every response immediately follows its call,
+version 1 does not add call IDs or parallel-call envelopes. The final decision
+is a normal assistant message in the SingGuard output grammar, not a
+`final_decision` function call.
+
+The initial tool set is:
+
+- `search_cases` for similar public moderation or regulatory cases;
+- `verify_claim` for evidence relevant to efficacy and factual claims;
+- `inspect_destination` for links, handles, and obfuscated off-platform
+  destinations;
+- `get_content_context` for deterministic account and related-content history.
+
+Tool results return evidence, not the final safe/unsafe label. This prevents the
+student from learning to copy a label emitted by the environment.
+
 ## Output
 
 An ordinary row contains system, user, and assistant messages:
