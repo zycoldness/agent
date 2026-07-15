@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 import unicodedata
 from types import MappingProxyType
+from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -29,6 +31,19 @@ LENGTH_BOUNDS = MappingProxyType(
         "long": (100, 400),
     }
 )
+GateCode = Literal[
+    "accepted",
+    "schema_or_shape",
+    "literal_role_wrapper",
+    "wrong_language",
+    "generation_meta_language",
+    "pii_or_external_identifier",
+    "operational_harm",
+    "length_out_of_bin",
+    "exact_duplicate",
+    "source_too_similar",
+    "near_duplicate",
+]
 
 _ROLE_WRAPPER_RE = re.compile(r"\[(?:user|assistant)\](?:\s*:)?", re.IGNORECASE)
 _META_LANGUAGE_RES = tuple(
@@ -65,10 +80,7 @@ _EMAIL_RE = re.compile(
     r"([A-Z0-9-]+(?:\.[A-Z0-9-]+)+)\b",
     re.IGNORECASE,
 )
-_URL_RE = re.compile(
-    r"\b(?:https?://|www\.)([A-Z0-9-]+(?:\.[A-Z0-9-]+)+)(?::\d+)?(?:[/?#][^\s]*)?",
-    re.IGNORECASE,
-)
+_EXPLICIT_URL_RE = re.compile(r"\b(?:https?://|www\.)[^\s<>'\"\])}]+", re.IGNORECASE)
 _DOMAIN_RE = re.compile(
     r"(?<![\w@.-])([A-Z0-9-]+(?:\.[A-Z0-9-]+)*\.[A-Z]{2,})(?![\w.-])",
     re.IGNORECASE,
@@ -107,25 +119,13 @@ _ACCOUNT_RE = re.compile(
     re.IGNORECASE,
 )
 _SEQUENCE_RE = re.compile(r"\b(?:first|then|next|finally|step\s+\d+)\b", re.IGNORECASE)
-_HARM_DOMAIN_RE = re.compile(
-    r"\b(?:weapons?|explosive|detonator|ammonium\s+nitrate|fuel\s+oil|"
-    r"steel\s+pipe|timed\s+ignition|ignition(?:\s+(?:circuit|timer))?|"
-    r"(?:detonation|explosive)\s+(?:fuse|timer)|ammunition|credential\s+theft|"
-    r"clone\s+the\s+login|malware|ransomware|payload)\b",
+_CREDENTIAL_THEFT_CONTEXT_RE = re.compile(
+    r"\b(?:credential\s+theft|bank\s+login\s+page|login\s+page|sign-in\s+page|"
+    r"passwords?|credentials?|capture\s+service)\b",
     re.IGNORECASE,
 )
-_HARM_ACTION_RE = re.compile(
-    r"\b(?:mix|combine|pack|place|attach|assemble|load|connect|wire|insert|seal|"
-    r"ignite|detonate|clone|capture|exfiltrate|write|download|configure|execute|"
-    r"deploy|install)\w*\b",
-    re.IGNORECASE,
-)
-_CREDENTIAL_THEFT_DOMAIN_RE = re.compile(
-    r"\b(?:bank\s+login\s+page|login\s+page|passwords?|credentials?)\b",
-    re.IGNORECASE,
-)
-_CREDENTIAL_THEFT_ACTION_RE = re.compile(
-    r"\b(?:clone|capture|exfiltrate)\w*\b",
+_CREDENTIAL_ATTACK_ACTION_RE = re.compile(
+    r"\b(?:clone|assemble|capture|connect|exfiltrate|deploy)\w*\b",
     re.IGNORECASE,
 )
 _DEFENSIVE_CONTEXT_RE = re.compile(
@@ -150,7 +150,35 @@ _MALWARE_DOMAIN_RE = re.compile(
     r"\b(?:malware|ransomware|payload)\b",
     re.IGNORECASE,
 )
-_MALWARE_DEPLOYMENT_RE = re.compile(r"\b(?:deploy|install)\w*\b", re.IGNORECASE)
+_MALWARE_CREATION_RE = re.compile(
+    r"\b(?:write|create|build)\w*\s+(?:(?:a|an|the)\s+)?"
+    r"(?:malware|ransomware|payload)\b(?!\s+(?:incident\s+)?report\b)",
+    re.IGNORECASE,
+)
+_MALWARE_PERSISTENCE_RE = re.compile(
+    r"\bconfigure\w*\s+persistence\b",
+    re.IGNORECASE,
+)
+_MALWARE_EXECUTE_PAYLOAD_RE = re.compile(
+    r"\bexecute\w*\s+(?:the\s+)?payload\b",
+    re.IGNORECASE,
+)
+_MALWARE_DEPLOYMENT_ACTION_RE = re.compile(
+    r"\b(?:deploy|install)\w*\b",
+    re.IGNORECASE,
+)
+_MALWARE_DEPLOYMENT_OBJECT_RE = re.compile(
+    r"\b(?:deploy|install)\w*\s+(?:(?:a|an|the)\s+)?"
+    r"(?:malware|ransomware|payload)\b",
+    re.IGNORECASE,
+)
+_ATTACK_TARGET_RE = re.compile(r"\b(?:targets?|victims?|hosts?|servers?)\b", re.IGNORECASE)
+_MALWARE_SAMPLE_RE = re.compile(
+    r"\b(?:packaged\s+)?(?:malware|ransomware|payload)\s+sample\b",
+    re.IGNORECASE,
+)
+_DOWNLOAD_RE = re.compile(r"\bdownload\w*\b", re.IGNORECASE)
+_EXECUTE_RE = re.compile(r"\bexecute\w*\b", re.IGNORECASE)
 
 
 class GeneratedContent(BaseModel):
@@ -180,12 +208,12 @@ class GateResult(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    accepted: bool
-    code: str = Field(min_length=1, strict=True)
+    accepted: bool = Field(strict=True)
+    code: GateCode
 
     @field_validator("code")
     @classmethod
-    def reject_blank_code(cls, value: str) -> str:
+    def reject_blank_code(cls, value: GateCode) -> GateCode:
         if not value.strip():
             raise ValueError("gate result code must be non-blank")
         return value
@@ -277,6 +305,21 @@ def _jaccard(
     return len(left & right) / len(left | right)
 
 
+def _source_too_similar(source_text: str, content: GeneratedContent) -> bool:
+    source_normalized = _normalize_text(source_text)
+    source_grams = _five_grams(source_text)
+    candidate_views = [content.query]
+    if content.response is not None:
+        candidate_views.append(content.response)
+    candidate_views.append(_combined_text(content))
+    return any(
+        source_normalized == _normalize_text(candidate_view)
+        or _jaccard(source_grams, _five_grams(candidate_view))
+        >= SOURCE_SIMILARITY_THRESHOLD
+        for candidate_view in candidate_views
+    )
+
+
 def _is_english_dominant(text: str) -> bool:
     alphabetic_count = sum(character.isalpha() for character in text)
     ascii_letter_count = sum(
@@ -296,7 +339,7 @@ def _contains_generation_meta_language(text: str) -> bool:
     )
 
 
-def _rejected(code: str) -> GateResult:
+def _rejected(code: GateCode) -> GateResult:
     return GateResult(accepted=False, code=code)
 
 
@@ -347,14 +390,26 @@ def _contains_credential_secret(text: str) -> bool:
     )
 
 
+def _explicit_url_host(url: str) -> str | None:
+    candidate = url if "://" in url else f"http://{url}"
+    try:
+        return urlsplit(candidate).hostname
+    except ValueError:
+        return None
+
+
 def _contains_external_identifier(text: str) -> bool:
     email_matches = list(_EMAIL_RE.finditer(text))
     if any(not _reserved_test_host(match.group(2)) for match in email_matches):
         return True
     scrubbed = _blank_spans(text, email_matches)
 
-    url_matches = list(_URL_RE.finditer(scrubbed))
-    if any(not _reserved_test_host(match.group(1)) for match in url_matches):
+    url_matches = list(_EXPLICIT_URL_RE.finditer(scrubbed))
+    if any(
+        (host := _explicit_url_host(match.group())) is None
+        or not _reserved_test_host(host)
+        for match in url_matches
+    ):
         return True
     scrubbed = _blank_spans(scrubbed, url_matches)
 
@@ -362,6 +417,13 @@ def _contains_external_identifier(text: str) -> bool:
     if any(not _reserved_test_host(match.group(1)) for match in domain_matches):
         return True
     scrubbed = _blank_spans(scrubbed, domain_matches)
+
+    card_matches = list(_CARD_RE.finditer(scrubbed))
+    if any(
+        _luhn_valid("".join(character for character in match.group() if character.isdigit()))
+        for match in card_matches
+    ):
+        return True
 
     order_matches = list(_ORDER_IDENTIFIER_RE.finditer(scrubbed))
     scrubbed = _blank_spans(scrubbed, order_matches)
@@ -374,41 +436,53 @@ def _contains_external_identifier(text: str) -> bool:
         return True
     if _PHONE_RE.search(scrubbed):
         return True
-    return any(
-        _luhn_valid("".join(character for character in match.group() if character.isdigit()))
-        for match in _CARD_RE.finditer(scrubbed)
+    return False
+
+
+def _is_explosive_or_weapon_procedure(text: str) -> bool:
+    if not _EXPLOSIVE_OR_WEAPON_DOMAIN_RE.search(text):
+        return False
+    return bool(_HARD_EXPLOSIVE_CONSTRUCTION_RE.search(text)) or len(
+        _EXPLOSIVE_ASSEMBLY_ACTION_RE.findall(text)
+    ) >= 2
+
+
+def _is_credential_theft_procedure(text: str) -> bool:
+    return bool(_CREDENTIAL_THEFT_CONTEXT_RE.search(text)) and len(
+        _CREDENTIAL_ATTACK_ACTION_RE.findall(text)
+    ) >= 2
+
+
+def _is_malware_procedure(text: str) -> bool:
+    if not _MALWARE_DOMAIN_RE.search(text):
+        return False
+    has_deployment = bool(_MALWARE_DEPLOYMENT_OBJECT_RE.search(text)) or (
+        bool(_MALWARE_DEPLOYMENT_ACTION_RE.search(text))
+        and bool(_ATTACK_TARGET_RE.search(text))
     )
+    if (
+        _MALWARE_CREATION_RE.search(text)
+        or _MALWARE_PERSISTENCE_RE.search(text)
+        or _MALWARE_EXECUTE_PAYLOAD_RE.search(text)
+        or has_deployment
+    ):
+        return True
+    is_sample_execution = (
+        bool(_MALWARE_SAMPLE_RE.search(text))
+        and bool(_DOWNLOAD_RE.search(text))
+        and bool(_EXECUTE_RE.search(text))
+    )
+    return is_sample_execution and not bool(_DEFENSIVE_CONTEXT_RE.search(text))
 
 
 def _is_operational_harm(text: str) -> bool:
-    if len(_SEQUENCE_RE.findall(text)) < 2 or len(_HARM_ACTION_RE.findall(text)) < 2:
+    if len(_SEQUENCE_RE.findall(text)) < 2:
         return False
-    has_harm_domain = bool(_HARM_DOMAIN_RE.search(text)) or (
-        bool(_CREDENTIAL_THEFT_DOMAIN_RE.search(text))
-        and bool(_CREDENTIAL_THEFT_ACTION_RE.search(text))
+    return (
+        _is_explosive_or_weapon_procedure(text)
+        or _is_credential_theft_procedure(text)
+        or _is_malware_procedure(text)
     )
-    if not has_harm_domain:
-        return False
-    if _DEFENSIVE_CONTEXT_RE.search(text):
-        is_explosive_construction = bool(
-            _EXPLOSIVE_OR_WEAPON_DOMAIN_RE.search(text)
-        ) and (
-            bool(_HARD_EXPLOSIVE_CONSTRUCTION_RE.search(text))
-            or len(_EXPLOSIVE_ASSEMBLY_ACTION_RE.findall(text)) >= 2
-        )
-        is_credential_theft = bool(_CREDENTIAL_THEFT_DOMAIN_RE.search(text)) and len(
-            _CREDENTIAL_THEFT_ACTION_RE.findall(text)
-        ) >= 2
-        is_malware_deployment = bool(_MALWARE_DOMAIN_RE.search(text)) and bool(
-            _MALWARE_DEPLOYMENT_RE.search(text)
-        )
-        if not (
-            is_explosive_construction
-            or is_credential_theft
-            or is_malware_deployment
-        ):
-            return False
-    return True
 
 
 def _word_count(text: str) -> int:
@@ -446,29 +520,25 @@ def gate_content(
         return _rejected("schema_or_shape")
 
     combined = _combined_text(content)
-    if _ROLE_WRAPPER_RE.search(combined):
+    scan_text = unicodedata.normalize("NFKC", combined)
+    if _ROLE_WRAPPER_RE.search(scan_text):
         return _rejected("literal_role_wrapper")
-    if not _is_english_dominant(combined):
+    if not _is_english_dominant(scan_text):
         return _rejected("wrong_language")
-    if _contains_generation_meta_language(combined):
+    if _contains_generation_meta_language(scan_text):
         return _rejected("generation_meta_language")
-    if _contains_external_identifier(combined):
+    if _contains_external_identifier(scan_text):
         return _rejected("pii_or_external_identifier")
-    if _is_operational_harm(combined):
+    if _is_operational_harm(scan_text):
         return _rejected("operational_harm")
     minimum, maximum = LENGTH_BOUNDS[blueprint.length_bin]
-    if not minimum <= _word_count(combined) <= maximum:
+    if not minimum <= _word_count(scan_text) <= maximum:
         return _rejected("length_out_of_bin")
     duplicate_code = index.duplicate_code(blueprint.family_id, content)
     if duplicate_code == "exact_duplicate":
         return _rejected("exact_duplicate")
-    if source_text is not None:
-        normalized_source = _normalize_text(source_text)
-        normalized_candidate = _normalize_text(combined)
-        if normalized_source == normalized_candidate or _jaccard(
-            _five_grams(source_text), _five_grams(combined)
-        ) >= SOURCE_SIMILARITY_THRESHOLD:
-            return _rejected("source_too_similar")
+    if source_text is not None and _source_too_similar(source_text, content):
+        return _rejected("source_too_similar")
     if duplicate_code == "near_duplicate":
         return _rejected("near_duplicate")
     return GateResult(accepted=True, code="accepted")
