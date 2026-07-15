@@ -69,18 +69,6 @@ def _tool_environment(tmp_path: Path) -> Path:
             }
         ],
     )
-    _write_jsonl(
-        tmp_path / "content_history.jsonl",
-        [
-            {
-                "content_id": "content-1",
-                "recent_contents": ["DM me for a private price."],
-                "account_signals": ["repeated off-platform solicitation"],
-                "source_type": "synthetic_fixture",
-                "source_id": "history-source-1",
-            }
-        ],
-    )
     return tmp_path
 
 
@@ -203,21 +191,21 @@ def test_tool_environment_rejects_duplicate_record_ids(tmp_path: Path) -> None:
     from risk_agent.singguard_tools import ToolEnvironment
 
     root = _tool_environment(tmp_path)
-    with (root / "content_history.jsonl").open("a", encoding="utf-8") as handle:
+    with (root / "cases.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(
             json.dumps(
                 {
-                    "content_id": "content-1",
-                    "recent_contents": ["Conflicting duplicate."],
-                    "account_signals": [],
+                    "case_id": "case-1",
+                    "text": "Conflicting duplicate.",
+                    "summary": "Duplicate case.",
                     "source_type": "synthetic_fixture",
-                    "source_id": "history-source-duplicate",
+                    "source_id": "case-source-duplicate",
                 }
             )
             + "\n"
         )
 
-    with pytest.raises(ValueError, match="duplicate content IDs"):
+    with pytest.raises(ValueError, match="duplicate case IDs"):
         ToolEnvironment.load(root)
 
 
@@ -255,6 +243,29 @@ def test_tools_json_uses_ms_swift_function_schema() -> None:
         "inspect_destination",
     ]
     assert all(item["type"] == "function" for item in payload)
+
+
+def test_content_context_tool_is_not_registered_or_executable(tmp_path: Path) -> None:
+    import pytest
+
+    from risk_agent.singguard_tools import TOOL_SPECS, ToolCall, ToolEnvironment, tools_json
+
+    assert set(TOOL_SPECS) == {
+        "search_cases",
+        "verify_claim",
+        "inspect_destination",
+    }
+    with pytest.raises(ValueError, match="unknown tool name"):
+        tools_json(("get_content_context",))
+
+    environment = ToolEnvironment.load(_tool_environment(tmp_path))
+    result = environment.execute(
+        ToolCall(name="get_content_context", arguments={"content_id": "content-1"})
+    )
+    assert json.loads(result.to_content()) == {
+        "status": "error",
+        "error": "unknown_tool",
+    }
 
 
 def test_verify_claim_drops_records_with_only_one_shared_token(tmp_path: Path) -> None:

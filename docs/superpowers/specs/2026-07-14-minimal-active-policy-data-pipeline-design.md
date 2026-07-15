@@ -146,7 +146,6 @@ deterministic, local functions such as:
 
 - `search_policy(query)`;
 - `search_cases(query)`;
-- `inspect_content_history(content_id)`.
 
 The tool descriptions are injected into the complete prompt. Gemini chooses a
 tool and arguments. The local runner executes the tool, appends the real tool
@@ -203,7 +202,6 @@ The initial tool set is:
 - `verify_claim` for evidence relevant to efficacy and factual claims;
 - `inspect_destination` for links, handles, and obfuscated off-platform
   destinations;
-- `get_content_context` for deterministic account and related-content history.
 
 Tool results return evidence, not the final safe/unsafe label. This prevents the
 student from learning to copy a label emitted by the environment.

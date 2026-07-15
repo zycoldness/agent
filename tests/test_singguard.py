@@ -103,7 +103,7 @@ def test_required_tool_sequence_is_explicit_in_the_system_prompt() -> None:
         policy_id="policy-1",
         thinking_type="slow",
         query="Inspect this ambiguous content.",
-        tool_names=("inspect_destination", "get_content_context"),
+        tool_names=("inspect_destination", "search_cases"),
         tool_policy="required",
     )
 
@@ -111,9 +111,9 @@ def test_required_tool_sequence_is_explicit_in_the_system_prompt() -> None:
 
     assert "You MUST call every tool below exactly once" in system
     assert "1. inspect_destination" in system
-    assert "2. get_content_context" in system
+    assert "2. search_cases" in system
     assert system.index("1. inspect_destination") < system.index(
-        "2. get_content_context"
+        "2. search_cases"
     )
     assert "Only after the final tool response" in system
     assert "Copy every identifier and indicator verbatim" in system

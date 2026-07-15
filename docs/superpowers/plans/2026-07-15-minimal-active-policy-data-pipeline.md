@@ -170,7 +170,6 @@ git commit -m "feat: validate Gemini SingGuard completions"
 - Create: `data/tool_env/cases.jsonl`
 - Create: `data/tool_env/claim_evidence.jsonl`
 - Create: `data/tool_env/destinations.jsonl`
-- Create: `data/tool_env/content_history.jsonl`
 
 - [ ] **Step 1: Write failing protocol tests**
 
@@ -200,7 +199,7 @@ Expected: module import failure.
 ```python
 class ToolCall(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
-    name: Literal["search_cases", "verify_claim", "inspect_destination", "get_content_context"]
+    name: Literal["search_cases", "verify_claim", "inspect_destination"]
     arguments: dict[str, object]
 
 class ToolResult(BaseModel):
@@ -223,7 +222,7 @@ Use normalized-token overlap plus stable ID tie-breaking for cases/evidence, nor
 
 - [ ] **Step 5: Add tool data**
 
-Add at least eight case rows, eight claim-evidence rows, eight destinations, and six histories. Include success, empty, benign-exception, and conflicting-evidence records with `source_type` and `source_id`.
+Add at least eight case rows, eight claim-evidence rows, and eight destinations. Include success, empty, benign-exception, and conflicting-evidence records with `source_type` and `source_id`.
 
 - [ ] **Step 6: Test and commit**
 
@@ -247,7 +246,7 @@ git commit -m "feat: add deterministic risk-agent tools"
 def test_two_tools_then_final(policy, sample, environment) -> None:
     provider = FakeAgentProvider(turns=[
         AgentTurn(tool_call=ToolCall(name="inspect_destination", arguments={"indicator": "w-h-a-t-s-a-p-p:user123"})),
-        AgentTurn(tool_call=ToolCall(name="get_content_context", arguments={"content_id": "content-1"})),
+        AgentTurn(tool_call=ToolCall(name="search_cases", arguments={"query": "private price"})),
         AgentTurn(content="unsafe\\n<answer>Off-Platform Solicitation</answer>"),
     ])
     generated = generate_example(policy, sample, provider, environment, max_tool_calls=2)

@@ -105,9 +105,9 @@ The local environment returns one compact result:
 {"status":"ok","result":{"verdict":"unsupported"}}
 ```
 
-Supported tools are `search_cases`, `verify_claim`, `inspect_destination`, and
-`get_content_context`. The final answer is normal SingGuard text, not another
-tool call. In ms-swift JSONL, calls and results use the `tool_call` and
+Supported tools are `search_cases`, `verify_claim`, and `inspect_destination`.
+The final answer is normal SingGuard text, not another tool call. In ms-swift
+JSONL, calls and results use the `tool_call` and
 `tool_response` roles, while the top-level `tools` field is a JSON string.
 For a required trajectory, the sample lists tools in execution order and the
 pipeline rejects missing, extra, or reordered calls.

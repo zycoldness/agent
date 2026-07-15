@@ -72,7 +72,7 @@ def test_bundled_smoke_plan_has_complete_hidden_oracles_and_tool_targets() -> No
     assert len(samples) == 6
     assert all(sample.expected_label is not None for sample in samples)
     assert sum(sample.thinking_type == "slow" for sample in samples) == 4
-    assert sum(sample.tool_policy == "required" for sample in samples) == 3
+    assert sum(sample.tool_policy == "required" for sample in samples) == 2
     assert all(
         sample.tool_names for sample in samples if sample.tool_policy == "required"
     )
@@ -94,7 +94,7 @@ def test_agent_executes_two_tools_then_records_final_completion() -> None:
         policy_id="commerce-v1",
         thinking_type="fast",
         query="Contact w-h-a-t-s-a-p-p:user123 for the private price.",
-        tool_names=("inspect_destination", "get_content_context"),
+        tool_names=("inspect_destination", "search_cases"),
     )
     provider = FakeAgentProvider(
         turns=[
@@ -106,8 +106,8 @@ def test_agent_executes_two_tools_then_records_final_completion() -> None:
             ),
             AgentTurn(
                 tool_call=ToolCall(
-                    name="get_content_context",
-                    arguments={"content_id": "content-0001"},
+                    name="search_cases",
+                    arguments={"query": "private price"},
                 )
             ),
             AgentTurn(
@@ -132,7 +132,7 @@ def test_agent_executes_two_tools_then_records_final_completion() -> None:
     ]
     assert generated.completion.startswith("unsafe")
     assert provider.received_results[0]["status"] == "ok"
-    assert provider.received_results[1]["result"]["content_id"] == "content-0001"
+    assert provider.received_results[1]["results"][0]["case_id"] == "case-0003"
 
 
 def test_agent_accepts_direct_no_tool_completion() -> None:
@@ -894,7 +894,7 @@ def test_batch_preflights_every_required_tool_limit_before_generation(
             policy_id="commerce-v1",
             thinking_type="fast",
             query="Inspect both sources.",
-            tool_names=("inspect_destination", "get_content_context"),
+            tool_names=("inspect_destination", "search_cases"),
             tool_policy="required",
         ),
     )
@@ -1303,7 +1303,7 @@ def test_manifest_counts_accepted_modes_and_required_tool_coverage(tmp_path: Pat
     checkpoint = json.loads(
         (output / "checkpoint.json").read_text(encoding="utf-8")
     )
-    assert checkpoint["contract_version"] == "singguard-active-policy-v3"
+    assert checkpoint["contract_version"] == "singguard-active-policy-v4"
     assert manifest["attempted_tool_call_count"] == 1
     assert manifest["accepted_tool_call_count"] == 1
     assert "tool_call_count" not in manifest

@@ -71,16 +71,6 @@ class _DestinationRecord(BaseModel):
     source_id: str = Field(min_length=1)
 
 
-class _HistoryRecord(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    content_id: str = Field(min_length=1)
-    recent_contents: tuple[str, ...]
-    account_signals: tuple[str, ...]
-    source_type: str = Field(min_length=1)
-    source_id: str = Field(min_length=1)
-
-
 class _SearchCasesArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -100,12 +90,6 @@ class _InspectDestinationArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     indicator: str = Field(min_length=1)
-
-
-class _ContentContextArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    content_id: str = Field(min_length=1)
 
 
 def _function(
@@ -156,14 +140,6 @@ TOOL_SPECS: dict[str, dict[str, object]] = {
             "indicator": {"type": "string", "description": "The destination indicator from the content."},
         },
         ["indicator"],
-    ),
-    "get_content_context": _function(
-        "get_content_context",
-        "Return deterministic account and related-content history for one content ID. Copy the content ID verbatim from the supplied conversation.",
-        {
-            "content_id": {"type": "string", "description": "Stable content identifier."},
-        },
-        ["content_id"],
     ),
 }
 
@@ -248,14 +224,12 @@ class ToolEnvironment:
         cases: tuple[_CaseRecord, ...],
         claims: tuple[_ClaimRecord, ...],
         destinations: tuple[_DestinationRecord, ...],
-        histories: tuple[_HistoryRecord, ...],
         fingerprint: str,
     ) -> None:
         record_ids = (
             ("case", [record.case_id for record in cases]),
             ("evidence", [record.evidence_id for record in claims]),
             ("destination", [record.destination_id for record in destinations]),
-            ("content", [record.content_id for record in histories]),
         )
         for label, values in record_ids:
             if len(values) != len(set(values)):
@@ -263,7 +237,6 @@ class ToolEnvironment:
         self._cases = cases
         self._claims = claims
         self._destinations = destinations
-        self._histories = histories
         self.fingerprint = fingerprint
         destination_index: dict[str, _DestinationRecord] = {}
         for record in destinations:
@@ -280,8 +253,6 @@ class ToolEnvironment:
                     )
                 destination_index[normalized] = record
         self._destination_index = destination_index
-        self._history_index = {record.content_id: record for record in histories}
-
     @classmethod
     def load(cls, root: Path) -> "ToolEnvironment":
         paths = tuple(
@@ -290,7 +261,6 @@ class ToolEnvironment:
                 "cases.jsonl",
                 "claim_evidence.jsonl",
                 "destinations.jsonl",
-                "content_history.jsonl",
             )
         )
         digest = hashlib.sha256()
@@ -304,7 +274,6 @@ class ToolEnvironment:
             cases=tuple(_read_records(root / "cases.jsonl", _CaseRecord)),
             claims=tuple(_read_records(root / "claim_evidence.jsonl", _ClaimRecord)),
             destinations=tuple(_read_records(root / "destinations.jsonl", _DestinationRecord)),
-            histories=tuple(_read_records(root / "content_history.jsonl", _HistoryRecord)),
             fingerprint=digest.hexdigest(),
         )
 
@@ -321,10 +290,6 @@ class ToolEnvironment:
             if call.name == "inspect_destination":
                 return self._inspect_destination(
                     _InspectDestinationArgs.model_validate(call.arguments)
-                )
-            if call.name == "get_content_context":
-                return self._get_content_context(
-                    _ContentContextArgs.model_validate(call.arguments)
                 )
         except ValidationError:
             return self._error("invalid_arguments")
@@ -390,23 +355,6 @@ class ToolEnvironment:
                     "destination_id": record.destination_id,
                     "destination_type": record.destination_type,
                     "risk_signals": list(record.risk_signals),
-                    "source_id": record.source_id,
-                    "source_type": record.source_type,
-                }
-            },
-        )
-
-    def _get_content_context(self, args: _ContentContextArgs) -> ToolResult:
-        record = self._history_index.get(args.content_id)
-        if record is None:
-            return ToolResult(status="not_found", payload={"result": None})
-        return ToolResult(
-            status="ok",
-            payload={
-                "result": {
-                    "content_id": record.content_id,
-                    "recent_contents": list(record.recent_contents),
-                    "account_signals": list(record.account_signals),
                     "source_id": record.source_id,
                     "source_type": record.source_type,
                 }

@@ -1021,7 +1021,7 @@ def run_generation_batch(
         if isinstance(provider_model, str) and provider_model:
             provider_info["model"] = provider_model
     fingerprints: dict[str, object] = {
-        "contract_version": "singguard-active-policy-v3",
+        "contract_version": "singguard-active-policy-v4",
         "policy_sha256": _fingerprint(
             [policy.model_dump(mode="json") for policy in policies]
         ),

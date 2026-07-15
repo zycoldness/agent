@@ -30,8 +30,7 @@ The deterministic tool environment is stored under `data/tool_env`:
 
 - `cases.jsonl` for `search_cases`;
 - `claim_evidence.jsonl` for `verify_claim`;
-- `destinations.jsonl` for `inspect_destination`;
-- `content_history.jsonl` for `get_content_context`.
+- `destinations.jsonl` for `inspect_destination`.
 
 These records are fixtures, not production evidence.
 
