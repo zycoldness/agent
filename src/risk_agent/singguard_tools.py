@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from pathlib import Path
 from typing import Any, Literal
@@ -248,11 +249,13 @@ class ToolEnvironment:
         claims: tuple[_ClaimRecord, ...],
         destinations: tuple[_DestinationRecord, ...],
         histories: tuple[_HistoryRecord, ...],
+        fingerprint: str,
     ) -> None:
         self._cases = cases
         self._claims = claims
         self._destinations = destinations
         self._histories = histories
+        self.fingerprint = fingerprint
         self._destination_index = {
             _normalize_indicator(indicator): record
             for record in destinations
@@ -262,11 +265,28 @@ class ToolEnvironment:
 
     @classmethod
     def load(cls, root: Path) -> "ToolEnvironment":
+        paths = tuple(
+            root / name
+            for name in (
+                "cases.jsonl",
+                "claim_evidence.jsonl",
+                "destinations.jsonl",
+                "content_history.jsonl",
+            )
+        )
+        digest = hashlib.sha256()
+        try:
+            for path in paths:
+                digest.update(path.name.encode("utf-8"))
+                digest.update(path.read_bytes())
+        except OSError:
+            raise ValueError("cannot read tool environment snapshot") from None
         return cls(
             cases=tuple(_read_records(root / "cases.jsonl", _CaseRecord)),
             claims=tuple(_read_records(root / "claim_evidence.jsonl", _ClaimRecord)),
             destinations=tuple(_read_records(root / "destinations.jsonl", _DestinationRecord)),
             histories=tuple(_read_records(root / "content_history.jsonl", _HistoryRecord)),
+            fingerprint=digest.hexdigest(),
         )
 
     @staticmethod

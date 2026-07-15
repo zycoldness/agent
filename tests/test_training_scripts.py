@@ -79,9 +79,7 @@ def test_opsd_script_is_a_direct_gkd_command() -> None:
     assert "--remove_unused_columns false" in script
 
 
-def test_singguard_generation_cli_help_and_plan_only_need_no_credentials(
-    tmp_path, monkeypatch
-) -> None:
+def test_singguard_generation_cli_help_needs_no_credentials(monkeypatch) -> None:
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_GENAI_USE_VERTEXAI", raising=False)
@@ -92,31 +90,12 @@ def test_singguard_generation_cli_help_and_plan_only_need_no_credentials(
         capture_output=True,
         check=False,
     )
-    output = tmp_path / "plan"
-    plan_result = subprocess.run(
-        [
-            sys.executable,
-            "scripts/generate_singguard_data.py",
-            str(output),
-            "--anchors",
-            "100",
-            "--seed",
-            "42",
-            "--plan-only",
-        ],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
     assert help_result.returncode == 0, help_result.stderr
-    assert plan_result.returncode == 0, plan_result.stderr
-    rows = (output / "plan.jsonl").read_text(encoding="utf-8").splitlines()
-    assert len(rows) == 100
-    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["status"] == "planned"
-    assert manifest["planned_anchors"] == 100
+    assert "active_policies" in help_result.stdout
+    assert "content_samples" in help_result.stdout
+    assert "--max-tool-calls" in help_result.stdout
+    assert "--resume" in help_result.stdout
+    assert "--anchors" not in help_result.stdout
 
 
 def test_singguard_progress_bar_is_terminal_friendly() -> None:

@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Protocol
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from risk_agent.singguard import (
     ActivePolicy,
@@ -15,6 +19,7 @@ from risk_agent.singguard import (
     ModerationSample,
     ParsedCompletion,
     build_initial_messages,
+    render_training_row,
     validate_completion,
 )
 from risk_agent.singguard_tools import (
@@ -24,9 +29,11 @@ from risk_agent.singguard_tools import (
     tool_declarations,
     tools_json,
 )
+from risk_agent.singguard_prompts import prompt_sha256
 from risk_agent.teacher import (
     GeminiTeacher,
     TeacherBudget,
+    TeacherBudgetExceeded,
     TeacherRequestError,
     TeacherUsage,
     _UsageAccumulator,
@@ -77,6 +84,22 @@ class GeneratedExample(BaseModel):
     completion: str
     parsed: ParsedCompletion
     tools_json: str | None = None
+
+
+class GenerationRejected(ValueError):
+    """One candidate failed deterministic validation."""
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        candidate: str | None = None,
+        trajectory: tuple[Message, ...] = (),
+    ) -> None:
+        super().__init__(code)
+        self.code = code
+        self.candidate = candidate
+        self.trajectory = trajectory
 
 
 class GeminiAgentProvider(GeminiTeacher):
@@ -261,6 +284,51 @@ class GeminiAgentProvider(GeminiTeacher):
         response = self._send(part)
         return self._to_turn(response)
 
+    def repair(
+        self,
+        *,
+        system: str,
+        user: str,
+        candidate: str,
+        validation_code: str,
+    ) -> AgentTurn:
+        """Make one fresh, tool-free request that only repairs output grammar."""
+
+        types = self._types()
+        repair_instruction = (
+            "\n\n# Output Repair\n"
+            "The previous candidate failed deterministic validation. Preserve its "
+            "moderation judgment, but return only a completion that exactly follows "
+            "the required SingGuard output grammar. Do not call tools, add commentary, "
+            "or introduce policy categories that are not active."
+        )
+        repair_user = (
+            f"{user}\n\n[validation_error]: {validation_code}"
+            f"\n[rejected_candidate]:\n{candidate}"
+        )
+        try:
+            client = self._new_client()
+            self._chat = client.chats.create(
+                model=self.model,
+                config=types.GenerateContentConfig(
+                    system_instruction=system + repair_instruction,
+                    temperature=0.0,
+                    max_output_tokens=self._max_output_tokens,
+                ),
+            )
+        except Exception:
+            raise TeacherRequestError(
+                "Gemini repair client initialization failed",
+                TeacherUsage(
+                    provider="gemini",
+                    model=self.model,
+                    request_count=0,
+                    accounting_complete=False,
+                ),
+            ) from None
+        self._context_text = f"{system}{repair_instruction}\n{repair_user}"
+        return self._to_turn(self._send(repair_user))
+
 
 def _tool_call_content(call: ToolCall) -> str:
     return json.dumps(
@@ -268,6 +336,30 @@ def _tool_call_content(call: ToolCall) -> str:
         ensure_ascii=False,
         separators=(",", ":"),
         allow_nan=False,
+    )
+
+
+def _validation_code(error: ValueError) -> str:
+    message = str(error)
+    if "active policy" in message:
+        return "inactive_answer"
+    if "policy order" in message:
+        return "slow_rule_order"
+    if "grammar" in message:
+        return "output_grammar"
+    return "completion_validation"
+
+
+def _validate_candidate(
+    completion: str,
+    *,
+    policy: ActivePolicy,
+    sample: ModerationSample,
+) -> ParsedCompletion:
+    return validate_completion(
+        completion,
+        thinking_type=sample.thinking_type,
+        active_titles=tuple(rule.title for rule in policy.rules),
     )
 
 
@@ -317,11 +409,14 @@ def generate_example(
     completion = turn.content
     if completion is None:
         raise ValueError("agent did not produce a final completion")
-    parsed = validate_completion(
-        completion,
-        thinking_type=sample.thinking_type,
-        active_titles=tuple(rule.title for rule in policy.rules),
-    )
+    try:
+        parsed = _validate_candidate(completion, policy=policy, sample=sample)
+    except ValueError as error:
+        raise GenerationRejected(
+            _validation_code(error),
+            candidate=completion,
+            trajectory=tuple(trajectory),
+        ) from None
     return GeneratedExample(
         initial_messages=initial,
         trajectory=tuple(trajectory),
@@ -329,3 +424,383 @@ def generate_example(
         parsed=parsed,
         tools_json=serialized_tools,
     )
+
+
+def _atomic_json(path: Path, payload: object) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _atomic_jsonl(path: Path, rows: Sequence[object]) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        for row in rows:
+            handle.write(
+                json.dumps(
+                    row,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n"
+            )
+    os.replace(temporary, path)
+
+
+def _fingerprint(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _sanitize_candidate(candidate: str | None, *, limit: int = 2048) -> str | None:
+    if candidate is None:
+        return None
+    sanitized = re.sub(
+        r"(?i)\b(api[_-]?key|access[_-]?token|token|secret)\s*[:=]\s*[^\s,;]+",
+        lambda match: f"{match.group(1)}=[REDACTED]",
+        candidate,
+    )
+    sanitized = re.sub(
+        r"(?i)\bbearer\s+[a-z0-9._~+/=-]+",
+        "Bearer [REDACTED]",
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+        "[REDACTED_EMAIL]",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    if len(sanitized) > limit:
+        sanitized = sanitized[:limit] + "...[truncated]"
+    return sanitized
+
+
+def _read_json(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise ValueError(f"cannot read resume artifact {path.name}") from None
+    if not isinstance(payload, dict):
+        raise ValueError(f"resume artifact {path.name} must contain an object")
+    return payload
+
+
+def _read_jsonl(path: Path) -> list[dict[str, object]]:
+    try:
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except (OSError, json.JSONDecodeError):
+        raise ValueError(f"cannot read resume artifact {path.name}") from None
+    if not all(isinstance(row, dict) for row in rows):
+        raise ValueError(f"resume artifact {path.name} must contain objects")
+    return rows
+
+
+def _restore_budget(budget: TeacherBudget, payload: object) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError("resume checkpoint has invalid budget accounting")
+    request_count = payload.get("request_count")
+    input_tokens = payload.get("input_tokens")
+    output_tokens = payload.get("output_tokens")
+    estimated_cost = payload.get("estimated_cost_usd")
+    accounting_complete = payload.get("accounting_complete")
+    if not (
+        all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in (request_count, input_tokens, output_tokens)
+        )
+        and isinstance(estimated_cost, (int, float))
+        and not isinstance(estimated_cost, bool)
+        and estimated_cost >= 0
+        and isinstance(accounting_complete, bool)
+    ):
+        raise ValueError("resume checkpoint has invalid budget accounting")
+    if budget.max_requests is not None and request_count > budget.max_requests:
+        raise ValueError("resume request budget is below prior usage")
+    if (
+        budget.max_estimated_cost_usd is not None
+        and float(estimated_cost) > budget.max_estimated_cost_usd
+    ):
+        raise ValueError("resume cost budget is below prior usage")
+    budget.request_count = request_count
+    budget.input_tokens = input_tokens
+    budget.output_tokens = output_tokens
+    budget.estimated_cost_usd = float(estimated_cost)
+    budget.accounting_complete = accounting_complete
+
+
+def _load_jsonl(path: Path, model: type[BaseModel], label: str) -> tuple[BaseModel, ...]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        raise ValueError(f"cannot read {label} JSONL") from None
+    records: list[BaseModel] = []
+    try:
+        for line in lines:
+            if line.strip():
+                records.append(model.model_validate_json(line))
+    except (ValidationError, ValueError):
+        raise ValueError(f"{label} JSONL contains an invalid record") from None
+    if not records:
+        raise ValueError(f"{label} JSONL is empty")
+    return tuple(records)
+
+
+def load_active_policies(path: Path) -> tuple[ActivePolicy, ...]:
+    records = tuple(_load_jsonl(path, ActivePolicy, "active policy"))
+    if len({record.policy_id for record in records}) != len(records):
+        raise ValueError("active policy IDs must be unique")
+    return records
+
+
+def load_moderation_samples(path: Path) -> tuple[ModerationSample, ...]:
+    records = tuple(_load_jsonl(path, ModerationSample, "content sample"))
+    if len({record.sample_id for record in records}) != len(records):
+        raise ValueError("sample IDs must be unique")
+    return records
+
+
+def run_generation_batch(
+    *,
+    policies: Sequence[ActivePolicy],
+    samples: Sequence[ModerationSample],
+    provider: AgentProvider,
+    environment: ToolEnvironment,
+    output_dir: Path,
+    budget: TeacherBudget,
+    max_tool_calls: int = 2,
+    resume: bool = False,
+    progress: Callable[[dict[str, object]], object] | None = None,
+) -> dict[str, object]:
+    """Generate one immutable ms-swift batch from reviewed prompts."""
+
+    if output_dir.exists() and not resume:
+        raise ValueError("output directory must not exist")
+    if resume and not output_dir.is_dir():
+        raise ValueError("resume output directory does not exist")
+    policy_by_id = {policy.policy_id: policy for policy in policies}
+    if len(policy_by_id) != len(policies):
+        raise ValueError("active policy IDs must be unique")
+    if len({sample.sample_id for sample in samples}) != len(samples):
+        raise ValueError("sample IDs must be unique")
+    if any(sample.policy_id not in policy_by_id for sample in samples):
+        raise ValueError("sample references an unknown active policy")
+    fingerprints: dict[str, object] = {
+        "policy_sha256": _fingerprint(
+            [policy.model_dump(mode="json") for policy in policies]
+        ),
+        "sample_sha256": _fingerprint(
+            [sample.model_dump(mode="json") for sample in samples]
+        ),
+        "tool_environment_sha256": environment.fingerprint,
+        "prompt_sha256": prompt_sha256("guard"),
+    }
+    if resume:
+        checkpoint = _read_json(output_dir / "checkpoint.json")
+        for name, expected in fingerprints.items():
+            if checkpoint.get(name) != expected:
+                raise ValueError(f"resume {name} does not match")
+        completed = checkpoint.get("completed_samples")
+        if not isinstance(completed, int) or not 0 <= completed <= len(samples):
+            raise ValueError("resume checkpoint has invalid completed sample count")
+        accepted_rows = _read_jsonl(output_dir / "train.jsonl")
+        rejected_rows = _read_jsonl(output_dir / "rejected.jsonl")
+        repaired = checkpoint.get("repaired_samples", 0)
+        if not isinstance(repaired, int) or not 0 <= repaired <= len(accepted_rows):
+            raise ValueError("resume checkpoint has invalid repaired sample count")
+        _restore_budget(budget, checkpoint.get("budget"))
+    else:
+        output_dir.mkdir(parents=True, exist_ok=False)
+        accepted_rows = []
+        rejected_rows = []
+        completed = 0
+        repaired = 0
+        _atomic_jsonl(output_dir / "train.jsonl", accepted_rows)
+        _atomic_jsonl(output_dir / "rejected.jsonl", rejected_rows)
+        _atomic_json(
+            output_dir / "checkpoint.json",
+            {
+                "completed_samples": completed,
+                "repaired_samples": repaired,
+                "budget": budget.as_dict(),
+                **fingerprints,
+            },
+        )
+    stopped_reason: str | None = None
+
+    def emit(phase: str, sample_id: str | None = None) -> None:
+        if progress is None:
+            return
+        event: dict[str, object] = {
+            "phase": phase,
+            "completed": completed,
+            "total": len(samples),
+            "accepted": len(accepted_rows),
+            "rejected": len(rejected_rows),
+            "requests": budget.request_count,
+        }
+        if sample_id is not None:
+            event["sample_id"] = sample_id
+        try:
+            progress(event)
+        except Exception:
+            pass
+
+    emit("start")
+    for sample in samples[completed:]:
+        emit("generate", sample.sample_id)
+        try:
+            generated = generate_example(
+                policy_by_id[sample.policy_id],
+                sample,
+                provider,
+                environment,
+                max_tool_calls=max_tool_calls,
+            )
+        except GenerationRejected as error:
+            repair = getattr(provider, "repair", None)
+            repaired_candidate: str | None = None
+            repair_code: str | None = None
+            if callable(repair) and error.candidate is not None:
+                initial = build_initial_messages(
+                    policy_by_id[sample.policy_id], sample
+                )
+                try:
+                    repair_turn = repair(
+                        system=initial[0].content,
+                        user=initial[1].content,
+                        candidate=error.candidate,
+                        validation_code=error.code,
+                    )
+                    if not isinstance(repair_turn, AgentTurn):
+                        raise ValueError("repair provider returned an invalid turn")
+                    if repair_turn.tool_call is not None or repair_turn.content is None:
+                        raise ValueError("repair must return final text without tools")
+                    repaired_candidate = repair_turn.content
+                    _validate_candidate(
+                        repaired_candidate,
+                        policy=policy_by_id[sample.policy_id],
+                        sample=sample,
+                    )
+                except TeacherBudgetExceeded as budget_error:
+                    stopped_reason = budget_error.reason
+                    break
+                except TeacherRequestError:
+                    stopped_reason = "provider_error"
+                    break
+                except ValueError as repair_error:
+                    repair_code = _validation_code(repair_error)
+                else:
+                    accepted_rows.append(
+                        render_training_row(
+                            initial,
+                            repaired_candidate,
+                            tools_json=(
+                                tools_json(sample.tool_names)
+                                if sample.tool_names
+                                else None
+                            ),
+                            trajectory=error.trajectory,
+                        )
+                    )
+                    repaired += 1
+            if repaired_candidate is None or repair_code is not None:
+                codes = [error.code]
+                if repair_code is not None:
+                    codes.append(f"repair_{repair_code}")
+                rejected_rows.append(
+                    {
+                        "sample_id": sample.sample_id,
+                        "codes": codes,
+                        "candidate": _sanitize_candidate(error.candidate),
+                        "repaired_candidate": _sanitize_candidate(repaired_candidate),
+                        "trajectory": [
+                            message.model_dump(mode="json")
+                            for message in error.trajectory
+                        ],
+                    }
+                )
+        except TeacherBudgetExceeded as error:
+            stopped_reason = error.reason
+            break
+        except TeacherRequestError:
+            stopped_reason = "provider_error"
+            break
+        else:
+            accepted_rows.append(
+                render_training_row(
+                    generated.initial_messages,
+                    generated.completion,
+                    tools_json=generated.tools_json,
+                    trajectory=generated.trajectory,
+                )
+            )
+        completed += 1
+        _atomic_jsonl(output_dir / "train.jsonl", accepted_rows)
+        _atomic_jsonl(output_dir / "rejected.jsonl", rejected_rows)
+        _atomic_json(
+            output_dir / "checkpoint.json",
+            {
+                "completed_samples": completed,
+                "repaired_samples": repaired,
+                "budget": budget.as_dict(),
+                **fingerprints,
+            },
+        )
+        emit("sample_complete", sample.sample_id)
+
+    status = "complete" if stopped_reason is None and completed == len(samples) else "incomplete"
+    manifest: dict[str, object] = {
+        "schema": "singguard-active-policy-batch-v1",
+        "status": status,
+        "reason": stopped_reason,
+        "planned_samples": len(samples),
+        "completed_samples": completed,
+        "accepted_samples": len(accepted_rows),
+        "repaired_samples": repaired,
+        "rejected_samples": len(rejected_rows),
+        "thinking_type_counts": {
+            mode: sum(sample.thinking_type == mode for sample in samples[:completed])
+            for mode in ("fast", "slow")
+        },
+        "tool_call_count": sum(
+            message["role"] == "tool_call"
+            for row in accepted_rows
+            for message in row["messages"]
+        ),
+        "budget": budget.as_dict(),
+    }
+    _atomic_json(output_dir / "manifest.json", manifest)
+    _atomic_json(
+        output_dir / "checkpoint.json",
+        {
+            "completed_samples": completed,
+            "repaired_samples": repaired,
+            "budget": budget.as_dict(),
+            **fingerprints,
+        },
+    )
+    emit("complete" if status == "complete" else "incomplete")
+    return manifest

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ import pytest
 from risk_agent.contracts import PolicyRule
 from risk_agent.singguard import ActivePolicy, ModerationSample
 from risk_agent.singguard_tools import ToolCall, ToolEnvironment, ToolResult
+from risk_agent.teacher import TeacherBudgetExceeded
 
 
 class FakeAgentProvider:
@@ -273,3 +275,189 @@ def test_gemini_adapter_maps_function_call_and_response() -> None:
     }
     assert captured["config"]["system_instruction"] == "system prompt"
     assert budget.as_dict()["request_count"] == 2
+
+
+def test_batch_writes_accepted_rows_and_specific_rejection(tmp_path: Path) -> None:
+    from risk_agent.singguard_generation import AgentTurn, run_generation_batch
+    from risk_agent.teacher import TeacherBudget
+
+    samples = (
+        ModerationSample(
+            sample_id="accepted-safe",
+            policy_id="commerce-v1",
+            thinking_type="fast",
+            query="Neutral content.",
+        ),
+        ModerationSample(
+            sample_id="accepted-unsafe",
+            policy_id="commerce-v1",
+            thinking_type="fast",
+            query="Message me privately.",
+        ),
+        ModerationSample(
+            sample_id="rejected-inactive",
+            policy_id="commerce-v1",
+            thinking_type="fast",
+            query="Unknown category.",
+        ),
+    )
+    provider = FakeAgentProvider(
+        turns=[
+            AgentTurn(content="safe\n<answer>Safe</answer>"),
+            AgentTurn(
+                content="unsafe\n<answer>Off-Platform Solicitation</answer>"
+            ),
+            AgentTurn(content="unsafe\n<answer>Unknown Rule</answer>"),
+        ]
+    )
+    output = tmp_path / "batch"
+
+    manifest = run_generation_batch(
+        policies=(_policy(),),
+        samples=samples,
+        provider=provider,
+        environment=_environment(),
+        output_dir=output,
+        budget=TeacherBudget(max_requests=10),
+    )
+
+    train_rows = [json.loads(line) for line in (output / "train.jsonl").read_text(encoding="utf-8").splitlines()]
+    rejected_rows = [json.loads(line) for line in (output / "rejected.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert manifest["planned_samples"] == 3
+    assert manifest["accepted_samples"] == 2
+    assert manifest["rejected_samples"] == 1
+    assert train_rows[0]["messages"][-1]["role"] == "assistant"
+    assert rejected_rows[0]["sample_id"] == "rejected-inactive"
+    assert rejected_rows[0]["codes"] == ["inactive_answer"]
+
+
+def test_incomplete_batch_resumes_without_repeating_completed_sample(tmp_path: Path) -> None:
+    from risk_agent.singguard_generation import AgentTurn, run_generation_batch
+    from risk_agent.teacher import TeacherBudget
+
+    samples = (
+        ModerationSample(
+            sample_id="first",
+            policy_id="commerce-v1",
+            thinking_type="fast",
+            query="First.",
+        ),
+        ModerationSample(
+            sample_id="second",
+            policy_id="commerce-v1",
+            thinking_type="fast",
+            query="Second.",
+        ),
+    )
+
+    class StopAfterOne(FakeAgentProvider):
+        def start(self, **kwargs):
+            if not self._turns:
+                raise TeacherBudgetExceeded("max_requests")
+            return super().start(**kwargs)
+
+    output = tmp_path / "resumable"
+    first_manifest = run_generation_batch(
+        policies=(_policy(),),
+        samples=samples,
+        provider=StopAfterOne(
+            turns=[AgentTurn(content="safe\n<answer>Safe</answer>")]
+        ),
+        environment=_environment(),
+        output_dir=output,
+        budget=TeacherBudget(max_requests=10),
+    )
+    second_manifest = run_generation_batch(
+        policies=(_policy(),),
+        samples=samples,
+        provider=FakeAgentProvider(
+            turns=[AgentTurn(content="safe\n<answer>Safe</answer>")]
+        ),
+        environment=_environment(),
+        output_dir=output,
+        budget=TeacherBudget(max_requests=10),
+        resume=True,
+    )
+
+    train_rows = (output / "train.jsonl").read_text(encoding="utf-8").splitlines()
+    assert first_manifest["status"] == "incomplete"
+    assert first_manifest["completed_samples"] == 1
+    assert second_manifest["status"] == "complete"
+    assert len(train_rows) == 2
+
+
+def test_batch_repairs_one_invalid_completion_without_replaying_tools(tmp_path: Path) -> None:
+    from risk_agent.singguard_generation import AgentTurn, run_generation_batch
+    from risk_agent.teacher import TeacherBudget
+
+    sample = ModerationSample(
+        sample_id="repair-me",
+        policy_id="commerce-v1",
+        thinking_type="fast",
+        query="Message me privately.",
+    )
+
+    class RepairingProvider(FakeAgentProvider):
+        def __init__(self) -> None:
+            super().__init__([AgentTurn(content="The content is unsafe.")])
+            self.repair_calls: list[dict[str, str]] = []
+
+        def repair(self, *, system, user, candidate, validation_code):
+            self.repair_calls.append(
+                {
+                    "system": system,
+                    "user": user,
+                    "candidate": candidate,
+                    "validation_code": validation_code,
+                }
+            )
+            return AgentTurn(
+                content="unsafe\n<answer>Off-Platform Solicitation</answer>"
+            )
+
+    provider = RepairingProvider()
+    output = tmp_path / "repair"
+    manifest = run_generation_batch(
+        policies=(_policy(),),
+        samples=(sample,),
+        provider=provider,
+        environment=_environment(),
+        output_dir=output,
+        budget=TeacherBudget(max_requests=10),
+    )
+
+    row = json.loads((output / "train.jsonl").read_text(encoding="utf-8"))
+    assert manifest["accepted_samples"] == 1
+    assert manifest["repaired_samples"] == 1
+    assert row["messages"][-1]["content"].startswith("unsafe")
+    assert provider.repair_calls[0]["candidate"] == "The content is unsafe."
+    assert provider.repair_calls[0]["validation_code"] == "output_grammar"
+
+
+def test_rejected_candidate_is_redacted_and_truncated(tmp_path: Path) -> None:
+    from risk_agent.singguard_generation import AgentTurn, run_generation_batch
+    from risk_agent.teacher import TeacherBudget
+
+    sample = ModerationSample(
+        sample_id="reject-secret",
+        policy_id="commerce-v1",
+        thinking_type="fast",
+        query="Neutral.",
+    )
+    candidate = "api_key=top-secret user@example.com " + "x" * 5000
+    output = tmp_path / "reject"
+    run_generation_batch(
+        policies=(_policy(),),
+        samples=(sample,),
+        provider=FakeAgentProvider([AgentTurn(content=candidate)]),
+        environment=_environment(),
+        output_dir=output,
+        budget=TeacherBudget(max_requests=10),
+    )
+
+    rejected = json.loads(
+        (output / "rejected.jsonl").read_text(encoding="utf-8")
+    )
+    assert "top-secret" not in rejected["candidate"]
+    assert "user@example.com" not in rejected["candidate"]
+    assert rejected["candidate"].endswith("...[truncated]")

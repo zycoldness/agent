@@ -1,4 +1,4 @@
-"""Generate an audited English text-only SingGuard dataset with Gemini."""
+"""Generate ms-swift SingGuard data from complete active-policy prompts."""
 
 from __future__ import annotations
 
@@ -10,18 +10,14 @@ import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
-from pydantic import ValidationError
-
-from risk_agent.singguard_prompts import prompt_sha256
-from risk_agent.singguard_sources import SeedRecord
-from risk_agent.singguard_synthesis import (
-    GENERATOR_RESPONSE_SCHEMA,
-    VERIFIER_RESPONSE_SCHEMA,
-    AnchorBlueprint,
-    plan_blueprints,
-    run_singguard_batch,
+from risk_agent.singguard_generation import (
+    GeminiAgentProvider,
+    load_active_policies,
+    load_moderation_samples,
+    run_generation_batch,
 )
-from risk_agent.teacher import GeminiTeacher, TeacherBudget
+from risk_agent.singguard_tools import ToolEnvironment
+from risk_agent.teacher import TeacherBudget
 
 
 class ProgressBar:
@@ -50,11 +46,7 @@ class ProgressBar:
         filled = round(ratio * self._width)
         bar = "#" * filled + "-" * (self._width - filled)
         elapsed = max(0.0, now - self._started)
-        if completed:
-            eta_seconds = elapsed / completed * (self.total - completed)
-            eta = _duration(eta_seconds)
-        else:
-            eta = "--"
+        eta = _duration(elapsed / completed * (self.total - completed)) if completed else "--"
         phase = str(event.get("phase", "working"))
         line = (
             f"\r[{bar}] {completed:>{len(str(self.total))}}/{self.total} "
@@ -76,67 +68,23 @@ def _duration(seconds: float) -> str:
     return f"{hours:02d}:{minute:02d}:{second:02d}"
 
 
-def _write_jsonl(path: Path, rows: tuple[AnchorBlueprint, ...]) -> None:
-    path.write_text(
-        "".join(item.model_dump_json() + "\n" for item in rows),
-        encoding="utf-8",
-    )
-
-
-def _load_seeds(path: Path) -> tuple[SeedRecord, ...]:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        raise ValueError("cannot read the seed JSONL") from None
-    records: list[SeedRecord] = []
-    try:
-        for line in lines:
-            if line.strip():
-                records.append(SeedRecord.model_validate_json(line))
-    except (ValidationError, ValueError):
-        raise ValueError("seed JSONL contains an invalid record") from None
-    if not records:
-        raise ValueError("seed JSONL is empty")
-    return tuple(records)
-
-
-def _assign_seeds(
-    plan: tuple[AnchorBlueprint, ...], records: tuple[SeedRecord, ...]
-) -> tuple[tuple[AnchorBlueprint, ...], dict[str, str], dict[str, str]]:
-    assigned: list[AnchorBlueprint] = []
-    texts: dict[str, str] = {}
-    licenses: dict[str, str] = {}
-    cursor = 0
-    for item in plan:
-        if not item.use_open_seed:
-            assigned.append(item)
-            continue
-        record = records[cursor % len(records)]
-        cursor += 1
-        item = item.model_copy(update={"source_id": f"{record.source}:{record.source_id}"})
-        assigned.append(item)
-        texts[item.anchor_id] = record.text
-        licenses[item.anchor_id] = record.license
-    return tuple(assigned), texts, licenses
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("active_policies", type=Path)
+    parser.add_argument("content_samples", type=Path)
     parser.add_argument("output_dir", type=Path)
-    parser.add_argument("--anchors", type=int, default=100)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--generator-model", default=os.environ.get("GEMINI_GENERATOR_MODEL"))
-    parser.add_argument("--verifier-model", default=os.environ.get("GEMINI_VERIFIER_MODEL"))
-    parser.add_argument("--seeds", type=Path)
-    parser.add_argument("--allow-external-data", action="store_true")
-    parser.add_argument("--pilot", action="store_true")
-    parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("GEMINI_GENERATOR_MODEL")
+        or os.environ.get("GEMINI_MODEL"),
+    )
+    parser.add_argument("--tool-env", type=Path, default=Path("data/tool_env"))
+    parser.add_argument("--max-tool-calls", type=int, choices=(0, 1, 2), default=2)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--provider-attempts", type=int, default=3)
     parser.add_argument("--request-timeout", type=float, default=120.0)
-    parser.add_argument("--max-requests", type=int, default=800)
+    parser.add_argument("--max-requests", type=int, default=500)
     parser.add_argument("--max-output-tokens", type=int, default=4096)
-    parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--input-cost-per-million", type=float)
     parser.add_argument("--output-cost-per-million", type=float)
     parser.add_argument("--max-cost-usd", type=float)
@@ -146,94 +94,41 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    if args.output_dir.exists() and not args.resume:
-        parser.error("output directory must not exist")
-    if args.resume and args.plan_only:
-        parser.error("--resume cannot be combined with --plan-only")
-    try:
-        plan = plan_blueprints(args.anchors, seed=args.seed)
-    except ValueError as error:
-        parser.error(str(error))
-
-    if args.plan_only:
-        args.output_dir.mkdir(parents=True, exist_ok=False)
-        _write_jsonl(args.output_dir / "plan.jsonl", plan)
-        manifest = {
-            "schema": "singguard-plan-v1",
-            "status": "planned",
-            "planned_anchors": len(plan),
-            "seed": args.seed,
-            "prompt_hashes": {
-                name: prompt_sha256(name)
-                for name in ("guard", "agent", "generator", "verifier")
-            },
-        }
-        (args.output_dir / "manifest.json").write_text(
-            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
-            encoding="utf-8",
-        )
-        print(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
-        return 0
-
-    if not args.generator_model or not args.verifier_model:
-        parser.error("real generation requires --generator-model and --verifier-model")
-    if args.seeds and not args.allow_external_data:
-        parser.error("--seeds requires --allow-external-data")
-    if args.allow_external_data and not args.seeds:
-        parser.error("--allow-external-data requires --seeds")
+    if not args.model:
+        parser.error("--model or GEMINI_GENERATOR_MODEL is required")
     if (args.input_cost_per_million is None) != (args.output_cost_per_million is None):
         parser.error("both input and output prices are required together")
     if args.max_cost_usd is not None and args.input_cost_per_million is None:
         parser.error("--max-cost-usd requires input and output prices")
-
-    seed_texts: dict[str, str] = {}
-    seed_licenses: dict[str, str] = {}
-    if args.seeds:
-        try:
-            plan, seed_texts, seed_licenses = _assign_seeds(plan, _load_seeds(args.seeds))
-        except ValueError as error:
-            parser.error(str(error))
-
-    budget = TeacherBudget(
-        max_requests=args.max_requests,
-        max_estimated_cost_usd=args.max_cost_usd,
-    )
-    common = {
-        "max_attempts": args.provider_attempts,
-        "request_timeout_seconds": args.request_timeout,
-        "input_cost_per_million": args.input_cost_per_million,
-        "output_cost_per_million": args.output_cost_per_million,
-        "max_output_tokens": args.max_output_tokens,
-        "budget": budget,
-    }
-    generator = GeminiTeacher(
-        model=args.generator_model,
-        response_schema=GENERATOR_RESPONSE_SCHEMA,
-        temperature=0.7,
-        **common,
-    )
-    verifier = GeminiTeacher(
-        model=args.verifier_model,
-        response_schema=VERIFIER_RESPONSE_SCHEMA,
-        temperature=0.0,
-        **common,
-    )
     try:
-        manifest = run_singguard_batch(
-            plan,
-            generator=generator,
-            verifier=verifier,
-            budget=budget,
-            output_dir=args.output_dir,
-            seed=args.seed,
-            seed_texts=seed_texts,
-            seed_licenses=seed_licenses,
-            max_retries=args.max_retries,
-            pilot=args.pilot,
-            resume=args.resume,
-            progress=ProgressBar(total=len(plan)),
+        policies = load_active_policies(args.active_policies)
+        samples = load_moderation_samples(args.content_samples)
+        environment = ToolEnvironment.load(args.tool_env)
+        budget = TeacherBudget(
+            max_requests=args.max_requests,
+            max_estimated_cost_usd=args.max_cost_usd,
         )
-    except (OSError, ValueError) as error:
+        provider = GeminiAgentProvider(
+            model=args.model,
+            max_attempts=args.provider_attempts,
+            request_timeout_seconds=args.request_timeout,
+            input_cost_per_million=args.input_cost_per_million,
+            output_cost_per_million=args.output_cost_per_million,
+            max_output_tokens=args.max_output_tokens,
+            budget=budget,
+        )
+        manifest = run_generation_batch(
+            policies=policies,
+            samples=samples,
+            provider=provider,
+            environment=environment,
+            output_dir=args.output_dir,
+            budget=budget,
+            max_tool_calls=args.max_tool_calls,
+            resume=args.resume,
+            progress=ProgressBar(total=len(samples)),
+        )
+    except (OSError, RuntimeError, ValueError) as error:
         parser.error(str(error))
     print(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
     return 0 if manifest["status"] == "complete" else 2
