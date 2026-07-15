@@ -43,22 +43,21 @@ _META_LANGUAGE_RES = tuple(
         r"\bgenerate\s+(?:an?\s+)?(?:safe|unsafe)\s+example\b",
     )
 )
-_CLASSIFICATION_LABEL_RE = re.compile(
-    r"\b(?:dataset|training|gold|target|correct|expected)\s+label\b",
-    re.IGNORECASE,
-)
-_LABEL_LEAKAGE_CONTEXT_RES = tuple(
+_LABEL_DECISION_RES = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
         (
-            r"\blabel\b(?:\s+\w+){0,5}\s+"
+            r"\blabel(?:s|ed)?\b(?:\s+\w+){0,6}\s+"
             r"(?:(?:is|as)\s+|should\s+be\s+)?(?:safe|unsafe)\b"
-            r"(?!\s+(?:to|for)\b)"
         ),
-        r"\bgenerated\s+(?:sample|example|item|output|response|content)\b",
-        r"\b(?:oracle|annotat(?:or|ion))\b",
-        r"\b(?:policy|rule(?:[- ]id)?)\s+metadata\b",
+        r"\b(?:safe|unsafe)\b(?:\s+\w+){0,6}\s+\blabel(?:s|ed)?\b",
     )
+)
+_LABEL_META_CONTEXT_RE = re.compile(
+    r"\b(?:generated(?:\s+(?:sample|example|item|output|response|content))?|"
+    r"training|dataset|gold|oracle|annotat(?:or|ion)|policy\s+metadata|"
+    r"rule(?:[- ]id)?\s+metadata)\b",
+    re.IGNORECASE,
 )
 _EMAIL_RE = re.compile(
     r"(?<![\w.+-])([A-Z0-9.!#$%&'*+/=?^_`{|}~-]+)@"
@@ -77,8 +76,8 @@ _HANDLE_RE = re.compile(r"(?<![\w@])@([A-Z0-9_]{1,32})\b", re.IGNORECASE)
 _PHONE_RE = re.compile(r"(?<![\w-])(?:\+?\d[\s().-]*){10,15}(?![\w-])")
 _CARD_RE = re.compile(r"(?<![\w-])(?:\d[ -]?){13,19}(?![\w-])")
 _ORDER_IDENTIFIER_RE = re.compile(
-    r"\b(?:order|tracking)\s+(?:id|number|no\.?|#)\s*[:#=\-]?\s*"
-    r"[A-Z0-9][A-Z0-9-]{5,31}\b",
+    r"\b(?:order|tracking)(?:\s+(?:id|number|no\.?|#))?\s*[:#=\-]?\s+"
+    r"(?=[A-Z0-9-]{6,32}\b)(?=[A-Z0-9-]*\d)[A-Z0-9][A-Z0-9-]{5,31}\b",
     re.IGNORECASE,
 )
 _KNOWN_SECRET_PREFIX_RE = re.compile(
@@ -86,9 +85,14 @@ _KNOWN_SECRET_PREFIX_RE = re.compile(
     r"[A-Z0-9_\-]{8,}\b",
     re.IGNORECASE,
 )
-_SECRET_AFTER_KEYWORD_RE = re.compile(
+_EXPLICIT_SECRET_VALUE_RE = re.compile(
     r"\b(?:api[_ -]?key|access[_ -]?token|credential|secret|password|passwd|pwd)\b"
-    r"\s*(?:(?:is)\s+|[:=]\s*|\s+)[\"']?([A-Z0-9_./+\-]{6,})",
+    r"\s*(?:(?:is)\s+|[:=]\s*)[\"']?([A-Z0-9_./+\-]{6,})",
+    re.IGNORECASE,
+)
+_BARE_SECRET_VALUE_RE = re.compile(
+    r"\b(?:api[_ -]?key|access[_ -]?token|credential|secret|password|passwd|pwd)\b"
+    r"\s+[\"']?([A-Z0-9_./+\-]{6,})",
     re.IGNORECASE,
 )
 _ACCOUNT_RE = re.compile(
@@ -107,6 +111,28 @@ _HARM_ACTION_RE = re.compile(
     r"\b(?:mix|combine|pack|place|attach|assemble|load|connect|wire|insert|seal|"
     r"ignite|detonate|clone|capture|exfiltrate|write|download|configure|execute|"
     r"deploy|install)\w*\b",
+    re.IGNORECASE,
+)
+_CREDENTIAL_THEFT_DOMAIN_RE = re.compile(
+    r"\b(?:bank\s+login\s+page|login\s+page|passwords?|credentials?)\b",
+    re.IGNORECASE,
+)
+_CREDENTIAL_THEFT_ACTION_RE = re.compile(
+    r"\b(?:clone|capture|exfiltrate)\w*\b",
+    re.IGNORECASE,
+)
+_DEFENSIVE_CONTEXT_RE = re.compile(
+    r"\b(?:isolated\s+sandbox|forensic\s+analysis|remediat(?:e|ion)|"
+    r"incident[- ]response|law[- ]enforcement|bomb[- ]squad|police\s+response)\b",
+    re.IGNORECASE,
+)
+_EXPLOSIVE_CONSTRUCTION_RE = re.compile(
+    r"\b(?:mix|combine|pack|wire|ignite|detonate)\w*\b",
+    re.IGNORECASE,
+)
+_EXPLOSIVE_OR_WEAPON_DOMAIN_RE = re.compile(
+    r"\b(?:weapons?|explosive|detonator|ammonium\s+nitrate|fuel\s+oil|"
+    r"steel\s+pipe|timed\s+ignition|ignition|ammunition)\b",
     re.IGNORECASE,
 )
 
@@ -249,8 +275,8 @@ def _is_english_dominant(text: str) -> bool:
 def _contains_generation_meta_language(text: str) -> bool:
     if any(pattern.search(text) for pattern in _META_LANGUAGE_RES):
         return True
-    return bool(_CLASSIFICATION_LABEL_RE.search(text)) and any(
-        pattern.search(text) for pattern in _LABEL_LEAKAGE_CONTEXT_RES
+    return bool(_LABEL_META_CONTEXT_RE.search(text)) and any(
+        pattern.search(text) for pattern in _LABEL_DECISION_RES
     )
 
 
@@ -285,11 +311,15 @@ def _luhn_valid(digits: str) -> bool:
 def _contains_credential_secret(text: str) -> bool:
     if _KNOWN_SECRET_PREFIX_RE.search(text):
         return True
-    for match in _SECRET_AFTER_KEYWORD_RE.finditer(text):
+    if _EXPLICIT_SECRET_VALUE_RE.search(text):
+        return True
+    for match in _BARE_SECRET_VALUE_RE.finditer(text):
         value = match.group(1)
-        if len(value) >= 10 and any(character.isalpha() for character in value) and any(
+        has_uppercase_and_digit = any(character.isupper() for character in value) and any(
             character.isdigit() for character in value
-        ):
+        )
+        has_secret_punctuation = any(character in "_./+-" for character in value)
+        if len(value) >= 10 and (has_uppercase_and_digit or has_secret_punctuation):
             return True
     return False
 
@@ -328,11 +358,21 @@ def _contains_external_identifier(text: str) -> bool:
 
 
 def _is_operational_harm(text: str) -> bool:
-    return (
-        len(_SEQUENCE_RE.findall(text)) >= 2
-        and bool(_HARM_DOMAIN_RE.search(text))
-        and len(_HARM_ACTION_RE.findall(text)) >= 2
+    if len(_SEQUENCE_RE.findall(text)) < 2 or len(_HARM_ACTION_RE.findall(text)) < 2:
+        return False
+    has_harm_domain = bool(_HARM_DOMAIN_RE.search(text)) or (
+        bool(_CREDENTIAL_THEFT_DOMAIN_RE.search(text))
+        and bool(_CREDENTIAL_THEFT_ACTION_RE.search(text))
     )
+    if not has_harm_domain:
+        return False
+    if _DEFENSIVE_CONTEXT_RE.search(text):
+        is_explosive_construction = bool(
+            _EXPLOSIVE_OR_WEAPON_DOMAIN_RE.search(text)
+        ) and bool(_EXPLOSIVE_CONSTRUCTION_RE.search(text))
+        if not is_explosive_construction:
+            return False
+    return True
 
 
 def _word_count(text: str) -> int:

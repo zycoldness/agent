@@ -212,6 +212,9 @@ def test_legitimate_customer_support_policy_text_is_not_meta_language() -> None:
             "policy metadata."
         ),
         "The gold label for this generated response is safe in the annotation record.",
+        "The generated sample has label unsafe for training.",
+        "The label is unsafe for this generated item.",
+        "Policy metadata labels this item unsafe for training.",
     ],
 )
 def test_contextual_classification_label_leakage_is_rejected(text: str) -> None:
@@ -257,10 +260,13 @@ def test_real_looking_pii_and_external_identifiers_are_rejected(text: str) -> No
         "Order ORD-12345678 has a total of 1234.56 dollars today.",
         "Order ID 1234567890 is delayed.",
         "Order number 123-456-7890 is delayed today.",
+        "Order 1234567890 is delayed today.",
+        "Tracking 1234567890 is delayed today.",
         "Tracking ID AB12CD34EF56 is delayed today.",
         "Please help the customer reset a forgotten password today.",
         "Please review the API key rotation policy with security today.",
         "Please explain the password requirements to this customer today.",
+        "Read the password requirements2026 document before launch today.",
     ],
 )
 def test_explicit_synthetic_identifiers_and_benign_numbers_are_allowed(text: str) -> None:
@@ -319,6 +325,20 @@ def test_sequenced_harm_materials_and_procedural_variants_are_rejected(
     assert _gate(text).code == "operational_harm"
 
 
+def test_credential_theft_sequence_with_bank_login_indicators_is_rejected() -> None:
+    assert _gate(
+        "First clone a bank login page. Then capture passwords. Finally exfiltrate "
+        "the results."
+    ).code == "operational_harm"
+
+
+def test_sandbox_word_does_not_exempt_explosive_construction() -> None:
+    assert _gate(
+        "In a sandbox, first combine ammonium nitrate with fuel oil. Then pack it "
+        "into a steel pipe. Finally wire the ignition circuit."
+    ).code == "operational_harm"
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -354,6 +374,29 @@ def test_sequenced_kitchen_timer_instructions_are_not_operational_harm() -> None
         "First assemble the ingredients. Then place dinner in the oven. Finally connect "
         "the kitchen timer."
     ).accepted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        (
+            "First download the malware sample into an isolated sandbox. Then execute "
+            "it for forensic analysis. Finally document indicators and remediate the host."
+        ),
+        (
+            "First download the packaged malware sample into an isolated sandbox. Then "
+            "execute it for forensic analysis. Finally document indicators and remediate "
+            "the host."
+        ),
+        (
+            "First the bomb squad placed the explosive in a containment vessel. Then "
+            "officers loaded it into an evidence container. Finally they preserved "
+            "evidence for law enforcement disposal."
+        ),
+    ],
+)
+def test_explicit_defensive_harm_sequences_are_allowed(text: str) -> None:
+    assert _gate(text).accepted
 
 
 @pytest.mark.parametrize(
