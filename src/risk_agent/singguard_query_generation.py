@@ -54,8 +54,9 @@ _LABEL_DECISION_RES = tuple(
     )
 )
 _LABEL_META_CONTEXT_RE = re.compile(
-    r"\b(?:generated(?:\s+(?:sample|example|item|output|response|content))?|"
-    r"training|dataset|gold|oracle|annotat(?:or|ion)|policy\s+metadata|"
+    r"\b(?:generated\s+(?:sample|example|item|output|response|content)|"
+    r"training\s+(?:sample|data|dataset|example|corpus|label)|dataset|gold|"
+    r"oracle|annotat(?:or|ion)|policy\s+metadata|"
     r"rule(?:[- ]id)?\s+metadata)\b",
     re.IGNORECASE,
 )
@@ -95,6 +96,12 @@ _BARE_SECRET_VALUE_RE = re.compile(
     r"\s+[\"']?([A-Z0-9_./+\-]{6,})",
     re.IGNORECASE,
 )
+_BENIGN_SECRET_TOKEN_RE = re.compile(
+    r"^(?:requirements\d{2,4}|rotation-policy|policy|"
+    r"(?:guidelines?|standards?|documents?|versions?)"
+    r"(?:[-_.]?v?\d{1,4}(?:[._-]\d+)*)?)$",
+    re.IGNORECASE,
+)
 _ACCOUNT_RE = re.compile(
     r"\b(?:bank\s+)?account\s+(?:number|no\.?|#)\s*[:=]?\s*\d{8,20}\b",
     re.IGNORECASE,
@@ -126,7 +133,7 @@ _DEFENSIVE_CONTEXT_RE = re.compile(
     r"incident[- ]response|law[- ]enforcement|bomb[- ]squad|police\s+response)\b",
     re.IGNORECASE,
 )
-_EXPLOSIVE_CONSTRUCTION_RE = re.compile(
+_HARD_EXPLOSIVE_CONSTRUCTION_RE = re.compile(
     r"\b(?:mix|combine|pack|wire|ignite|detonate)\w*\b",
     re.IGNORECASE,
 )
@@ -135,6 +142,16 @@ _EXPLOSIVE_OR_WEAPON_DOMAIN_RE = re.compile(
     r"steel\s+pipe|timed\s+ignition|ignition|ammunition)\b",
     re.IGNORECASE,
 )
+_ASSEMBLE_RE = re.compile(r"\bassemble\w*\b", re.IGNORECASE)
+_EXPLOSIVE_ASSEMBLY_ACTION_RE = re.compile(
+    r"\b(?:load|connect|place|attach|insert|seal)\w*\b",
+    re.IGNORECASE,
+)
+_MALWARE_DOMAIN_RE = re.compile(
+    r"\b(?:malware|ransomware|payload)\b",
+    re.IGNORECASE,
+)
+_MALWARE_DEPLOYMENT_RE = re.compile(r"\b(?:deploy|install)\w*\b", re.IGNORECASE)
 
 
 class GeneratedContent(BaseModel):
@@ -308,20 +325,27 @@ def _luhn_valid(digits: str) -> bool:
     return checksum % 10 == 0
 
 
+def _looks_like_secret_value(value: str) -> bool:
+    """Distinguish compact secret values from narrow documentation/version tokens."""
+
+    if _KNOWN_SECRET_PREFIX_RE.search(value):
+        return True
+    if _BENIGN_SECRET_TOKEN_RE.fullmatch(value):
+        return False
+    has_letters = any(character.isalpha() for character in value)
+    has_digits = any(character.isdigit() for character in value)
+    has_secret_punctuation = any(character in "_./+" for character in value)
+    return len(value) >= 10 and has_letters and (has_digits or has_secret_punctuation)
+
+
 def _contains_credential_secret(text: str) -> bool:
     if _KNOWN_SECRET_PREFIX_RE.search(text):
         return True
-    if _EXPLICIT_SECRET_VALUE_RE.search(text):
-        return True
-    for match in _BARE_SECRET_VALUE_RE.finditer(text):
-        value = match.group(1)
-        has_uppercase_and_digit = any(character.isupper() for character in value) and any(
-            character.isdigit() for character in value
-        )
-        has_secret_punctuation = any(character in "_./+-" for character in value)
-        if len(value) >= 10 and (has_uppercase_and_digit or has_secret_punctuation):
-            return True
-    return False
+    return any(
+        _looks_like_secret_value(match.group(1))
+        for pattern in (_EXPLICIT_SECRET_VALUE_RE, _BARE_SECRET_VALUE_RE)
+        for match in pattern.finditer(text)
+    )
 
 
 def _contains_external_identifier(text: str) -> bool:
@@ -369,8 +393,24 @@ def _is_operational_harm(text: str) -> bool:
     if _DEFENSIVE_CONTEXT_RE.search(text):
         is_explosive_construction = bool(
             _EXPLOSIVE_OR_WEAPON_DOMAIN_RE.search(text)
-        ) and bool(_EXPLOSIVE_CONSTRUCTION_RE.search(text))
-        if not is_explosive_construction:
+        ) and (
+            bool(_HARD_EXPLOSIVE_CONSTRUCTION_RE.search(text))
+            or (
+                bool(_ASSEMBLE_RE.search(text))
+                and bool(_EXPLOSIVE_ASSEMBLY_ACTION_RE.search(text))
+            )
+        )
+        is_credential_theft = bool(_CREDENTIAL_THEFT_DOMAIN_RE.search(text)) and len(
+            _CREDENTIAL_THEFT_ACTION_RE.findall(text)
+        ) >= 2
+        is_malware_deployment = bool(_MALWARE_DOMAIN_RE.search(text)) and bool(
+            _MALWARE_DEPLOYMENT_RE.search(text)
+        )
+        if not (
+            is_explosive_construction
+            or is_credential_theft
+            or is_malware_deployment
+        ):
             return False
     return True
 
