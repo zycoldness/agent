@@ -103,7 +103,13 @@ def test_different_seed_changes_plan_without_changing_quotas() -> None:
     first = _plan(count=500, seed=13)
     second = _plan(count=500, seed=14)
 
-    assert first != second
+    first_metadata = [
+        row.model_dump(exclude={"blueprint_id", "family_id"}) for row in first
+    ]
+    second_metadata = [
+        row.model_dump(exclude={"blueprint_id", "family_id"}) for row in second
+    ]
+    assert first_metadata != second_metadata
     for attribute in (
         "intended_label",
         "conversation_shape",
@@ -174,6 +180,25 @@ def test_unsafe_primary_rules_are_balanced_and_answers_follow_policy_order() -> 
         )
 
 
+def test_plan_rejects_too_few_unsafe_rows_to_cover_every_active_rule() -> None:
+    from risk_agent.singguard_query_generation import plan_blueprints
+
+    policy = ActivePolicy(
+        policy_id="too-many-rules",
+        rules=tuple(
+            PolicyRule(
+                rule_id=f"R{index:02d}",
+                title=f"Rule {index}",
+                text=f"Rule {index} text.",
+            )
+            for index in range(51)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="enough unsafe rows to cover every active rule"):
+        plan_blueprints((policy,), count=100, seed=1, seed_records=())
+
+
 def test_safe_rows_have_no_intended_answers_or_primary_answer() -> None:
     safe = [row for row in _plan(count=500) if row.intended_label == "safe"]
 
@@ -189,6 +214,18 @@ def test_at_least_quota_seeds_assigns_exactly_600_unique_references() -> None:
     assert len(refs) == 600
     assert len({(ref.source, ref.source_id) for ref in refs}) == 600
     assert all(ref.content_hash for ref in refs)
+
+
+@pytest.mark.parametrize(
+    ("count", "seed_count", "expected_governed"),
+    ((100, 45, 30), (500, 200, 150)),
+)
+def test_governed_source_quota_scales_for_smaller_releases(
+    count: int, seed_count: int, expected_governed: int
+) -> None:
+    rows = _plan(count=count, seed_count=seed_count)
+
+    assert sum(row.source_ref is not None for row in rows) == expected_governed
 
 
 def test_no_seeds_degrades_to_all_synthetic() -> None:
@@ -341,3 +378,85 @@ def test_planner_trusts_validated_seed_hash_without_recomputing_text_integrity()
     assert [row.source_ref.content_hash for row in rows if row.source_ref] == [
         placeholder_hash
     ]
+
+
+def test_source_ref_is_frozen_and_forbids_extra_fields() -> None:
+    from risk_agent.singguard_query_generation import SourceRef
+
+    source_ref = SourceRef(
+        source="open-corpus",
+        source_id="row-1",
+        content_hash="0" * 64,
+    )
+
+    with pytest.raises(ValidationError, match="frozen"):
+        source_ref.source_id = "changed"
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        SourceRef(
+            source="open-corpus",
+            source_id="row-1",
+            content_hash="0" * 64,
+            unexpected="value",
+        )
+
+
+def test_query_blueprint_forbids_extra_fields() -> None:
+    from risk_agent.singguard_query_generation import QueryBlueprint
+
+    payload = _plan(count=100, seed_count=0)[0].model_dump()
+    payload["unexpected"] = "value"
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        QueryBlueprint.model_validate(payload)
+
+
+def test_query_blueprint_accepts_policy_ordered_multi_answers_and_rejects_reverse() -> None:
+    from risk_agent.singguard_query_generation import QueryBlueprint
+
+    row = next(
+        row
+        for row in _plan(count=100, seed_count=0)
+        if row.intended_label == "unsafe" and len(row.active_rule_ids) >= 2
+    )
+    ordered = row.active_rule_ids[:2]
+    payload = row.model_dump()
+    payload.update(primary_answer=ordered[0], intended_answers=ordered)
+
+    blueprint = QueryBlueprint.model_validate(payload)
+
+    assert blueprint.intended_answers == ordered
+    payload["intended_answers"] = tuple(reversed(ordered))
+    with pytest.raises(ValidationError, match="active-policy order"):
+        QueryBlueprint.model_validate(payload)
+
+
+def test_identical_global_rule_reuse_across_policies_is_accepted_and_balanced() -> None:
+    from risk_agent.singguard_query_generation import plan_blueprints
+
+    shared = PolicyRule(
+        rule_id="SHARED", title="Shared rule", text="Shared rule text."
+    )
+    policies = (
+        ActivePolicy(
+            policy_id="composition-one",
+            rules=(
+                shared,
+                PolicyRule(rule_id="ONE", title="Rule one", text="Rule one text."),
+            ),
+        ),
+        ActivePolicy(
+            policy_id="composition-two",
+            rules=(
+                shared,
+                PolicyRule(rule_id="TWO", title="Rule two", text="Rule two text."),
+            ),
+        ),
+    )
+
+    rows = plan_blueprints(policies, count=100, seed=7, seed_records=())
+    primary_counts = Counter(
+        row.primary_answer for row in rows if row.intended_label == "unsafe"
+    )
+
+    assert set(primary_counts) == {"SHARED", "ONE", "TWO"}
+    assert max(primary_counts.values()) - min(primary_counts.values()) <= 1

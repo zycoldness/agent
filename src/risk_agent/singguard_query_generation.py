@@ -249,6 +249,10 @@ def _validate_seeds(seed_records: tuple[SeedRecord, ...]) -> None:
 def _balanced_rule_schedule(
     rule_ids: tuple[str, ...], count: int, rng: random.Random
 ) -> list[str]:
+    if count < len(rule_ids):
+        raise ValueError(
+            "release does not contain enough unsafe rows to cover every active rule"
+        )
     quotient, remainder = divmod(count, len(rule_ids))
     schedule = [
         rule_id
