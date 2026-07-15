@@ -471,27 +471,29 @@ def _harm_clauses(text: str) -> tuple[str, ...]:
 
 
 def _is_explosive_or_weapon_procedure(clauses: tuple[str, ...]) -> bool:
-    relevant_clauses = 0
-    for clause in clauses:
-        has_domain = bool(_EXPLOSIVE_OR_WEAPON_DOMAIN_RE.search(clause))
-        has_action = bool(
-            _HARD_EXPLOSIVE_CONSTRUCTION_RE.search(clause)
-            or _EXPLOSIVE_ASSEMBLY_ACTION_RE.search(clause)
+    relationship_count = sum(
+        (
+            len(_HARD_EXPLOSIVE_CONSTRUCTION_RE.findall(clause))
+            + len(_EXPLOSIVE_ASSEMBLY_ACTION_RE.findall(clause))
         )
-        relevant_clauses += has_domain and has_action
-    return relevant_clauses >= 2
+        if _EXPLOSIVE_OR_WEAPON_DOMAIN_RE.search(clause)
+        else 0
+        for clause in clauses
+    )
+    return relationship_count >= 2
 
 
 def _is_credential_theft_procedure(
     text: str, clauses: tuple[str, ...]
 ) -> bool:
     literal_context = bool(_CREDENTIAL_THEFT_LITERAL_RE.search(text))
-    relevant_clauses = sum(
-        bool(_CREDENTIAL_ATTACK_ACTION_RE.search(clause))
-        and (literal_context or bool(_CREDENTIAL_OBJECT_RE.search(clause)))
+    relationship_count = sum(
+        len(_CREDENTIAL_ATTACK_ACTION_RE.findall(clause))
+        if literal_context or _CREDENTIAL_OBJECT_RE.search(clause)
+        else 0
         for clause in clauses
     )
-    return relevant_clauses >= 2
+    return relationship_count >= 2
 
 
 def _is_defensive_malware_sample(text: str, clauses: tuple[str, ...]) -> bool:
@@ -507,6 +509,12 @@ def _is_defensive_malware_sample(text: str, clauses: tuple[str, ...]) -> bool:
         or _MALWARE_ASSEMBLY_RE.search(clause)
         or _MALWARE_PERSISTENCE_RE.search(clause)
         or _MALWARE_DEPLOYMENT_OBJECT_RE.search(clause)
+        or _LOADER_CONNECT_RE.search(clause)
+        or _EXECUTE_PRONOUN_TARGET_RE.search(clause)
+        or (
+            _MALWARE_EXECUTE_PAYLOAD_RE.search(clause)
+            and _ATTACK_TARGET_RE.search(clause)
+        )
         or (
             _MALWARE_DEPLOYMENT_ACTION_RE.search(clause)
             and _ATTACK_TARGET_RE.search(clause)
@@ -514,6 +522,34 @@ def _is_defensive_malware_sample(text: str, clauses: tuple[str, ...]) -> bool:
         for clause in clauses
     )
     return not has_offensive_relationship
+
+
+def _malware_relationship_count(clause: str) -> int:
+    creation_or_assembly = bool(
+        _MALWARE_CREATION_RE.search(clause) or _MALWARE_ASSEMBLY_RE.search(clause)
+    )
+    persistence = bool(_MALWARE_PERSISTENCE_RE.search(clause))
+    targeted_execution = bool(
+        _MALWARE_EXECUTE_PAYLOAD_RE.search(clause)
+        or _EXECUTE_PRONOUN_TARGET_RE.search(clause)
+    )
+    loader_connection = bool(_LOADER_CONNECT_RE.search(clause))
+    deployment = bool(
+        _MALWARE_DEPLOYMENT_OBJECT_RE.search(clause)
+        or (
+            _MALWARE_DEPLOYMENT_ACTION_RE.search(clause)
+            and _ATTACK_TARGET_RE.search(clause)
+        )
+    )
+    return sum(
+        (
+            creation_or_assembly,
+            persistence,
+            targeted_execution,
+            loader_connection,
+            deployment,
+        )
+    )
 
 
 def _is_malware_procedure(text: str, clauses: tuple[str, ...]) -> bool:
@@ -525,23 +561,8 @@ def _is_malware_procedure(text: str, clauses: tuple[str, ...]) -> bool:
     )
     if not has_flow_context:
         return False
-    relevant_clauses = sum(
-        bool(
-            _MALWARE_CREATION_RE.search(clause)
-            or _MALWARE_ASSEMBLY_RE.search(clause)
-            or _MALWARE_PERSISTENCE_RE.search(clause)
-            or _MALWARE_EXECUTE_PAYLOAD_RE.search(clause)
-            or _MALWARE_DEPLOYMENT_OBJECT_RE.search(clause)
-            or _LOADER_CONNECT_RE.search(clause)
-            or _EXECUTE_PRONOUN_TARGET_RE.search(clause)
-            or (
-                _MALWARE_DEPLOYMENT_ACTION_RE.search(clause)
-                and _ATTACK_TARGET_RE.search(clause)
-            )
-        )
-        for clause in clauses
-    )
-    return relevant_clauses >= 2
+    relationship_count = sum(_malware_relationship_count(clause) for clause in clauses)
+    return relationship_count >= 2
 
 
 def _is_operational_harm(text: str) -> bool:
