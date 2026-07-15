@@ -1,23 +1,45 @@
-# SingGuard English data pilot runbook
+# SingGuard active-policy data runbook
 
-This run produces the first English, text-only, research-only, Guard-only data
-batch. It is an experiment artifact, not production moderation evidence. Images
-and agent tool traces are deliberately deferred until the text pipeline passes.
+This runbook produces an English, text-only SFT batch from reviewed active
+policies and content prompts. Gemini supplies the supervision trace; local code
+only executes tools and enforces deterministic contracts.
 
-## 1. Install and verify
+## 1. Inputs
 
-```bash
-pip install -e '.[dev,teacher]'
-python -m pytest -q
+`data/active_policies.jsonl` contains one policy set per line. A set may contain
+one or many simultaneously active rules:
+
+```json
+{"policy_id":"commerce-v1","rules":[{"rule_id":"EFF-001","title":"Deceptive Efficacy","text":"Do not claim a guaranteed or medically unsupported outcome."}]}
 ```
 
-Use either Gemini Developer API credentials:
+`data/content_samples.jsonl` contains the target conversations:
 
-```bash
-export GEMINI_API_KEY='set-this-on-the-server'
+```json
+{"sample_id":"sample-1","policy_id":"commerce-v1","thinking_type":"fast","query":"Guaranteed results in seven days.","tool_names":["verify_claim"]}
 ```
 
-or Vertex AI credentials:
+Optional fields are `response` and `tool_names`. The first version does not use
+images. Every `policy_id` must resolve to exactly one active policy set.
+
+The deterministic tool environment is stored under `data/tool_env`:
+
+- `cases.jsonl` for `search_cases`;
+- `claim_evidence.jsonl` for `verify_claim`;
+- `destinations.jsonl` for `inspect_destination`;
+- `content_history.jsonl` for `get_content_context`.
+
+These records are fixtures, not production evidence.
+
+## 2. Credentials
+
+Developer API:
+
+```bash
+export GEMINI_API_KEY='set-this-only-in-the-shell'
+```
+
+Vertex AI:
 
 ```bash
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
@@ -26,126 +48,99 @@ export GOOGLE_CLOUD_LOCATION=global
 export GOOGLE_GENAI_USE_VERTEXAI=true
 ```
 
-Never put credentials in a command, JSONL file, shell script, or Git commit.
-The repository also provides a blank template:
+Do not write secrets into commands, JSONL, logs, or Git. The repository's
+`configs/vertex_ai.env.example` intentionally leaves all values blank.
+
+## 3. Validate locally
 
 ```bash
-cp configs/vertex_ai.env.example configs/vertex_ai.env
-# Edit configs/vertex_ai.env locally, then load it into the current shell.
-source configs/vertex_ai.env
+pip install -e '.[dev,teacher]'
+python -m pytest -q
+python scripts/generate_singguard_data.py --help
 ```
 
-`configs/vertex_ai.env` is ignored by Git; the example contains no credential
-path, project ID, API key, or model selection.
-
-## 2. Fetch governed public style seeds
+## 4. Generate a batch
 
 ```bash
-rm -rf outputs/singguard-seeds
-python scripts/fetch_singguard_seeds.py \
-  configs/singguard_sources.yaml \
-  outputs/singguard-seeds
-```
+export GEMINI_GENERATOR_MODEL='your-gemini-model'
 
-The enabled first version fetches UCI SMS Spam and YouTube Spam data under
-CC-BY-4.0. Seeds are style references only; their labels never become the local
-oracle. Inspect `outputs/singguard-seeds/manifest.json` before continuing.
-
-## 3. Freeze and inspect the quota plan
-
-```bash
-rm -rf outputs/singguard-plan
-python scripts/generate_singguard_data.py outputs/singguard-plan \
-  --anchors 100 \
-  --seed 42 \
-  --plan-only
-```
-
-`plan.jsonl` must contain 100 unique anchors spanning all eight domains, all four
-policy transitions, and the planned style/difficulty mix. Plan-only never needs a
-Gemini credential and never sends external data.
-
-## 4. Run the real 100-anchor pilot
-
-Set the two model names explicitly so the run is reproducible:
-
-```bash
-export GEMINI_GENERATOR_MODEL='your-generator-model'
-export GEMINI_VERIFIER_MODEL='your-verifier-model'
-
-rm -rf outputs/singguard-pilot-v1
-python scripts/generate_singguard_data.py outputs/singguard-pilot-v1 \
-  --anchors 100 \
-  --seed 42 \
-  --generator-model "$GEMINI_GENERATOR_MODEL" \
-  --verifier-model "$GEMINI_VERIFIER_MODEL" \
-  --seeds outputs/singguard-seeds/seeds.jsonl \
-  --allow-external-data \
-  --max-requests 800 \
-  --max-output-tokens 4096 \
-  --request-timeout 120 \
-  --pilot
-```
-
-The command renders a live terminal progress bar on stderr with the current
-`generate` / `verify` / `retry` phase, completed anchors, accepted anchors,
-rejected attempts, provider requests, elapsed time, and ETA. The final manifest
-remains the only stdout JSON object, so it can still be redirected or parsed.
-
-If the command stops because of a transient provider failure or request budget,
-keep the directory and resume with the identical arguments plus a sufficiently
-large total request limit:
-
-```bash
-python scripts/generate_singguard_data.py outputs/singguard-pilot-v1 \
-  --anchors 100 \
-  --seed 42 \
-  --generator-model "$GEMINI_GENERATOR_MODEL" \
-  --verifier-model "$GEMINI_VERIFIER_MODEL" \
-  --seeds outputs/singguard-seeds/seeds.jsonl \
-  --allow-external-data \
-  --max-requests 1200 \
-  --max-output-tokens 4096 \
-  --request-timeout 120 \
-  --pilot \
-  --resume
-```
-
-Resume is rejected if the plan, prompt files, or seed assignments differ from the
-checkpoint. Requests and credentials are never persisted.
-
-## 5. Review before scaling
-
-Inspect these files:
-
-- `quality_report.json`: acceptance, first-pass verifier agreement, DQS,
-  duplicate rate, coverage, distributions, and rejection reasons;
-- `review_sample.jsonl`: deterministic 10% whole-anchor sample spanning all eight
-  domains;
-- `rejected.jsonl`: every failed attempt with local reason codes, but no provider
-  prompt or credential;
-- `ms_swift/train.jsonl`, `dev.jsonl`, and `holdout.jsonl`: two policy-conditioned
-  rows per accepted anchor.
-
-Stop and revise prompts/rules as a new dataset version if first-pass agreement is
-below 80%, final acceptance is below 90%, near-duplicate rejection exceeds 5%,
-DQS is below 90, quota coverage fails, or human review finds systematic errors.
-Do not hand-edit accepted rows.
-
-Only after approval, create a new directory for the full batch:
-
-```bash
-python scripts/generate_singguard_data.py outputs/singguard-2000-v1 \
-  --anchors 2000 \
-  --seed 42 \
-  --generator-model "$GEMINI_GENERATOR_MODEL" \
-  --verifier-model "$GEMINI_VERIFIER_MODEL" \
-  --seeds outputs/singguard-seeds/seeds.jsonl \
-  --allow-external-data \
-  --max-requests 15000 \
+rm -rf outputs/singguard-v1
+python scripts/generate_singguard_data.py \
+  data/active_policies.jsonl \
+  data/content_samples.jsonl \
+  outputs/singguard-v1 \
+  --tool-env data/tool_env \
+  --max-tool-calls 2 \
+  --max-requests 500 \
   --max-output-tokens 4096 \
   --request-timeout 120
 ```
 
-The expected upper target is 2,000 accepted anchors and 4,000 SFT rows. The
-actual accepted count is reported rather than silently padding failed quota cells.
+The progress bar is written to stderr. The manifest remains the only stdout JSON
+object, so automation can parse it.
+
+For each sample, the pipeline:
+
+1. renders the complete SingGuard system prompt with all active rules;
+2. gives the prompt and conversation to Gemini;
+3. executes each allowed tool locally and sends the real result back to Gemini;
+4. accepts at most two sequential calls;
+5. validates the final `fast` or `slow` completion exactly;
+6. makes at most one fresh, tool-free grammar-repair request;
+7. writes either an accepted training row or a sanitized rejection.
+
+## 5. Resume safely
+
+If the provider fails or the request/cost budget is reached, preserve the output
+directory and repeat the same command with `--resume`. `--max-requests` and
+`--max-cost-usd` are total batch limits, so a resumed limit must not be lower than
+already recorded usage.
+
+```bash
+python scripts/generate_singguard_data.py \
+  data/active_policies.jsonl \
+  data/content_samples.jsonl \
+  outputs/singguard-v1 \
+  --tool-env data/tool_env \
+  --max-tool-calls 2 \
+  --max-requests 800 \
+  --resume
+```
+
+Resume validates hashes of the normalized policies, samples, four tool tables,
+and the guard prompt. It never silently mixes versions.
+
+## 6. Inspect before training
+
+Review:
+
+- `manifest.json`: status, accepted/rejected/repaired counts, modes, tool calls,
+  and budget accounting;
+- `train.jsonl`: complete prompts, real trajectories, and original accepted
+  Gemini text;
+- `rejected.jsonl`: reason codes and bounded, redacted candidates;
+- `checkpoint.json`: completed count, budget, and fingerprints.
+
+Minimum first-batch checks:
+
+- every system prompt includes the intended complete active policy;
+- safe/unsafe and `fast`/`slow` distributions match the reviewed sample plan;
+- `slow` traces check every active rule in policy order;
+- tool results are relevant, deterministic, and not copied from an oracle;
+- repaired rows are manually inspected as a separate slice;
+- near duplicates and templated wording are not dominating the batch.
+
+Do not hand-edit accepted rows. Correct prompts, policies, samples, or tool data
+and create a new versioned output directory.
+
+## 7. Train
+
+```bash
+TRAIN_DATA=outputs/singguard-v1/train.jsonl \
+VAL_DATA= \
+OUTPUT_DIR=outputs/qwen3_vl_8b_singguard_sft \
+bash scripts/train_qwen3_vl_sft.sh
+```
+
+Keep a separate, approved holdout. Generated training rows are not a substitute
+for real content-risk evaluation data.
