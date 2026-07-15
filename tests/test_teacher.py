@@ -17,6 +17,17 @@ from risk_agent.teacher import (
 )
 
 
+def test_shared_gemini_client_builder_accepts_injected_factory():
+    from risk_agent.teacher import create_gemini_client
+
+    sentinel = object()
+
+    assert create_gemini_client(
+        request_timeout_seconds=12.5,
+        client_factory=lambda: sentinel,
+    ) is sentinel
+
+
 def test_callable_teacher_accepts_a_structured_fake_without_external_dependencies():
     seen = []
 

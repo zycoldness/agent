@@ -321,6 +321,45 @@ _IMAGE_MIME_TYPES = {
 }
 
 
+def create_gemini_client(
+    *,
+    request_timeout_seconds: float,
+    client_factory: Callable[[], object] | None = None,
+) -> object:
+    """Create one API-key or Vertex Gemini client with a finite timeout."""
+
+    timeout = _finite_nonnegative(
+        request_timeout_seconds,
+        "request_timeout_seconds",
+        maximum=600,
+    )
+    if timeout == 0:
+        raise ValueError("request_timeout_seconds must be positive")
+    if client_factory is not None:
+        return client_factory()
+    try:
+        from google import genai
+    except ImportError:
+        raise RuntimeError(
+            "Gemini support requires the optional 'teacher' dependency"
+        ) from None
+    use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    api_key = None if use_vertex else (
+        os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    )
+    http_options: dict[str, object] = {"timeout": int(timeout * 1000)}
+    if use_vertex:
+        http_options["api_version"] = "v1"
+    kwargs: dict[str, object] = {"http_options": http_options}
+    if api_key:
+        kwargs["api_key"] = api_key
+    return genai.Client(**kwargs)
+
+
 def _prompt_and_image_paths(request: Mapping[str, Any]) -> tuple[str, list[Path]]:
     payload = dict(request)
     task = payload.get("task")
@@ -421,31 +460,10 @@ class GeminiTeacher:
         self._budget = budget
 
     def _new_client(self) -> object:
-        if self._client_factory is not None:
-            return self._client_factory()
-        try:
-            from google import genai
-        except ImportError:
-            raise RuntimeError(
-                "Gemini support requires the optional 'teacher' dependency"
-            ) from None
-        use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-        }
-        api_key = None if use_vertex else (
-            os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        return create_gemini_client(
+            request_timeout_seconds=self._request_timeout_seconds,
+            client_factory=self._client_factory,
         )
-        http_options: dict[str, object] = {
-            "timeout": int(self._request_timeout_seconds * 1000)
-        }
-        if use_vertex:
-            http_options["api_version"] = "v1"
-        kwargs: dict[str, object] = {"http_options": http_options}
-        if api_key:
-            kwargs["api_key"] = api_key
-        return genai.Client(**kwargs)
 
     def generate(self, request: Mapping[str, Any]) -> TeacherReply:
         prompt, image_paths = _prompt_and_image_paths(request)
