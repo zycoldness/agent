@@ -8,6 +8,8 @@ import os
 import re
 import time
 from collections.abc import Callable, Sequence
+from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Protocol
 
@@ -32,6 +34,7 @@ from risk_agent.singguard_tools import (
 from risk_agent.singguard_prompts import prompt_sha256
 from risk_agent.teacher import (
     GeminiTeacher,
+    ProviderFailureDiagnostic,
     TeacherBudget,
     TeacherBudgetExceeded,
     TeacherRequestError,
@@ -128,6 +131,7 @@ class GeminiAgentProvider(GeminiTeacher):
         output_cost_per_million: float | None = None,
         max_output_tokens: int = 4096,
         budget: TeacherBudget | None = None,
+        event_sink: Callable[[dict[str, object]], object] | None = None,
     ) -> None:
         super().__init__(
             model=model,
@@ -147,6 +151,78 @@ class GeminiAgentProvider(GeminiTeacher):
         self._types_module = types_module
         self._chat: object | None = None
         self._context_text = ""
+        self._event_sink = event_sink
+        self._sample_id: str | None = None
+
+    def set_event_sink(
+        self,
+        event_sink: Callable[[dict[str, object]], object] | None,
+    ) -> None:
+        self._event_sink = event_sink
+
+    def begin_sample(self, sample_id: str) -> None:
+        self._sample_id = sample_id
+
+    def diagnostic_metadata(self) -> dict[str, object]:
+        try:
+            sdk_version = version("google-genai")
+        except PackageNotFoundError:
+            sdk_version = "unknown"
+        use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").casefold()
+        return {
+            "name": "gemini",
+            "model": self.model,
+            "sdk": "google-genai",
+            "sdk_version": sdk_version,
+            "backend": (
+                "vertex_ai"
+                if use_vertex in {"1", "true", "yes", "on"}
+                else "developer_api"
+            ),
+        }
+
+    def _emit(self, event: str, **fields: object) -> None:
+        if self._event_sink is None:
+            return
+        payload: dict[str, object] = {
+            "event": event,
+            "provider": "gemini",
+            "model": self.model,
+        }
+        if self._sample_id is not None:
+            payload["sample_id"] = self._sample_id
+        payload.update(fields)
+        try:
+            self._event_sink(payload)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _failure_diagnostic(
+        error: Exception,
+        *,
+        stage: str,
+        attempts: int,
+    ) -> ProviderFailureDiagnostic:
+        code = getattr(error, "code", None)
+        if isinstance(code, bool) or not isinstance(code, int):
+            code = None
+        status = getattr(error, "status", None)
+        if not (
+            isinstance(status, str)
+            and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", status)
+        ):
+            status = None
+        exception_type = type(error).__name__
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", exception_type):
+            exception_type = "Exception"
+        return ProviderFailureDiagnostic(
+            stage=stage,
+            exception_type=exception_type,
+            http_code=code,
+            provider_status=status,
+            attempts=attempts,
+        )
 
     def _types(self) -> object:
         if self._types_module is not None:
@@ -159,7 +235,7 @@ class GeminiAgentProvider(GeminiTeacher):
             ) from None
         return types
 
-    def _send(self, message: object) -> object:
+    def _send(self, message: object, *, stage: str) -> object:
         if self._chat is None:
             raise RuntimeError("Gemini agent chat has not been started")
         aggregate = _UsageAccumulator(
@@ -175,10 +251,27 @@ class GeminiAgentProvider(GeminiTeacher):
                 reservation = self._budget.reserve_request(
                     worst_case_cost_usd=worst_case_cost
                 )
+            self._emit(
+                "provider_request_started",
+                stage=stage,
+                attempt=attempt,
+                max_attempts=self._max_attempts,
+            )
             try:
                 response = self._chat.send_message(message)
-            except Exception:
+            except Exception as error:
                 usage = aggregate.add(None, None)
+                diagnostic = self._failure_diagnostic(
+                    error,
+                    stage=stage,
+                    attempts=attempt,
+                )
+                self._emit(
+                    "provider_request_failed",
+                    **diagnostic.as_dict(),
+                    attempt=attempt,
+                    max_attempts=self._max_attempts,
+                )
                 if self._budget is not None:
                     self._budget.record_attempt(
                         TeacherUsage(
@@ -189,11 +282,20 @@ class GeminiAgentProvider(GeminiTeacher):
                         reserved_cost_usd=reservation,
                     )
                 if attempt < self._max_attempts:
-                    self._sleep(self._retry_delay(attempt))
+                    delay = self._retry_delay(attempt)
+                    self._emit(
+                        "provider_retry_scheduled",
+                        stage=stage,
+                        attempt=attempt,
+                        next_attempt=attempt + 1,
+                        delay_seconds=delay,
+                    )
+                    self._sleep(delay)
                     continue
                 raise TeacherRequestError(
                     f"Gemini agent request failed after {self._max_attempts} attempts",
                     usage,
+                    diagnostic,
                 ) from None
             usage = self._normalize_response_usage(response)
             aggregate.add(
@@ -206,6 +308,14 @@ class GeminiAgentProvider(GeminiTeacher):
                     usage,
                     reserved_cost_usd=reservation,
                 )
+            self._emit(
+                "provider_request_succeeded",
+                stage=stage,
+                attempt=attempt,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                accounting_complete=usage.accounting_complete,
+            )
             return response
         raise RuntimeError("unreachable Gemini retry state")
 
@@ -259,7 +369,13 @@ class GeminiAgentProvider(GeminiTeacher):
                 model=self.model,
                 config=types.GenerateContentConfig(**config_kwargs),
             )
-        except Exception:
+        except Exception as error:
+            diagnostic = self._failure_diagnostic(
+                error,
+                stage="client_init",
+                attempts=0,
+            )
+            self._emit("provider_client_init_failed", **diagnostic.as_dict())
             raise TeacherRequestError(
                 "Gemini agent client initialization failed",
                 TeacherUsage(
@@ -268,9 +384,10 @@ class GeminiAgentProvider(GeminiTeacher):
                     request_count=0,
                     accounting_complete=False,
                 ),
+                diagnostic,
             ) from None
         self._context_text = f"{system}\n{user}"
-        response = self._send(user)
+        response = self._send(user, stage="initial")
         return self._to_turn(response)
 
     def continue_with_tool_result(
@@ -288,7 +405,7 @@ class GeminiAgentProvider(GeminiTeacher):
             name=call.name,
             response=payload,
         )
-        response = self._send(part)
+        response = self._send(part, stage="tool_response")
         return self._to_turn(response)
 
     def repair(
@@ -324,7 +441,13 @@ class GeminiAgentProvider(GeminiTeacher):
                     max_output_tokens=self._max_output_tokens,
                 ),
             )
-        except Exception:
+        except Exception as error:
+            diagnostic = self._failure_diagnostic(
+                error,
+                stage="repair_init",
+                attempts=0,
+            )
+            self._emit("provider_client_init_failed", **diagnostic.as_dict())
             raise TeacherRequestError(
                 "Gemini repair client initialization failed",
                 TeacherUsage(
@@ -333,9 +456,10 @@ class GeminiAgentProvider(GeminiTeacher):
                     request_count=0,
                     accounting_complete=False,
                 ),
+                diagnostic,
             ) from None
         self._context_text = f"{system}{repair_instruction}\n{repair_user}"
-        return self._to_turn(self._send(repair_user))
+        return self._to_turn(self._send(repair_user, stage="repair"))
 
 
 def _tool_call_content(call: ToolCall) -> str:
@@ -396,6 +520,7 @@ def generate_example(
     environment: ToolEnvironment,
     *,
     max_tool_calls: int = 2,
+    event_sink: Callable[[dict[str, object]], object] | None = None,
 ) -> GeneratedExample:
     """Execute the complete prompt and preserve only locally produced tool results."""
 
@@ -424,6 +549,15 @@ def generate_example(
 
     while turn.tool_call is not None:
         call = turn.tool_call
+        if event_sink is not None:
+            event_sink(
+                {
+                    "event": "tool_call_received",
+                    "sample_id": sample.sample_id,
+                    "tool_name": call.name,
+                    "call_index": calls + 1,
+                }
+            )
         if call.name not in sample.tool_names:
             raise ValueError("requested tool is not enabled for this sample")
         if calls >= max_tool_calls:
@@ -440,6 +574,16 @@ def generate_example(
                     trajectory=tuple(trajectory),
                 )
         result = environment.execute(call)
+        if event_sink is not None:
+            event_sink(
+                {
+                    "event": "tool_result_created",
+                    "sample_id": sample.sample_id,
+                    "tool_name": call.name,
+                    "call_index": calls + 1,
+                    "status": result.status,
+                }
+            )
         trajectory.extend(
             (
                 Message(role="tool_call", content=_tool_call_content(call)),
@@ -457,6 +601,15 @@ def generate_example(
             "required_tool_missing",
             candidate=completion,
             trajectory=tuple(trajectory),
+        )
+    if event_sink is not None:
+        event_sink(
+            {
+                "event": "candidate_received",
+                "sample_id": sample.sample_id,
+                "thinking_type": sample.thinking_type,
+                "tool_call_count": calls,
+            }
         )
     try:
         parsed = _validate_candidate(completion, policy=policy, sample=sample)
@@ -496,6 +649,40 @@ def _atomic_json(path: Path, payload: object) -> None:
         encoding="utf-8",
     )
     os.replace(temporary, path)
+
+
+class _SafeEventLog:
+    """Append-only operational events containing allowlisted metadata only."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        try:
+            self.path.touch(exist_ok=True)
+        except OSError:
+            raise ValueError("cannot initialize event log") from None
+
+    def write(self, payload: dict[str, object]) -> None:
+        event = {
+            "schema": "singguard-event-v1",
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            **payload,
+        }
+        try:
+            with self.path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(
+                    json.dumps(
+                        event,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    + "\n"
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+        except (OSError, TypeError, ValueError):
+            raise RuntimeError("cannot write safe event log") from None
 
 
 def _atomic_jsonl(path: Path, rows: Sequence[object]) -> None:
@@ -704,7 +891,28 @@ def run_generation_batch(
                 **fingerprints,
             },
         )
+    event_log = _SafeEventLog(output_dir / "events.jsonl")
+    set_event_sink = getattr(provider, "set_event_sink", None)
+    if callable(set_event_sink):
+        set_event_sink(event_log.write)
+    diagnostic_metadata = getattr(provider, "diagnostic_metadata", None)
+    if callable(diagnostic_metadata):
+        provider_info = dict(diagnostic_metadata())
+    else:
+        provider_model = getattr(provider, "model", None)
+        provider_info = {"name": type(provider).__name__}
+        if isinstance(provider_model, str) and provider_model:
+            provider_info["model"] = provider_model
+    event_log.write(
+        {
+            "event": "batch_resumed" if resume else "batch_started",
+            "planned_samples": len(samples),
+            "completed_samples": completed,
+            **provider_info,
+        }
+    )
     stopped_reason: str | None = None
+    provider_failure: dict[str, object] | None = None
 
     def emit(phase: str, sample_id: str | None = None) -> None:
         if progress is None:
@@ -726,6 +934,21 @@ def run_generation_batch(
 
     emit("start")
     for sample in samples[completed:]:
+        begin_sample = getattr(provider, "begin_sample", None)
+        if callable(begin_sample):
+            begin_sample(sample.sample_id)
+        event_log.write(
+            {
+                "event": "sample_started",
+                "sample_id": sample.sample_id,
+                "thinking_type": sample.thinking_type,
+                "tool_policy": sample.tool_policy,
+                "configured_tool_count": len(sample.tool_names),
+            }
+        )
+        accepted_before = len(accepted_rows)
+        rejected_before = len(rejected_rows)
+        sample_repaired = False
         emit("generate", sample.sample_id)
         try:
             generated = generate_example(
@@ -734,8 +957,18 @@ def run_generation_batch(
                 provider,
                 environment,
                 max_tool_calls=max_tool_calls,
+                event_sink=event_log.write,
             )
         except GenerationRejected as error:
+            event_log.write(
+                {
+                    "event": "candidate_rejected",
+                    "sample_id": sample.sample_id,
+                    "code": error.code,
+                    "repairable": error.code in _REPAIRABLE_CODES,
+                    "tool_call_count": len(error.trajectory) // 2,
+                }
+            )
             repair = getattr(provider, "repair", None)
             repaired_candidate: str | None = None
             repair_code: str | None = None
@@ -772,8 +1005,27 @@ def run_generation_batch(
                 except TeacherBudgetExceeded as budget_error:
                     stopped_reason = budget_error.reason
                     break
-                except TeacherRequestError:
+                except TeacherRequestError as request_error:
                     stopped_reason = "provider_error"
+                    provider_failure = (
+                        request_error.diagnostic.as_dict()
+                        if request_error.diagnostic is not None
+                        else {
+                            "stage": "unknown",
+                            "exception_type": "TeacherRequestError",
+                            "http_code": None,
+                            "provider_status": None,
+                            "attempts": 0,
+                        }
+                    )
+                    event_log.write(
+                        {
+                            "event": "batch_stopped",
+                            "sample_id": sample.sample_id,
+                            "reason": stopped_reason,
+                            **provider_failure,
+                        }
+                    )
                     break
                 except ValueError as repair_error:
                     repair_code = _validation_code(repair_error)
@@ -792,6 +1044,7 @@ def run_generation_batch(
                             )
                         )
                         repaired += 1
+                        sample_repaired = True
             if repaired_candidate is None or repair_code is not None:
                 codes = [error.code]
                 if repair_code is not None:
@@ -810,9 +1063,35 @@ def run_generation_batch(
                 )
         except TeacherBudgetExceeded as error:
             stopped_reason = error.reason
+            event_log.write(
+                {
+                    "event": "batch_stopped",
+                    "sample_id": sample.sample_id,
+                    "reason": stopped_reason,
+                }
+            )
             break
-        except TeacherRequestError:
+        except TeacherRequestError as error:
             stopped_reason = "provider_error"
+            provider_failure = (
+                error.diagnostic.as_dict()
+                if error.diagnostic is not None
+                else {
+                    "stage": "unknown",
+                    "exception_type": "TeacherRequestError",
+                    "http_code": None,
+                    "provider_status": None,
+                    "attempts": 0,
+                }
+            )
+            event_log.write(
+                {
+                    "event": "batch_stopped",
+                    "sample_id": sample.sample_id,
+                    "reason": stopped_reason,
+                    **provider_failure,
+                }
+            )
             break
         else:
             accepted_rows.append(
@@ -822,6 +1101,22 @@ def run_generation_batch(
                     tools_json=generated.tools_json,
                     trajectory=generated.trajectory,
                 )
+            )
+        if len(accepted_rows) > accepted_before:
+            event_log.write(
+                {
+                    "event": "sample_accepted",
+                    "sample_id": sample.sample_id,
+                    "repaired": sample_repaired,
+                }
+            )
+        elif len(rejected_rows) > rejected_before:
+            event_log.write(
+                {
+                    "event": "sample_rejected",
+                    "sample_id": sample.sample_id,
+                    "codes": rejected_rows[-1].get("codes", []),
+                }
             )
         completed += 1
         _atomic_jsonl(output_dir / "train.jsonl", accepted_rows)
@@ -875,6 +1170,8 @@ def run_generation_batch(
         "schema": "singguard-active-policy-batch-v1",
         "status": status,
         "reason": stopped_reason,
+        "provider": provider_info,
+        "event_log": "events.jsonl",
         "planned_samples": len(samples),
         "completed_samples": completed,
         "accepted_samples": len(accepted_rows),
@@ -904,6 +1201,8 @@ def run_generation_batch(
         },
         "budget": budget.as_dict(),
     }
+    if provider_failure is not None:
+        manifest["provider_failure"] = provider_failure
     _atomic_json(output_dir / "manifest.json", manifest)
     _atomic_json(
         output_dir / "checkpoint.json",
@@ -913,6 +1212,16 @@ def run_generation_batch(
             "budget": budget.as_dict(),
             **fingerprints,
         },
+    )
+    event_log.write(
+        {
+            "event": "batch_complete" if status == "complete" else "batch_incomplete",
+            "reason": stopped_reason,
+            "completed_samples": completed,
+            "accepted_samples": len(accepted_rows),
+            "rejected_samples": len(rejected_rows),
+            "request_count": budget.request_count,
+        }
     )
     emit("complete" if status == "complete" else "incomplete")
     return manifest

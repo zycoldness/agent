@@ -65,7 +65,14 @@ The result is directly trainable:
 - `rejected.jsonl`: sanitized invalid candidates and deterministic reason codes;
 - `checkpoint.json`: progress, budget accounting, and input/prompt fingerprints;
 - `manifest.json`: execution status, accepted-mode/tool coverage, and a separate
-  semantic `quality_gate` result.
+  semantic `quality_gate` result;
+- `events.jsonl`: crash-safe, append-only operational events for provider
+  attempts, retries, tool boundaries, validation, and per-sample outcomes.
+
+Provider failures in the manifest and event log include only the request stage,
+exception type, HTTP code/status, attempts, SDK version, backend type, and model
+name. Prompts, candidates, tool arguments/results, raw provider bodies,
+credentials, project IDs, and credential paths are deliberately excluded.
 
 The bundled six-row smoke input contains hidden `expected_label` and
 `expected_answers` fields. They are used only by local quality gates and are

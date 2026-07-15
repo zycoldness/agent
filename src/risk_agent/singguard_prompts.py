@@ -81,6 +81,47 @@ def _render_tool_instructions(required_tools: tuple[str, ...]) -> str:
     )
 
 
+def _render_output_format(
+    thinking_type: str,
+    active_policy: tuple[PolicyRule, ...],
+) -> str:
+    fast = (
+        "Use exactly this structure:\n\n"
+        "safe|unsafe\n"
+        "<answer><one or more active rule titles, one per line, or Safe></answer>\n\n"
+        "Replace the placeholders and do not add text outside this structure. "
+        "A safe result must answer Safe. Every unsafe answer must be an exact "
+        "active rule title."
+    )
+    slow = (
+        "Use exactly this structure and preserve the active-rule order shown below:\n\n"
+        "safe|unsafe\n"
+        "<reasoning>\n"
+        "[Step 1] Content Summary\n"
+        "<concise summary>\n\n"
+        "[Step 2] Check Risk Categories\n"
+        f"{_render_slow_checks(active_policy)}\n\n"
+        "[Step 3] Final Judgment\n"
+        "<policy-grounded final judgment>\n"
+        "</reasoning>\n"
+        "<answer><one or more HIT active rule titles, one per line, or Safe></answer>\n\n"
+        "Replace every angle-bracket placeholder with content. Select exactly one "
+        "uppercase verdict for every rule and keep the period before its non-empty "
+        "evidence. Do not add text outside this structure. A safe result must have "
+        "no HIT verdict and must answer Safe. Every unsafe answer must be an active "
+        "rule marked HIT."
+    )
+    if thinking_type == "fast":
+        return fast
+    if thinking_type == "slow":
+        return slow
+    return (
+        "First output only safe or unsafe. Stop after that confident early exit. "
+        "If confidence is insufficient, continue immediately with this slow "
+        f"structure:\n\n{slow}"
+    )
+
+
 def _substitute(name: str, replacements: dict[str, str]) -> str:
     rendered = load_prompt(name)
     for placeholder, value in replacements.items():
@@ -102,9 +143,9 @@ def render_guard_prompt(
         "guard",
         {
             "ACTIVE_POLICY": _render_policy(active_policy),
-            "SLOW_RULE_CHECKS": _render_slow_checks(active_policy),
             "THINKING_TYPE": thinking_type,
             "TOOL_INSTRUCTIONS": _render_tool_instructions(required_tools),
+            "OUTPUT_FORMAT": _render_output_format(thinking_type, active_policy),
         },
     )
 

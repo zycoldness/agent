@@ -16,3 +16,7 @@ trajectory generation. It is not an oracle or production moderation evidence.
 `data/oracle` is never supplied to retrieval or model prompts.
 
 Production evaluation requires a separately approved/de-identified business holdout and must not be committed.
+
+Generated `events.jsonl` files contain operational metadata only. They must not
+be extended with raw prompts, candidate text, tool inputs/outputs, credentials,
+provider response bodies, or service-account details.

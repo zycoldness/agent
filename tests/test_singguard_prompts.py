@@ -41,6 +41,17 @@ def test_slow_prompt_exposes_the_exact_validator_grammar() -> None:
     assert "Do not add text outside this structure" in prompt
 
 
+def test_fast_prompt_contains_only_the_fast_output_grammar() -> None:
+    from risk_agent.singguard_prompts import render_guard_prompt
+
+    prompt = render_guard_prompt((_rule(),), thinking_type="fast")
+
+    assert "safe|unsafe\n<answer>" in prompt
+    assert "<reasoning>" not in prompt
+    assert "[Step 1] Content Summary" not in prompt
+    assert "thinking_type is slow" not in prompt
+
+
 def test_agent_prompt_extends_policy_core_with_bounded_tools() -> None:
     from risk_agent.singguard_prompts import render_agent_prompt
 

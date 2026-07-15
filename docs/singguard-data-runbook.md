@@ -127,6 +127,21 @@ Review:
   Gemini text;
 - `rejected.jsonl`: reason codes and bounded, redacted candidates;
 - `checkpoint.json`: completed count, budget, and fingerprints.
+- `events.jsonl`: fsync-backed structured events for each sample, Gemini request,
+  retry, tool boundary, validation result, and terminal batch status.
+
+When `reason=provider_error`, inspect `manifest.provider_failure` and the tail of
+`events.jsonl`. Safe diagnostics include `stage` (`client_init`, `initial`,
+`tool_response`, `repair_init`, or `repair`), exception type, HTTP code,
+provider status, attempt number, retry delay, token accounting, model, backend,
+and `google-genai` version. They intentionally exclude raw exception text,
+request/response bodies, prompts, candidates, tool arguments/results, API keys,
+project IDs, credential paths, and service-account data.
+
+```bash
+tail -n 30 outputs/singguard-v3/events.jsonl
+jq '.provider, .provider_failure, .budget' outputs/singguard-v3/manifest.json
+```
 
 Minimum first-batch checks:
 

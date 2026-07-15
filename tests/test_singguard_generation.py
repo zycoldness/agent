@@ -372,6 +372,70 @@ def test_gemini_repair_receives_exact_format_only_contract() -> None:
     assert "tools" not in captured["config"]
 
 
+def test_gemini_retry_events_keep_safe_provider_diagnostics_only() -> None:
+    from risk_agent.singguard_generation import GeminiAgentProvider
+    from risk_agent.teacher import TeacherBudget, TeacherRequestError
+
+    events: list[dict[str, object]] = []
+    sleeps: list[float] = []
+
+    class FakeAPIError(Exception):
+        code = 400
+        status = "INVALID_ARGUMENT"
+
+        def __str__(self) -> str:
+            return "api_key=never-log-this raw provider details"
+
+    class Chat:
+        def send_message(self, message):
+            raise FakeAPIError()
+
+    class Chats:
+        def create(self, **kwargs):
+            return Chat()
+
+    types_module = SimpleNamespace(
+        GenerateContentConfig=lambda **kwargs: kwargs,
+    )
+    budget = TeacherBudget(max_requests=2)
+    provider = GeminiAgentProvider(
+        model="gemini-test",
+        client_factory=lambda: SimpleNamespace(chats=Chats()),
+        types_module=types_module,
+        budget=budget,
+        max_attempts=2,
+        initial_backoff_seconds=0.5,
+        sleep=sleeps.append,
+        event_sink=events.append,
+    )
+    provider.begin_sample("sample-safe-log")
+
+    with pytest.raises(TeacherRequestError) as captured:
+        provider.start(system="system", user="[user]: content", tool_specs=())
+
+    assert captured.value.diagnostic.as_dict() == {
+        "stage": "initial",
+        "exception_type": "FakeAPIError",
+        "http_code": 400,
+        "provider_status": "INVALID_ARGUMENT",
+        "attempts": 2,
+    }
+    assert [event["event"] for event in events] == [
+        "provider_request_started",
+        "provider_request_failed",
+        "provider_retry_scheduled",
+        "provider_request_started",
+        "provider_request_failed",
+    ]
+    assert all(event["sample_id"] == "sample-safe-log" for event in events)
+    assert sleeps == [0.5]
+    serialized = json.dumps(events) + json.dumps(
+        captured.value.diagnostic.as_dict()
+    )
+    assert "never-log-this" not in serialized
+    assert "raw provider details" not in serialized
+
+
 def test_batch_writes_accepted_rows_and_specific_rejection(tmp_path: Path) -> None:
     from risk_agent.singguard_generation import AgentTurn, run_generation_batch
     from risk_agent.teacher import TeacherBudget
@@ -479,6 +543,13 @@ def test_incomplete_batch_resumes_without_repeating_completed_sample(tmp_path: P
     assert first_manifest["completed_samples"] == 1
     assert second_manifest["status"] == "complete"
     assert len(train_rows) == 2
+    events = [
+        json.loads(line)
+        for line in (output / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert sum(event["event"] == "batch_started" for event in events) == 1
+    assert sum(event["event"] == "batch_resumed" for event in events) == 1
+    assert sum(event["event"] == "sample_accepted" for event in events) == 2
 
 
 def test_batch_repairs_one_invalid_completion_without_replaying_tools(tmp_path: Path) -> None:
@@ -651,3 +722,119 @@ def test_manifest_counts_accepted_modes_and_required_tool_coverage(tmp_path: Pat
         "required_tool_samples": 1,
         "required_tool_accepted": 1,
     }
+    events = [
+        json.loads(line)
+        for line in (output / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    event_names = [event["event"] for event in events]
+    assert "tool_call_received" in event_names
+    assert "tool_result_created" in event_names
+    assert "sample_accepted" in event_names
+    tool_event = next(event for event in events if event["event"] == "tool_call_received")
+    assert tool_event["tool_name"] == "inspect_destination"
+    serialized_events = json.dumps(events)
+    assert "w-h-a-t-s-a-p-p:user123" not in serialized_events
+    assert "destination-0001" not in serialized_events
+
+
+def test_batch_persists_sanitized_provider_failure_and_stops_cleanly(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from risk_agent.singguard_generation import GeminiAgentProvider, run_generation_batch
+    from risk_agent.teacher import TeacherBudget
+
+    class FakeServerError(Exception):
+        code = 503
+        status = "UNAVAILABLE"
+
+        def __str__(self) -> str:
+            return "Bearer never-persist-this provider body"
+
+    class Chat:
+        calls = 0
+
+        def send_message(self, message):
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(
+                    function_calls=[
+                        SimpleNamespace(
+                            name="inspect_destination",
+                            args={"indicator": "w-h-a-t-s-a-p-p:user123"},
+                        )
+                    ],
+                    text=None,
+                    usage_metadata=SimpleNamespace(
+                        prompt_token_count=10,
+                        candidates_token_count=3,
+                    ),
+                )
+            raise FakeServerError()
+
+    class Chats:
+        def create(self, **kwargs):
+            return Chat()
+
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+
+    class Part:
+        @staticmethod
+        def from_function_response(*, name, response):
+            return {"name": name, "response": response}
+
+    budget = TeacherBudget(max_requests=3)
+    provider = GeminiAgentProvider(
+        model="gemini-test",
+        client_factory=lambda: SimpleNamespace(chats=Chats()),
+        types_module=SimpleNamespace(
+            GenerateContentConfig=lambda **kwargs: kwargs,
+            Tool=lambda **kwargs: kwargs,
+            Part=Part,
+        ),
+        budget=budget,
+        max_attempts=2,
+        initial_backoff_seconds=0,
+        sleep=lambda _delay: None,
+    )
+    sample = ModerationSample(
+        sample_id="provider-failure",
+        policy_id="commerce-v1",
+        thinking_type="fast",
+        query="Contact w-h-a-t-s-a-p-p:user123.",
+        tool_names=("inspect_destination",),
+        tool_policy="required",
+    )
+    output = tmp_path / "provider-failure"
+
+    manifest = run_generation_batch(
+        policies=(_policy(),),
+        samples=(sample,),
+        provider=provider,
+        environment=_environment(),
+        output_dir=output,
+        budget=budget,
+    )
+
+    assert manifest["status"] == "incomplete"
+    assert manifest["reason"] == "provider_error"
+    assert manifest["provider"]["name"] == "gemini"
+    assert manifest["provider"]["model"] == "gemini-test"
+    assert manifest["provider"]["sdk"] == "google-genai"
+    assert manifest["provider"]["sdk_version"]
+    assert manifest["provider"]["backend"] == "vertex_ai"
+    assert manifest["event_log"] == "events.jsonl"
+    assert manifest["provider_failure"] == {
+        "stage": "tool_response",
+        "exception_type": "FakeServerError",
+        "http_code": 503,
+        "provider_status": "UNAVAILABLE",
+        "attempts": 2,
+    }
+    events_text = (output / "events.jsonl").read_text(encoding="utf-8")
+    events = [json.loads(line) for line in events_text.splitlines()]
+    assert events[-1]["event"] == "batch_incomplete"
+    assert events[-1]["reason"] == "provider_error"
+    assert "never-persist-this" not in events_text
+    assert "provider body" not in events_text
+    assert "w-h-a-t-s-a-p-p:user123" not in events_text

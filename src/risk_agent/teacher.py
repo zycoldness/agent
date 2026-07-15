@@ -66,12 +66,38 @@ class TeacherReply:
     usage: TeacherUsage
 
 
+@dataclass(frozen=True)
+class ProviderFailureDiagnostic:
+    """Allowlisted provider metadata that is safe to persist."""
+
+    stage: str
+    exception_type: str
+    http_code: int | None
+    provider_status: str | None
+    attempts: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "stage": self.stage,
+            "exception_type": self.exception_type,
+            "http_code": self.http_code,
+            "provider_status": self.provider_status,
+            "attempts": self.attempts,
+        }
+
+
 class TeacherRequestError(RuntimeError):
     """Sanitized provider failure retaining accounting but no raw exception."""
 
-    def __init__(self, message: str, usage: TeacherUsage) -> None:
+    def __init__(
+        self,
+        message: str,
+        usage: TeacherUsage,
+        diagnostic: ProviderFailureDiagnostic | None = None,
+    ) -> None:
         super().__init__(message)
         self.usage = usage
+        self.diagnostic = diagnostic
 
 
 class TeacherBudgetExceeded(RuntimeError):
