@@ -25,7 +25,7 @@ class ToolResult(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    status: Literal["ok", "error"]
+    status: Literal["ok", "not_found", "error"]
     payload: dict[str, object]
 
     def to_content(self) -> str:
@@ -151,7 +151,7 @@ TOOL_SPECS: dict[str, dict[str, object]] = {
     ),
     "inspect_destination": _function(
         "inspect_destination",
-        "Normalize and inspect a link, handle, QR destination, or obfuscated contact indicator.",
+        "Inspect a link, handle, QR destination, or obfuscated contact indicator. Copy the indicator verbatim from the supplied conversation.",
         {
             "indicator": {"type": "string", "description": "The destination indicator from the content."},
         },
@@ -159,7 +159,7 @@ TOOL_SPECS: dict[str, dict[str, object]] = {
     ),
     "get_content_context": _function(
         "get_content_context",
-        "Return deterministic account and related-content history for one content ID.",
+        "Return deterministic account and related-content history for one content ID. Copy the content ID verbatim from the supplied conversation.",
         {
             "content_id": {"type": "string", "description": "Stable content identifier."},
         },
@@ -251,16 +251,35 @@ class ToolEnvironment:
         histories: tuple[_HistoryRecord, ...],
         fingerprint: str,
     ) -> None:
+        record_ids = (
+            ("case", [record.case_id for record in cases]),
+            ("evidence", [record.evidence_id for record in claims]),
+            ("destination", [record.destination_id for record in destinations]),
+            ("content", [record.content_id for record in histories]),
+        )
+        for label, values in record_ids:
+            if len(values) != len(set(values)):
+                raise ValueError(f"tool store contains duplicate {label} IDs")
         self._cases = cases
         self._claims = claims
         self._destinations = destinations
         self._histories = histories
         self.fingerprint = fingerprint
-        self._destination_index = {
-            _normalize_indicator(indicator): record
-            for record in destinations
-            for indicator in record.indicators
-        }
+        destination_index: dict[str, _DestinationRecord] = {}
+        for record in destinations:
+            for indicator in record.indicators:
+                normalized = _normalize_indicator(indicator)
+                if not normalized:
+                    raise ValueError(
+                        "tool store contains an empty normalized destination indicator"
+                    )
+                existing = destination_index.get(normalized)
+                if existing is not None and existing.destination_id != record.destination_id:
+                    raise ValueError(
+                        "tool store contains a duplicate normalized destination indicator"
+                    )
+                destination_index[normalized] = record
+        self._destination_index = destination_index
         self._history_index = {record.content_id: record for record in histories}
 
     @classmethod
@@ -320,7 +339,7 @@ class ToolEnvironment:
             top_k=args.top_k,
         )
         return ToolResult(
-            status="ok",
+            status="ok" if records else "not_found",
             payload={
                 "results": [
                     {
@@ -345,7 +364,7 @@ class ToolEnvironment:
             minimum_score=2,
         )
         return ToolResult(
-            status="ok",
+            status="ok" if records else "not_found",
             payload={
                 "results": [
                     {
@@ -363,7 +382,7 @@ class ToolEnvironment:
     def _inspect_destination(self, args: _InspectDestinationArgs) -> ToolResult:
         record = self._destination_index.get(_normalize_indicator(args.indicator))
         if record is None:
-            return ToolResult(status="ok", payload={"result": None})
+            return ToolResult(status="not_found", payload={"result": None})
         return ToolResult(
             status="ok",
             payload={
@@ -380,7 +399,7 @@ class ToolEnvironment:
     def _get_content_context(self, args: _ContentContextArgs) -> ToolResult:
         record = self._history_index.get(args.content_id)
         if record is None:
-            return ToolResult(status="ok", payload={"result": None})
+            return ToolResult(status="not_found", payload={"result": None})
         return ToolResult(
             status="ok",
             payload={

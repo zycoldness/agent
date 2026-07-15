@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -177,7 +178,11 @@ def test_agent_rejects_final_answer_before_required_tool_call() -> None:
 
 
 def test_agent_rejects_tool_not_enabled_for_sample() -> None:
-    from risk_agent.singguard_generation import AgentTurn, generate_example
+    from risk_agent.singguard_generation import (
+        AgentTurn,
+        GenerationRejected,
+        generate_example,
+    )
 
     sample = ModerationSample(
         sample_id="sample-3",
@@ -197,12 +202,18 @@ def test_agent_rejects_tool_not_enabled_for_sample() -> None:
         ]
     )
 
-    with pytest.raises(ValueError, match="not enabled"):
+    with pytest.raises(GenerationRejected) as captured:
         generate_example(_policy(), sample, provider, _environment())
+
+    assert captured.value.code == "tool_not_enabled"
 
 
 def test_agent_rejects_third_tool_call() -> None:
-    from risk_agent.singguard_generation import AgentTurn, generate_example
+    from risk_agent.singguard_generation import (
+        AgentTurn,
+        GenerationRejected,
+        generate_example,
+    )
 
     sample = ModerationSample(
         sample_id="sample-4",
@@ -223,7 +234,7 @@ def test_agent_rejects_third_tool_call() -> None:
         ]
     )
 
-    with pytest.raises(ValueError, match="tool call limit"):
+    with pytest.raises(GenerationRejected) as captured:
         generate_example(
             _policy(),
             sample,
@@ -231,6 +242,107 @@ def test_agent_rejects_third_tool_call() -> None:
             _environment(),
             max_tool_calls=2,
         )
+
+    assert captured.value.code == "tool_call_limit"
+
+
+def test_required_tool_not_found_is_rejected_before_continuation() -> None:
+    from risk_agent.singguard_generation import (
+        AgentTurn,
+        GenerationRejected,
+        generate_example,
+    )
+
+    sample = ModerationSample(
+        sample_id="required-not-found",
+        policy_id="commerce-v1",
+        thinking_type="fast",
+        query="Contact a disguised destination.",
+        tool_names=("inspect_destination",),
+        tool_policy="required",
+    )
+    provider = FakeAgentProvider(
+        [
+            AgentTurn(
+                tool_call=ToolCall(
+                    name="inspect_destination",
+                    arguments={"indicator": "w-h-a-t-a-p-p:user123"},
+                )
+            )
+        ]
+    )
+
+    with pytest.raises(GenerationRejected) as captured:
+        generate_example(_policy(), sample, provider, _environment())
+
+    assert captured.value.code == "required_tool_unsuccessful"
+    assert [message.role for message in captured.value.trajectory] == [
+        "tool_call",
+        "tool_response",
+    ]
+    assert '"status":"not_found"' in captured.value.trajectory[-1].content
+
+
+def test_auto_tool_invalid_arguments_are_rejected_before_continuation() -> None:
+    from risk_agent.singguard_generation import (
+        AgentTurn,
+        GenerationRejected,
+        generate_example,
+    )
+
+    sample = ModerationSample(
+        sample_id="auto-invalid-arguments",
+        policy_id="commerce-v1",
+        thinking_type="fast",
+        query="Find a related case.",
+        tool_names=("search_cases",),
+    )
+    provider = FakeAgentProvider(
+        [
+            AgentTurn(
+                tool_call=ToolCall(
+                    name="search_cases",
+                    arguments={"unexpected": "field"},
+                )
+            )
+        ]
+    )
+
+    with pytest.raises(GenerationRejected) as captured:
+        generate_example(_policy(), sample, provider, _environment())
+
+    assert captured.value.code == "tool_arguments_invalid"
+    assert [message.role for message in captured.value.trajectory] == [
+        "tool_call",
+        "tool_response",
+    ]
+    assert provider.received_results == []
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    (
+        (
+            "slow completion must check rules in active policy order",
+            "slow_rule_order",
+        ),
+        (
+            "unsafe slow completion answers must match every HIT rule in policy order",
+            "slow_verdict_consistency",
+        ),
+        (
+            "unsafe completion answer must belong to the active policy",
+            "inactive_answer",
+        ),
+    ),
+)
+def test_validation_code_uses_specific_failure_before_shared_words(
+    message: str,
+    expected: str,
+) -> None:
+    from risk_agent.singguard_generation import _validation_code
+
+    assert _validation_code(ValueError(message)) == expected
 
 
 def test_gemini_adapter_maps_function_call_and_response() -> None:
@@ -403,20 +515,21 @@ def test_gemini_repair_receives_exact_format_only_contract() -> None:
     provider.repair(
         system=system,
         user="[user]: neutral",
-        candidate="The content is safe.",
-        validation_code="output_grammar",
+        candidate="safe\n<reasoning>missing evidence</reasoning>\n<answer>Safe</answer>",
+        validation_code="slow_rule_evidence",
     )
 
     repair_system = captured["system_instruction"]
     assert "The only permitted changes are output serialization" in repair_system
     assert "Do not change the moderation label or triggered rule" in repair_system
     repair_user = sent[0]["contents"][0]["parts"][0]["text"]
-    assert "[validation_error]: output_grammar" in repair_user
-    assert "[rejected_candidate]:\nThe content is safe." in repair_user
+    assert "[validation_error]: slow_rule_evidence" in repair_user
+    assert "including NOT APPLICABLE" in repair_user
+    assert "[rejected_candidate]:\nsafe" in repair_user
     assert "tools" not in captured
 
 
-def test_gemini_retry_events_keep_safe_provider_diagnostics_only() -> None:
+def test_gemini_does_not_retry_non_transient_provider_error() -> None:
     from risk_agent.singguard_generation import GeminiAgentProvider
     from risk_agent.teacher import TeacherBudget, TeacherRequestError
 
@@ -469,17 +582,15 @@ def test_gemini_retry_events_keep_safe_provider_diagnostics_only() -> None:
         "exception_type": "FakeAPIError",
         "http_code": 400,
         "provider_status": "INVALID_ARGUMENT",
-        "attempts": 2,
+        "attempts": 1,
     }
     assert [event["event"] for event in events] == [
         "provider_request_started",
         "provider_request_failed",
-        "provider_retry_scheduled",
-        "provider_request_started",
-        "provider_request_failed",
     ]
+    assert events[-1]["retryable"] is False
     assert all(event["sample_id"] == "sample-safe-log" for event in events)
-    assert sleeps == [0.5]
+    assert sleeps == []
     serialized = json.dumps(events) + json.dumps(
         captured.value.diagnostic.as_dict()
     )
@@ -577,10 +688,28 @@ def test_incomplete_batch_resumes_without_repeating_completed_sample(tmp_path: P
         output_dir=output,
         budget=TeacherBudget(max_requests=10),
     )
+    from risk_agent.singguard import build_initial_messages
+
+    rendered_prompts = [
+        build_initial_messages(_policy(), sample)[0].content for sample in samples
+    ]
+    expected_prompt_sha = hashlib.sha256(
+        json.dumps(
+            rendered_prompts,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    checkpoint = json.loads(
+        (output / "checkpoint.json").read_text(encoding="utf-8")
+    )
+    assert checkpoint["prompt_sha256"] == expected_prompt_sha
     second_manifest = run_generation_batch(
         policies=(_policy(),),
         samples=samples,
-        provider=FakeAgentProvider(
+        provider=StopAfterOne(
             turns=[AgentTurn(content="safe\n<answer>Safe</answer>")]
         ),
         environment=_environment(),
@@ -601,6 +730,256 @@ def test_incomplete_batch_resumes_without_repeating_completed_sample(tmp_path: P
     assert sum(event["event"] == "batch_started" for event in events) == 1
     assert sum(event["event"] == "batch_resumed" for event in events) == 1
     assert sum(event["event"] == "sample_accepted" for event in events) == 2
+
+
+def test_resume_rejects_inconsistent_row_count_before_provider_call(tmp_path: Path) -> None:
+    from risk_agent.singguard_generation import AgentTurn, run_generation_batch
+    from risk_agent.teacher import TeacherBudget
+
+    sample = ModerationSample(
+        sample_id="completed",
+        policy_id="commerce-v1",
+        thinking_type="fast",
+        query="Example.",
+    )
+    output = tmp_path / "tampered-resume"
+    run_generation_batch(
+        policies=(_policy(),),
+        samples=(sample,),
+        provider=FakeAgentProvider(
+            [AgentTurn(content="safe\n<answer>Safe</answer>")]
+        ),
+        environment=_environment(),
+        output_dir=output,
+        budget=TeacherBudget(max_requests=10),
+    )
+    (output / "train.jsonl").write_text("", encoding="utf-8")
+    provider = FakeAgentProvider(
+        [AgentTurn(content="safe\n<answer>Safe</answer>")]
+    )
+
+    with pytest.raises(ValueError, match="row count"):
+        run_generation_batch(
+            policies=(_policy(),),
+            samples=(sample,),
+            provider=provider,
+            environment=_environment(),
+            output_dir=output,
+            budget=TeacherBudget(max_requests=10),
+            resume=True,
+        )
+
+    assert len(provider._turns) == 1
+
+
+def test_resume_rejects_changed_generation_contract(tmp_path: Path) -> None:
+    from risk_agent.singguard_generation import AgentTurn, run_generation_batch
+    from risk_agent.teacher import TeacherBudget
+
+    sample = ModerationSample(
+        sample_id="completed",
+        policy_id="commerce-v1",
+        thinking_type="fast",
+        query="Example.",
+    )
+    output = tmp_path / "changed-generation-contract"
+    run_generation_batch(
+        policies=(_policy(),),
+        samples=(sample,),
+        provider=FakeAgentProvider(
+            [AgentTurn(content="safe\n<answer>Safe</answer>")]
+        ),
+        environment=_environment(),
+        output_dir=output,
+        budget=TeacherBudget(max_requests=10),
+        max_tool_calls=2,
+    )
+
+    with pytest.raises(ValueError, match="generation_sha256"):
+        run_generation_batch(
+            policies=(_policy(),),
+            samples=(sample,),
+            provider=FakeAgentProvider([]),
+            environment=_environment(),
+            output_dir=output,
+            budget=TeacherBudget(max_requests=10),
+            max_tool_calls=1,
+            resume=True,
+        )
+
+
+def test_batch_preflights_every_required_tool_limit_before_generation(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_generation import AgentTurn, run_generation_batch
+    from risk_agent.teacher import TeacherBudget
+
+    samples = (
+        ModerationSample(
+            sample_id="valid-first",
+            policy_id="commerce-v1",
+            thinking_type="fast",
+            query="Example.",
+        ),
+        ModerationSample(
+            sample_id="invalid-second",
+            policy_id="commerce-v1",
+            thinking_type="fast",
+            query="Inspect both sources.",
+            tool_names=("inspect_destination", "get_content_context"),
+            tool_policy="required",
+        ),
+    )
+    provider = FakeAgentProvider(
+        [AgentTurn(content="safe\n<answer>Safe</answer>")]
+    )
+    output = tmp_path / "preflight-all-samples"
+
+    with pytest.raises(ValueError, match="required tool sequence"):
+        run_generation_batch(
+            policies=(_policy(),),
+            samples=samples,
+            provider=provider,
+            environment=_environment(),
+            output_dir=output,
+            budget=TeacherBudget(max_requests=10),
+            max_tool_calls=1,
+        )
+
+    assert len(provider._turns) == 1
+    assert not output.exists()
+
+
+def test_batch_preflights_hidden_answers_in_policy_order(tmp_path: Path) -> None:
+    from risk_agent.singguard_generation import AgentTurn, run_generation_batch
+    from risk_agent.teacher import TeacherBudget
+
+    policy = ActivePolicy(
+        policy_id="two-rules",
+        rules=(
+            PolicyRule(rule_id="A", title="Rule A", text="Rule A text."),
+            PolicyRule(rule_id="B", title="Rule B", text="Rule B text."),
+        ),
+    )
+    sample = ModerationSample(
+        sample_id="reversed-oracle",
+        policy_id="two-rules",
+        thinking_type="slow",
+        query="Example.",
+        expected_label="unsafe",
+        expected_answers=("Rule B", "Rule A"),
+    )
+    provider = FakeAgentProvider(
+        [AgentTurn(content="unsafe\n<answer>Rule A</answer>")]
+    )
+    output = tmp_path / "reversed-oracle"
+
+    with pytest.raises(ValueError, match="expected answers.*policy order"):
+        run_generation_batch(
+            policies=(policy,),
+            samples=(sample,),
+            provider=provider,
+            environment=_environment(),
+            output_dir=output,
+            budget=TeacherBudget(max_requests=10),
+        )
+
+    assert len(provider._turns) == 1
+    assert not output.exists()
+
+
+def test_batch_rejects_invalid_provider_turn_without_stopping(tmp_path: Path) -> None:
+    from risk_agent.singguard_generation import run_generation_batch
+    from risk_agent.teacher import TeacherBudget
+
+    class InvalidTurnProvider(FakeAgentProvider):
+        def start(self, **kwargs):
+            raise ValueError("Gemini returned neither a tool call nor final text")
+
+    output = tmp_path / "invalid-provider-turn"
+    manifest = run_generation_batch(
+        policies=(_policy(),),
+        samples=(
+            ModerationSample(
+                sample_id="invalid-turn",
+                policy_id="commerce-v1",
+                thinking_type="fast",
+                query="Example.",
+            ),
+        ),
+        provider=InvalidTurnProvider([]),
+        environment=_environment(),
+        output_dir=output,
+        budget=TeacherBudget(max_requests=10),
+    )
+
+    rejected = json.loads((output / "rejected.jsonl").read_text(encoding="utf-8"))
+    assert manifest["status"] == "complete"
+    assert rejected["codes"] == ["provider_turn_invalid"]
+
+
+def test_batch_rejects_wrong_provider_turn_type_without_stopping(tmp_path: Path) -> None:
+    from risk_agent.singguard_generation import run_generation_batch
+    from risk_agent.teacher import TeacherBudget
+
+    output = tmp_path / "wrong-provider-turn-type"
+    manifest = run_generation_batch(
+        policies=(_policy(),),
+        samples=(
+            ModerationSample(
+                sample_id="wrong-turn-type",
+                policy_id="commerce-v1",
+                thinking_type="fast",
+                query="Example.",
+            ),
+        ),
+        provider=FakeAgentProvider([{"content": "safe"}]),
+        environment=_environment(),
+        output_dir=output,
+        budget=TeacherBudget(max_requests=10),
+    )
+
+    rejected = json.loads((output / "rejected.jsonl").read_text(encoding="utf-8"))
+    assert manifest["status"] == "complete"
+    assert rejected["codes"] == ["provider_turn_invalid"]
+
+
+def test_manifest_separates_attempted_and_accepted_tool_calls(tmp_path: Path) -> None:
+    from risk_agent.singguard_generation import AgentTurn, run_generation_batch
+    from risk_agent.teacher import TeacherBudget
+
+    sample = ModerationSample(
+        sample_id="required-not-found",
+        policy_id="commerce-v1",
+        thinking_type="fast",
+        query="Contact a disguised destination.",
+        tool_names=("inspect_destination",),
+        tool_policy="required",
+    )
+    provider = FakeAgentProvider(
+        [
+            AgentTurn(
+                tool_call=ToolCall(
+                    name="inspect_destination",
+                    arguments={"indicator": "w-h-a-t-a-p-p:user123"},
+                )
+            )
+        ]
+    )
+    output = tmp_path / "rejected-tool-metrics"
+
+    manifest = run_generation_batch(
+        policies=(_policy(),),
+        samples=(sample,),
+        provider=provider,
+        environment=_environment(),
+        output_dir=output,
+        budget=TeacherBudget(max_requests=10),
+    )
+
+    assert manifest["attempted_tool_call_count"] == 1
+    assert manifest["accepted_tool_call_count"] == 0
+    assert manifest["required_tool_accepted"] == 0
 
 
 def test_batch_repairs_one_invalid_completion_without_replaying_tools(tmp_path: Path) -> None:
@@ -646,9 +1025,58 @@ def test_batch_repairs_one_invalid_completion_without_replaying_tools(tmp_path: 
     row = json.loads((output / "train.jsonl").read_text(encoding="utf-8"))
     assert manifest["accepted_samples"] == 1
     assert manifest["repaired_samples"] == 1
+    assert manifest["repair_attempts"] == 1
     assert row["messages"][-1]["content"].startswith("unsafe")
     assert provider.repair_calls[0]["candidate"] == "The content is unsafe."
     assert provider.repair_calls[0]["validation_code"] == "output_grammar"
+
+
+def test_batch_reports_specific_missing_slow_evidence_to_repair(tmp_path: Path) -> None:
+    from risk_agent.singguard_generation import AgentTurn, run_generation_batch
+    from risk_agent.teacher import TeacherBudget
+
+    invalid = (
+        "safe\n<reasoning>\n"
+        "[Step 1] Content Summary\nNeutral content.\n\n"
+        "[Step 2] Check Risk Categories\n"
+        "- Off-Platform Solicitation: NOT APPLICABLE.\n\n"
+        "[Step 3] Final Judgment\nNo rule is violated.\n"
+        "</reasoning>\n<answer>Safe</answer>"
+    )
+    valid = invalid.replace(
+        "NOT APPLICABLE.",
+        "NOT APPLICABLE. The content contains no destination.",
+    )
+
+    class RepairingProvider(FakeAgentProvider):
+        def __init__(self) -> None:
+            super().__init__([AgentTurn(content=invalid)])
+            self.validation_code: str | None = None
+
+        def repair(self, *, system, user, candidate, validation_code):
+            self.validation_code = validation_code
+            return AgentTurn(content=valid)
+
+    provider = RepairingProvider()
+    output = tmp_path / "slow-evidence-repair"
+    manifest = run_generation_batch(
+        policies=(_policy(),),
+        samples=(
+            ModerationSample(
+                sample_id="slow-evidence",
+                policy_id="commerce-v1",
+                thinking_type="slow",
+                query="Neutral content.",
+            ),
+        ),
+        provider=provider,
+        environment=_environment(),
+        output_dir=output,
+        budget=TeacherBudget(max_requests=10),
+    )
+
+    assert provider.validation_code == "slow_rule_evidence"
+    assert manifest["accepted_samples"] == 1
 
 
 def test_batch_rejects_semantic_label_mismatch_without_format_repair(tmp_path: Path) -> None:
@@ -765,7 +1193,10 @@ def test_manifest_counts_accepted_modes_and_required_tool_coverage(tmp_path: Pat
     assert manifest["accepted_thinking_type_counts"] == {"fast": 0, "slow": 1}
     assert manifest["required_tool_samples"] == 1
     assert manifest["required_tool_accepted"] == 1
-    assert manifest["tool_call_count"] == 1
+    assert manifest["schema"] == "singguard-active-policy-batch-v2"
+    assert manifest["attempted_tool_call_count"] == 1
+    assert manifest["accepted_tool_call_count"] == 1
+    assert "tool_call_count" not in manifest
     assert manifest["quality_gate"] == {
         "status": "pass",
         "expected_samples": 1,

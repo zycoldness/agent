@@ -24,6 +24,14 @@ class ActivePolicy(BaseModel):
 
     @model_validator(mode="after")
     def reject_duplicate_rules(self) -> "ActivePolicy":
+        if not self.policy_id.strip():
+            raise ValueError("active policy ID must be non-blank")
+        if any(
+            not value.strip()
+            for rule in self.rules
+            for value in (rule.rule_id, rule.title, rule.text, *rule.exceptions)
+        ):
+            raise ValueError("active policy rule fields must be non-blank")
         rule_ids = [rule.rule_id for rule in self.rules]
         titles = [rule.title for rule in self.rules]
         if len(rule_ids) != len(set(rule_ids)):
@@ -50,6 +58,16 @@ class ModerationSample(BaseModel):
 
     @model_validator(mode="after")
     def validate_hidden_expectation(self) -> "ModerationSample":
+        if not self.sample_id.strip() or not self.policy_id.strip():
+            raise ValueError("sample and policy IDs must be non-blank")
+        if not self.query.strip():
+            raise ValueError("query must be non-blank")
+        if any(not name.strip() for name in self.tool_names):
+            raise ValueError("tool names must be non-blank")
+        if len(self.tool_names) != len(set(self.tool_names)):
+            raise ValueError("tool names must be unique")
+        if any(not answer.strip() for answer in self.expected_answers):
+            raise ValueError("expected answers must be non-blank")
         if self.tool_policy == "required" and not self.tool_names:
             raise ValueError("required tool policy needs at least one tool")
         if len(self.expected_answers) != len(set(self.expected_answers)):
@@ -150,9 +168,10 @@ def validate_completion(
             raise ValueError("slow completion is missing required reasoning steps") from None
         if not _summary.strip() or not judgment.strip():
             raise ValueError("slow completion reasoning steps must not be empty")
-        check_lines = tuple(
-            line for line in checks_text.splitlines() if line.startswith("- ")
-        )
+        raw_check_lines = checks_text.splitlines()
+        if any(line and not line.startswith("- ") for line in raw_check_lines):
+            raise ValueError("slow completion Step 2 must contain only active-rule lines")
+        check_lines = tuple(line for line in raw_check_lines if line)
         observed_titles: list[str] = []
         hit_titles: set[str] = set()
         for line in check_lines:
@@ -180,8 +199,13 @@ def validate_completion(
             raise ValueError("slow completion must check rules in active policy order")
         if label == "safe" and hit_titles:
             raise ValueError("safe slow completion must not contain a hit")
-        if label == "unsafe" and any(answer not in hit_titles for answer in answers):
-            raise ValueError("unsafe slow completion answers must be marked HIT")
+        expected_hit_answers = tuple(
+            title for title in active_titles if title in hit_titles
+        )
+        if label == "unsafe" and answers != expected_hit_answers:
+            raise ValueError(
+                "unsafe slow completion answers must match every HIT rule in policy order"
+            )
 
     return ParsedCompletion(
         label=label,

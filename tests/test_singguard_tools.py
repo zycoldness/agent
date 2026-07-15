@@ -142,6 +142,109 @@ def test_destination_lookup_normalizes_obfuscated_platform_name(tmp_path: Path) 
     assert result.payload["result"]["destination_id"] == "destination-1"
 
 
+def test_destination_lookup_reports_not_found_for_changed_identifier(tmp_path: Path) -> None:
+    from risk_agent.singguard_tools import ToolCall, ToolEnvironment
+
+    environment = ToolEnvironment.load(_tool_environment(tmp_path))
+
+    result = environment.execute(
+        ToolCall(
+            name="inspect_destination",
+            arguments={"indicator": "w-h-a-t-a-p-p:user123"},
+        )
+    )
+
+    assert json.loads(result.to_content()) == {
+        "status": "not_found",
+        "result": None,
+    }
+
+
+def test_empty_search_result_reports_not_found(tmp_path: Path) -> None:
+    from risk_agent.singguard_tools import ToolCall, ToolEnvironment
+
+    environment = ToolEnvironment.load(_tool_environment(tmp_path))
+    result = environment.execute(
+        ToolCall(name="search_cases", arguments={"query": "unmatched-zebra-token"})
+    )
+
+    assert result.status == "not_found"
+    assert result.payload == {"results": []}
+
+
+def test_tool_environment_rejects_duplicate_normalized_indicators(tmp_path: Path) -> None:
+    import pytest
+
+    from risk_agent.singguard_tools import ToolEnvironment
+
+    root = _tool_environment(tmp_path)
+    with (root / "destinations.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "destination_id": "destination-2",
+                    "indicators": ["w-h-a-t-s-a-p-p:user123"],
+                    "destination_type": "different_destination",
+                    "risk_signals": [],
+                    "source_type": "synthetic_fixture",
+                    "source_id": "destination-source-2",
+                }
+            )
+            + "\n"
+        )
+
+    with pytest.raises(ValueError, match="duplicate normalized destination indicator"):
+        ToolEnvironment.load(root)
+
+
+def test_tool_environment_rejects_duplicate_record_ids(tmp_path: Path) -> None:
+    import pytest
+
+    from risk_agent.singguard_tools import ToolEnvironment
+
+    root = _tool_environment(tmp_path)
+    with (root / "content_history.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "content_id": "content-1",
+                    "recent_contents": ["Conflicting duplicate."],
+                    "account_signals": [],
+                    "source_type": "synthetic_fixture",
+                    "source_id": "history-source-duplicate",
+                }
+            )
+            + "\n"
+        )
+
+    with pytest.raises(ValueError, match="duplicate content IDs"):
+        ToolEnvironment.load(root)
+
+
+def test_tool_environment_rejects_indicator_without_searchable_content(
+    tmp_path: Path,
+) -> None:
+    import pytest
+
+    from risk_agent.singguard_tools import ToolEnvironment
+
+    root = _tool_environment(tmp_path)
+    destinations = [
+        {
+            "destination_id": "destination-empty",
+            "indicators": ["---"],
+            "destination_type": "unknown",
+            "risk_signals": [],
+            "source_type": "synthetic_fixture",
+            "source_id": "destination-source-empty",
+        }
+    ]
+    _write_jsonl(root / "destinations.jsonl", destinations)
+
+    with pytest.raises(ValueError, match="empty normalized destination indicator"):
+        ToolEnvironment.load(root)
+
+
 def test_tools_json_uses_ms_swift_function_schema() -> None:
     from risk_agent.singguard_tools import tools_json
 

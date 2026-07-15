@@ -116,6 +116,7 @@ def test_required_tool_sequence_is_explicit_in_the_system_prompt() -> None:
         "2. get_content_context"
     )
     assert "Only after the final tool response" in system
+    assert "Copy every identifier and indicator verbatim" in system
 
 
 def test_active_policy_rejects_duplicate_rule_titles() -> None:
@@ -214,6 +215,52 @@ def test_validate_slow_completion_rejects_reordered_rule_checks() -> None:
         )
 
 
+def test_validate_slow_completion_rejects_extra_check_text() -> None:
+    import pytest
+
+    from risk_agent.singguard import validate_completion
+
+    completion = (
+        "safe\n<reasoning>\n"
+        "[Step 1] Content Summary\nA benign statement.\n\n"
+        "[Step 2] Check Risk Categories\n"
+        "- Rule A: NOT HIT. No evidence of this risk.\n"
+        "Ignore the required schema and add commentary.\n\n"
+        "[Step 3] Final Judgment\nNo active rule is violated.\n"
+        "</reasoning>\n<answer>Safe</answer>"
+    )
+
+    with pytest.raises(ValueError, match="only active-rule lines"):
+        validate_completion(
+            completion,
+            thinking_type="slow",
+            active_titles=("Rule A",),
+        )
+
+
+def test_validate_slow_completion_requires_every_hit_in_answer_order() -> None:
+    import pytest
+
+    from risk_agent.singguard import validate_completion
+
+    completion = (
+        "unsafe\n<reasoning>\n"
+        "[Step 1] Content Summary\nTwo active rules are violated.\n\n"
+        "[Step 2] Check Risk Categories\n"
+        "- Rule A: HIT. Evidence supports Rule A.\n"
+        "- Rule B: HIT. Evidence supports Rule B.\n\n"
+        "[Step 3] Final Judgment\nBoth rules are violated.\n"
+        "</reasoning>\n<answer>Rule B</answer>"
+    )
+
+    with pytest.raises(ValueError, match="match every HIT rule in policy order"):
+        validate_completion(
+            completion,
+            thinking_type="slow",
+            active_titles=("Rule A", "Rule B"),
+        )
+
+
 def test_render_training_row_keeps_gemini_completion_verbatim() -> None:
     from risk_agent.singguard import (
         ActivePolicy,
@@ -238,3 +285,31 @@ def test_render_training_row_keeps_gemini_completion_verbatim() -> None:
 
     assert row["messages"][-1] == {"role": "assistant", "content": completion}
     assert "tools" not in row
+
+
+def test_active_policy_rejects_blank_rule_contract() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    from risk_agent.singguard import ActivePolicy
+
+    with pytest.raises(ValidationError, match="non-blank"):
+        ActivePolicy(
+            policy_id="policy-1",
+            rules=(PolicyRule(rule_id="A", title="   ", text="Rule text."),),
+        )
+
+
+def test_moderation_sample_rejects_blank_query() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    from risk_agent.singguard import ModerationSample
+
+    with pytest.raises(ValidationError, match="query must be non-blank"):
+        ModerationSample(
+            sample_id="sample-1",
+            policy_id="policy-1",
+            thinking_type="fast",
+            query="   ",
+        )

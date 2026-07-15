@@ -65,7 +65,8 @@ The result is directly trainable:
 - `rejected.jsonl`: sanitized invalid candidates and deterministic reason codes;
 - `checkpoint.json`: progress, budget accounting, and input/prompt fingerprints;
 - `manifest.json`: execution status, accepted-mode/tool coverage, and a separate
-  semantic `quality_gate` result;
+  semantic `quality_gate` result; `attempted_tool_call_count` includes rejected
+  trajectories while `accepted_tool_call_count` counts trainable rows only;
 - `events.jsonl`: crash-safe, append-only operational events for provider
   attempts, retries, tool boundaries, validation, and per-sample outcomes.
 
@@ -81,7 +82,8 @@ never rendered into Gemini's prompt or the exported SFT row. Do not train unless
 
 If a request budget or provider failure interrupts the batch, rerun the identical
 command with a sufficiently large total budget and `--resume`. Resume is refused
-when policy, sample, tool-environment, or guard-prompt fingerprints differ.
+when policy, sample, tool-environment, fully rendered system prompts, checkpoint
+counts, saved row counts, provider/model settings, or the tool-call limit differ.
 
 See [docs/singguard-data-runbook.md](docs/singguard-data-runbook.md) for schemas,
 review checks, and operational details.

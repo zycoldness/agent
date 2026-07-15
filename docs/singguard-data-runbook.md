@@ -114,7 +114,10 @@ python scripts/generate_singguard_data.py \
 ```
 
 Resume validates hashes of the normalized policies, samples, four tool tables,
-and the guard prompt. It never silently mixes versions.
+and every fully rendered system prompt. It also checks that saved accepted and
+rejected row counts match the checkpoint before making another provider request.
+The provider/model generation contract and tool-call limit must also match. It
+never silently mixes versions, generation settings, or truncated artifacts.
 
 ## 6. Inspect before training
 
@@ -122,7 +125,8 @@ Review:
 
 - `manifest.json`: execution status, accepted/rejected/repaired counts,
   accepted-mode distribution, required-tool coverage, semantic `quality_gate`,
-  and budget accounting;
+  budget accounting, attempted tool calls, and tool calls retained in accepted
+  rows;
 - `train.jsonl`: complete prompts, real trajectories, and original accepted
   Gemini text;
 - `rejected.jsonl`: reason codes and bounded, redacted candidates;
@@ -147,7 +151,8 @@ Minimum first-batch checks:
 
 - `status` is `complete` and `quality_gate.status` is `pass`;
 - all six smoke expectations are accepted;
-- all three required-tool samples are accepted and `tool_call_count` is three;
+- all three required-tool samples are accepted, `accepted_tool_call_count` is
+  three, and `attempted_tool_call_count` is not smaller;
 - every system prompt includes the intended complete active policy;
 - safe/unsafe and `fast`/`slow` distributions match the reviewed sample plan;
 - `slow` traces check every active rule in policy order;

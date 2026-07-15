@@ -31,7 +31,6 @@ from risk_agent.singguard_tools import (
     tool_declarations,
     tools_json,
 )
-from risk_agent.singguard_prompts import prompt_sha256
 from risk_agent.teacher import (
     GeminiTeacher,
     ProviderFailureDiagnostic,
@@ -107,8 +106,32 @@ class GenerationRejected(ValueError):
 
 _REPAIRABLE_CODES = {
     "output_grammar",
+    "answer_format",
+    "slow_structure",
+    "slow_rule_evidence",
     "slow_rule_order",
-    "completion_validation",
+    "slow_verdict_consistency",
+}
+_REPAIR_REQUIREMENTS = {
+    "output_grammar": (
+        "Output exactly one label on the first line: safe or unsafe. Never output "
+        "the literal alternatives together, and preserve every required tag."
+    ),
+    "answer_format": (
+        "A safe result must answer exactly Safe. An unsafe result must list each "
+        "triggered active-rule title exactly once in policy order."
+    ),
+    "slow_structure": (
+        "Preserve all three named reasoning steps and the reasoning and answer tags."
+    ),
+    "slow_rule_evidence": (
+        "Every active-rule line, including NOT APPLICABLE and NOT HIT, must include "
+        "non-empty evidence after the verdict period."
+    ),
+    "slow_rule_order": "Check every active rule exactly once in policy order.",
+    "slow_verdict_consistency": (
+        "The final label and answer must exactly match every rule marked HIT."
+    ),
 }
 
 
@@ -174,6 +197,8 @@ class GeminiAgentProvider(GeminiTeacher):
         return {
             "name": "gemini",
             "model": self.model,
+            "temperature": self._temperature,
+            "max_output_tokens": self._max_output_tokens,
             "sdk": "google-genai",
             "sdk_version": sdk_version,
             "backend": (
@@ -226,6 +251,29 @@ class GeminiAgentProvider(GeminiTeacher):
             attempts=attempts,
         )
 
+    @staticmethod
+    def _retryable_provider_error(
+        error: Exception,
+        diagnostic: ProviderFailureDiagnostic,
+    ) -> bool:
+        if diagnostic.http_code is not None:
+            return diagnostic.http_code in {408, 409, 425, 429} or (
+                500 <= diagnostic.http_code <= 599
+            )
+        if diagnostic.provider_status is not None:
+            return diagnostic.provider_status in {
+                "ABORTED",
+                "DEADLINE_EXCEEDED",
+                "INTERNAL",
+                "RESOURCE_EXHAUSTED",
+                "UNAVAILABLE",
+            }
+        exception_type = type(error).__name__.casefold()
+        return isinstance(error, (ConnectionError, TimeoutError)) or any(
+            marker in exception_type
+            for marker in ("connection", "timeout", "transport")
+        )
+
     def _types(self) -> object:
         if self._types_module is not None:
             return self._types_module
@@ -273,11 +321,13 @@ class GeminiAgentProvider(GeminiTeacher):
                     stage=stage,
                     attempts=attempt,
                 )
+                retryable = self._retryable_provider_error(error, diagnostic)
                 self._emit(
                     "provider_request_failed",
                     **diagnostic.as_dict(),
                     attempt=attempt,
                     max_attempts=self._max_attempts,
+                    retryable=retryable,
                 )
                 if self._budget is not None:
                     self._budget.record_attempt(
@@ -288,7 +338,7 @@ class GeminiAgentProvider(GeminiTeacher):
                         ),
                         reserved_cost_usd=reservation,
                     )
-                if attempt < self._max_attempts:
+                if retryable and attempt < self._max_attempts:
                     delay = self._retry_delay(attempt)
                     self._emit(
                         "provider_retry_scheduled",
@@ -300,7 +350,7 @@ class GeminiAgentProvider(GeminiTeacher):
                     self._sleep(delay)
                     continue
                 raise TeacherRequestError(
-                    f"Gemini agent request failed after {self._max_attempts} attempts",
+                    f"Gemini agent request failed after {attempt} attempts",
                     usage,
                     diagnostic,
                 ) from None
@@ -447,6 +497,7 @@ class GeminiAgentProvider(GeminiTeacher):
         )
         repair_user = (
             f"{user}\n\n[validation_error]: {validation_code}"
+            f"\n[repair_requirement]: {_REPAIR_REQUIREMENTS.get(validation_code, 'Re-emit the exact required output without changing its classification.')}"
             f"\n[rejected_candidate]:\n{candidate}"
         )
         try:
@@ -493,8 +544,21 @@ def _tool_call_content(call: ToolCall) -> str:
 
 def _validation_code(error: ValueError) -> str:
     message = str(error)
-    if "active policy" in message:
+    if (
+        "must belong to the active policy" in message
+        or "checks an inactive policy rule" in message
+    ):
         return "inactive_answer"
+    if "missing or duplicate titles" in message or "must answer Safe" in message:
+        return "answer_format"
+    if "missing the content summary" in message or "required reasoning steps" in message:
+        return "slow_structure"
+    if "reasoning steps must not be empty" in message:
+        return "slow_structure"
+    if "only active-rule lines" in message or "invalid evidence" in message:
+        return "slow_rule_evidence"
+    if "must not contain a hit" in message or "match every HIT rule" in message:
+        return "slow_verdict_consistency"
     if "policy order" in message:
         return "slow_rule_order"
     if "grammar" in message:
@@ -559,16 +623,25 @@ def generate_example(
     serialized_tools = tools_json(sample.tool_names) if sample.tool_names else None
     declarations = tool_declarations(sample.tool_names)
     initial = build_initial_messages(policy, sample)
-    turn = provider.start(
-        system=initial[0].content,
-        user=initial[1].content,
-        tool_specs=declarations,
-    )
+    try:
+        turn = provider.start(
+            system=initial[0].content,
+            user=initial[1].content,
+            tool_specs=declarations,
+        )
+    except GenerationRejected:
+        raise
+    except ValueError:
+        raise GenerationRejected("provider_turn_invalid") from None
+    if not isinstance(turn, AgentTurn):
+        raise GenerationRejected("provider_turn_invalid")
     trajectory: list[Message] = []
     calls = 0
 
     while turn.tool_call is not None:
         call = turn.tool_call
+        call_message = Message(role="tool_call", content=_tool_call_content(call))
+        rejected_trajectory = (*trajectory, call_message)
         if event_sink is not None:
             event_sink(
                 {
@@ -579,19 +652,25 @@ def generate_example(
                 }
             )
         if call.name not in sample.tool_names:
-            raise ValueError("requested tool is not enabled for this sample")
+            raise GenerationRejected(
+                "tool_not_enabled",
+                trajectory=rejected_trajectory,
+            )
         if calls >= max_tool_calls:
-            raise ValueError("tool call limit exceeded")
+            raise GenerationRejected(
+                "tool_call_limit",
+                trajectory=rejected_trajectory,
+            )
         if sample.tool_policy == "required":
             if calls >= len(sample.tool_names):
                 raise GenerationRejected(
                     "required_tool_extra",
-                    trajectory=tuple(trajectory),
+                    trajectory=rejected_trajectory,
                 )
             if call.name != sample.tool_names[calls]:
                 raise GenerationRejected(
                     "required_tool_order",
-                    trajectory=tuple(trajectory),
+                    trajectory=rejected_trajectory,
                 )
         result = environment.execute(call)
         if event_sink is not None:
@@ -606,12 +685,35 @@ def generate_example(
             )
         trajectory.extend(
             (
-                Message(role="tool_call", content=_tool_call_content(call)),
+                call_message,
                 Message(role="tool_response", content=result.to_content()),
             )
         )
         calls += 1
-        turn = provider.continue_with_tool_result(call=call, result=result)
+        if result.status == "error":
+            raise GenerationRejected(
+                "tool_arguments_invalid",
+                trajectory=tuple(trajectory),
+            )
+        if sample.tool_policy == "required" and result.status != "ok":
+            raise GenerationRejected(
+                "required_tool_unsuccessful",
+                trajectory=tuple(trajectory),
+            )
+        try:
+            turn = provider.continue_with_tool_result(call=call, result=result)
+        except GenerationRejected:
+            raise
+        except ValueError:
+            raise GenerationRejected(
+                "provider_turn_invalid",
+                trajectory=tuple(trajectory),
+            ) from None
+        if not isinstance(turn, AgentTurn):
+            raise GenerationRejected(
+                "provider_turn_invalid",
+                trajectory=tuple(trajectory),
+            )
 
     completion = turn.content
     if completion is None:
@@ -870,7 +972,36 @@ def run_generation_batch(
         raise ValueError("sample IDs must be unique")
     if any(sample.policy_id not in policy_by_id for sample in samples):
         raise ValueError("sample references an unknown active policy")
+    if isinstance(max_tool_calls, bool) or not isinstance(max_tool_calls, int):
+        raise ValueError("max_tool_calls must be an integer")
+    if not 0 <= max_tool_calls <= 2:
+        raise ValueError("max_tool_calls must be between zero and two")
+    for sample in samples:
+        if sample.tool_policy == "required" and len(sample.tool_names) > max_tool_calls:
+            raise ValueError("required tool sequence exceeds the tool call limit")
+        if sample.tool_names:
+            tools_json(sample.tool_names)
+        if sample.expected_label == "unsafe":
+            policy_titles = tuple(
+                rule.title for rule in policy_by_id[sample.policy_id].rules
+            )
+            expected_in_policy_order = tuple(
+                title for title in policy_titles if title in sample.expected_answers
+            )
+            if expected_in_policy_order != sample.expected_answers:
+                raise ValueError(
+                    "expected answers must belong to the active policy in policy order"
+                )
+    diagnostic_metadata = getattr(provider, "diagnostic_metadata", None)
+    if callable(diagnostic_metadata):
+        provider_info = dict(diagnostic_metadata())
+    else:
+        provider_model = getattr(provider, "model", None)
+        provider_info = {"name": type(provider).__name__}
+        if isinstance(provider_model, str) and provider_model:
+            provider_info["model"] = provider_model
     fingerprints: dict[str, object] = {
+        "contract_version": "singguard-active-policy-v2",
         "policy_sha256": _fingerprint(
             [policy.model_dump(mode="json") for policy in policies]
         ),
@@ -878,7 +1009,20 @@ def run_generation_batch(
             [sample.model_dump(mode="json") for sample in samples]
         ),
         "tool_environment_sha256": environment.fingerprint,
-        "prompt_sha256": prompt_sha256("guard"),
+        "prompt_sha256": _fingerprint(
+            [
+                build_initial_messages(policy_by_id[sample.policy_id], sample)[
+                    0
+                ].content
+                for sample in samples
+            ]
+        ),
+        "generation_sha256": _fingerprint(
+            {
+                "max_tool_calls": max_tool_calls,
+                "provider": provider_info,
+            }
+        ),
     }
     if resume:
         checkpoint = _read_json(output_dir / "checkpoint.json")
@@ -890,9 +1034,14 @@ def run_generation_batch(
             raise ValueError("resume checkpoint has invalid completed sample count")
         accepted_rows = _read_jsonl(output_dir / "train.jsonl")
         rejected_rows = _read_jsonl(output_dir / "rejected.jsonl")
+        if len(accepted_rows) + len(rejected_rows) != completed:
+            raise ValueError("resume artifact row count does not match checkpoint")
         repaired = checkpoint.get("repaired_samples", 0)
         if not isinstance(repaired, int) or not 0 <= repaired <= len(accepted_rows):
             raise ValueError("resume checkpoint has invalid repaired sample count")
+        repair_attempts = checkpoint.get("repair_attempts", 0)
+        if not isinstance(repair_attempts, int) or repair_attempts < repaired:
+            raise ValueError("resume checkpoint has invalid repair attempt count")
         _restore_budget(budget, checkpoint.get("budget"))
     else:
         output_dir.mkdir(parents=True, exist_ok=False)
@@ -900,6 +1049,7 @@ def run_generation_batch(
         rejected_rows = []
         completed = 0
         repaired = 0
+        repair_attempts = 0
         _atomic_jsonl(output_dir / "train.jsonl", accepted_rows)
         _atomic_jsonl(output_dir / "rejected.jsonl", rejected_rows)
         _atomic_json(
@@ -907,6 +1057,7 @@ def run_generation_batch(
             {
                 "completed_samples": completed,
                 "repaired_samples": repaired,
+                "repair_attempts": repair_attempts,
                 "budget": budget.as_dict(),
                 **fingerprints,
             },
@@ -915,14 +1066,6 @@ def run_generation_batch(
     set_event_sink = getattr(provider, "set_event_sink", None)
     if callable(set_event_sink):
         set_event_sink(event_log.write)
-    diagnostic_metadata = getattr(provider, "diagnostic_metadata", None)
-    if callable(diagnostic_metadata):
-        provider_info = dict(diagnostic_metadata())
-    else:
-        provider_model = getattr(provider, "model", None)
-        provider_info = {"name": type(provider).__name__}
-        if isinstance(provider_model, str) and provider_model:
-            provider_info["model"] = provider_model
     event_log.write(
         {
             "event": "batch_resumed" if resume else "batch_started",
@@ -986,7 +1129,9 @@ def run_generation_batch(
                     "sample_id": sample.sample_id,
                     "code": error.code,
                     "repairable": error.code in _REPAIRABLE_CODES,
-                    "tool_call_count": len(error.trajectory) // 2,
+                    "tool_call_count": sum(
+                        message.role == "tool_call" for message in error.trajectory
+                    ),
                 }
             )
             repair = getattr(provider, "repair", None)
@@ -997,6 +1142,7 @@ def run_generation_batch(
                 and callable(repair)
                 and error.candidate is not None
             ):
+                repair_attempts += 1
                 initial = build_initial_messages(
                     policy_by_id[sample.policy_id], sample
                 )
@@ -1146,6 +1292,7 @@ def run_generation_batch(
             {
                 "completed_samples": completed,
                 "repaired_samples": repaired,
+                "repair_attempts": repair_attempts,
                 "budget": budget.as_dict(),
                 **fingerprints,
             },
@@ -1186,8 +1333,20 @@ def run_generation_batch(
         quality_status = "pass"
     else:
         quality_status = "fail"
+    accepted_tool_call_count = sum(
+        message.get("role") == "tool_call"
+        for row in accepted_rows
+        for message in row.get("messages", [])
+        if isinstance(message, dict)
+    )
+    rejected_tool_call_count = sum(
+        message.get("role") == "tool_call"
+        for row in rejected_rows
+        for message in row.get("trajectory", [])
+        if isinstance(message, dict)
+    )
     manifest: dict[str, object] = {
-        "schema": "singguard-active-policy-batch-v1",
+        "schema": "singguard-active-policy-batch-v2",
         "status": status,
         "reason": stopped_reason,
         "provider": provider_info,
@@ -1196,6 +1355,7 @@ def run_generation_batch(
         "completed_samples": completed,
         "accepted_samples": len(accepted_rows),
         "repaired_samples": repaired,
+        "repair_attempts": repair_attempts,
         "rejected_samples": len(rejected_rows),
         "thinking_type_counts": {
             mode: sum(sample.thinking_type == mode for sample in samples[:completed])
@@ -1207,11 +1367,10 @@ def run_generation_batch(
         },
         "required_tool_samples": required_tool_samples,
         "required_tool_accepted": required_tool_accepted,
-        "tool_call_count": sum(
-            message["role"] == "tool_call"
-            for row in accepted_rows
-            for message in row["messages"]
+        "attempted_tool_call_count": (
+            accepted_tool_call_count + rejected_tool_call_count
         ),
+        "accepted_tool_call_count": accepted_tool_call_count,
         "quality_gate": {
             "status": quality_status,
             "expected_samples": expected_samples,
@@ -1229,6 +1388,7 @@ def run_generation_batch(
         {
             "completed_samples": completed,
             "repaired_samples": repaired,
+            "repair_attempts": repair_attempts,
             "budget": budget.as_dict(),
             **fingerprints,
         },
