@@ -2,14 +2,25 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
+from collections.abc import Mapping
+from pathlib import Path
 from types import MappingProxyType
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
+from risk_agent.singguard import ActivePolicy
 from risk_agent.singguard_query_planning import (
     QueryBlueprint,
     SourceRef,
@@ -19,6 +30,7 @@ from risk_agent.singguard_query_planning import (
 
 MAX_CONTENT_CHARS = 5_000
 MAX_SOURCE_CHARS = 5_000
+CONTENT_CONTRACT_VERSION = "singguard-query-generator-v1"
 ENGLISH_ALPHA_RATIO = 0.80
 NEAR_DUPLICATE_THRESHOLD = 0.85
 SOURCE_SIMILARITY_THRESHOLD = 0.50
@@ -44,6 +56,31 @@ GateCode = Literal[
     "source_too_similar",
     "near_duplicate",
 ]
+
+CONTENT_BATCH_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["items"],
+    "properties": {
+        "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["blueprint_id", "query", "response"],
+                "properties": {
+                    "blueprint_id": {"type": "string"},
+                    "query": {"type": "string"},
+                    "response": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}]
+                    },
+                },
+            },
+        }
+    },
+}
 
 _ROLE_WRAPPER_RE = re.compile(r"\[(?:user|assistant)\](?:\s*:)?", re.IGNORECASE)
 _META_LANGUAGE_RES = tuple(
@@ -223,6 +260,241 @@ class GeneratedContent(BaseModel):
         if value is not None and not value.strip():
             raise ValueError("generated content strings must be non-blank")
         return value
+
+
+def parse_content_batch(
+    payload: Mapping[str, object],
+    *,
+    expected_ids: tuple[str, ...],
+) -> tuple[GeneratedContent, ...]:
+    """Strictly validate one provider batch without reordering or coercion."""
+
+    if type(expected_ids) is not tuple or not 1 <= len(expected_ids) <= 4:
+        raise ValueError("expected_ids must contain 1..4 IDs")
+    if (
+        any(type(item_id) is not str or not item_id.strip() for item_id in expected_ids)
+        or len(set(expected_ids)) != len(expected_ids)
+    ):
+        raise ValueError("every expected blueprint ID must occur exactly once")
+    if not isinstance(payload, Mapping):
+        raise ValueError("content batch must be a mapping")
+    if set(payload) != {"items"}:
+        raise ValueError("content batch must contain exactly the items property")
+    raw_items = payload["items"]
+    if type(raw_items) is not list:
+        raise ValueError("content batch items must be a list")
+    if not 1 <= len(raw_items) <= 4:
+        raise ValueError("content batch items must contain 1..4 entries")
+
+    parsed: list[GeneratedContent] = []
+    for raw_item in raw_items:
+        if not isinstance(raw_item, Mapping):
+            raise ValueError("content batch contains an invalid item")
+        try:
+            parsed.append(GeneratedContent.model_validate(raw_item, strict=True))
+        except ValidationError:
+            raise ValueError("content batch contains an invalid item") from None
+
+    actual_ids = tuple(item.blueprint_id for item in parsed)
+    if len(actual_ids) != len(expected_ids) or set(actual_ids) != set(expected_ids):
+        raise ValueError("every expected blueprint ID must occur exactly once")
+    return tuple(parsed)
+
+
+def _prompt_bytes() -> bytes:
+    path = Path(__file__).resolve().parents[2] / "prompts" / "singguard_query_generator_v1.txt"
+    try:
+        return path.read_bytes()
+    except OSError:
+        raise RuntimeError("cannot load the SingGuard query generator prompt") from None
+
+
+def _redact_source_seed(text: str) -> str:
+    if type(text) is not str:
+        raise TypeError("source text must be a string")
+    redacted = re.sub(
+        r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+        "[EMAIL]",
+        text,
+    )
+    redacted = re.sub(r"(?i)https?://\S+", "[URL]", redacted)
+    redacted = re.sub(r"(?<!\w)\+?\d[\d\s().-]{7,}\d(?!\w)", "[PHONE]", redacted)
+    redacted = " ".join(redacted.split())
+    if not redacted or len(redacted) > MAX_SOURCE_CHARS:
+        raise ValueError("source text must be nonblank and at most 5000 characters")
+    return redacted
+
+
+def _source_text_for(
+    source_ref: SourceRef,
+    *,
+    source_texts: Mapping[object, str],
+    source_id_counts: Mapping[str, int],
+) -> str:
+    tuple_key = (source_ref.source, source_ref.source_id)
+    string_key = f"{source_ref.source}:{source_ref.source_id}"
+    qualified_matches = [key for key in (tuple_key, string_key) if key in source_texts]
+    if len(qualified_matches) > 1:
+        raise ValueError("source text lookup contains colliding qualified keys")
+    if qualified_matches:
+        return _redact_source_seed(source_texts[qualified_matches[0]])
+    if source_ref.source_id in source_texts:
+        if source_id_counts[source_ref.source_id] != 1:
+            raise ValueError("source text bare ID lookup is ambiguous")
+        return _redact_source_seed(source_texts[source_ref.source_id])
+    raise ValueError("source text is missing for a blueprint source reference")
+
+
+def _policy_payload(policy: ActivePolicy) -> dict[str, object]:
+    return {
+        "policy_id": policy.policy_id,
+        "rules": [
+            {
+                "rule_id": rule.rule_id,
+                "title": rule.title,
+                "description": rule.text,
+                "allowed_exceptions": list(rule.exceptions),
+                "priority": rule.priority,
+            }
+            for rule in policy.rules
+        ],
+    }
+
+
+def _blueprint_payload(
+    blueprint: QueryBlueprint,
+    *,
+    policy: ActivePolicy,
+    source_texts: Mapping[object, str],
+    source_id_counts: Mapping[str, int],
+) -> dict[str, object]:
+    expected_rule_ids = tuple(rule.rule_id for rule in policy.rules)
+    expected_rule_titles = tuple(rule.title for rule in policy.rules)
+    if (
+        blueprint.active_rule_ids != expected_rule_ids
+        or blueprint.active_rule_titles != expected_rule_titles
+    ):
+        raise ValueError("blueprint active rules do not match the resolved policy")
+
+    intended_target: dict[str, object] = {
+        "intended_label": blueprint.intended_label,
+        "primary_answer": blueprint.primary_answer,
+        "intended_answers": list(blueprint.intended_answers),
+    }
+    if blueprint.target_exception_rule_id is not None:
+        rule_title = next(
+            rule.title
+            for rule in policy.rules
+            if rule.rule_id == blueprint.target_exception_rule_id
+        )
+        intended_target["safe_exception_context"] = {
+            "rule_title": rule_title,
+            "exception": blueprint.target_exception,
+            "hard_negative": True,
+        }
+
+    item: dict[str, object] = {
+        "blueprint_id": blueprint.blueprint_id,
+        "policy_id": blueprint.policy_id,
+        "controls": {
+            "conversation_shape": blueprint.conversation_shape,
+            "content_form": blueprint.content_form,
+            "tone": blueprint.tone,
+            "length_bin": blueprint.length_bin,
+            "difficulty": blueprint.difficulty,
+            "noise_profile": blueprint.noise_profile,
+            "thinking_type": blueprint.thinking_type,
+            "tool_capable": blueprint.tool_capable,
+        },
+        "intended_target": intended_target,
+    }
+    if blueprint.source_ref is not None:
+        item["source_seed"] = {
+            "trust": "untrusted_quoted_data",
+            "use": "style_inspiration_only",
+            "text": _source_text_for(
+                blueprint.source_ref,
+                source_texts=source_texts,
+                source_id_counts=source_id_counts,
+            ),
+        }
+    return item
+
+
+def build_content_request(
+    blueprints: tuple[QueryBlueprint, ...],
+    *,
+    policies: tuple[ActivePolicy, ...],
+    source_texts: Mapping[str, str],
+) -> dict[str, object]:
+    """Build a content-only Gemini request with no provider orchestration."""
+
+    if type(blueprints) is not tuple or not 1 <= len(blueprints) <= 4:
+        raise ValueError("content request must contain 1..4 blueprints")
+    if any(not isinstance(blueprint, QueryBlueprint) for blueprint in blueprints):
+        raise TypeError("blueprints must contain QueryBlueprint items")
+    blueprint_ids = tuple(blueprint.blueprint_id for blueprint in blueprints)
+    if len(set(blueprint_ids)) != len(blueprint_ids):
+        raise ValueError("blueprint IDs must be unique")
+    if type(policies) is not tuple or any(
+        not isinstance(policy, ActivePolicy) for policy in policies
+    ):
+        raise TypeError("policies must contain ActivePolicy items")
+    if not isinstance(source_texts, Mapping):
+        raise TypeError("source_texts must be a mapping")
+
+    policies_by_id: dict[str, list[ActivePolicy]] = {}
+    for policy in policies:
+        policies_by_id.setdefault(policy.policy_id, []).append(policy)
+    selected: list[ActivePolicy] = []
+    resolved: dict[str, ActivePolicy] = {}
+    for blueprint in blueprints:
+        matches = policies_by_id.get(blueprint.policy_id, [])
+        if len(matches) != 1:
+            raise ValueError("every blueprint policy_id must resolve exactly once")
+        if blueprint.policy_id not in resolved:
+            resolved[blueprint.policy_id] = matches[0]
+            selected.append(matches[0])
+
+    source_id_counts: dict[str, int] = {}
+    seen_refs: set[tuple[str, str]] = set()
+    for blueprint in blueprints:
+        if blueprint.source_ref is None:
+            continue
+        ref_key = (blueprint.source_ref.source, blueprint.source_ref.source_id)
+        if ref_key not in seen_refs:
+            source_id_counts[blueprint.source_ref.source_id] = (
+                source_id_counts.get(blueprint.source_ref.source_id, 0) + 1
+            )
+            seen_refs.add(ref_key)
+
+    prompt_bytes = _prompt_bytes()
+    prompt = prompt_bytes.decode("utf-8")
+    return {
+        "contract_version": CONTENT_CONTRACT_VERSION,
+        "prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
+        "prompt": prompt,
+        "active_policies": [_policy_payload(policy) for policy in selected],
+        "items": [
+            _blueprint_payload(
+                blueprint,
+                policy=resolved[blueprint.policy_id],
+                source_texts=source_texts,
+                source_id_counts=source_id_counts,
+            )
+            for blueprint in blueprints
+        ],
+        "output_contract": {
+            "items": [
+                {
+                    "blueprint_id": "string",
+                    "query": "string",
+                    "response": "string|null",
+                }
+            ]
+        },
+        "response_schema": CONTENT_BATCH_SCHEMA,
+    }
 
 
 class GateResult(BaseModel):
