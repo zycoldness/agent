@@ -20,6 +20,70 @@ PolicyTransition = Literal[
 ]
 
 
+class ActivePolicy(BaseModel):
+    """One runtime policy set containing one or more active rules."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    policy_id: str = Field(min_length=1)
+    rules: tuple[PolicyRule, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def reject_duplicate_rules(self) -> "ActivePolicy":
+        rule_ids = [rule.rule_id for rule in self.rules]
+        titles = [rule.title for rule in self.rules]
+        if len(rule_ids) != len(set(rule_ids)):
+            raise ValueError("active policy contains duplicate rule IDs")
+        if len(titles) != len(set(titles)):
+            raise ValueError("active policy contains duplicate rule titles")
+        return self
+
+
+class ModerationSample(BaseModel):
+    """One conversation to execute under a referenced active policy."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    sample_id: str = Field(min_length=1)
+    policy_id: str = Field(min_length=1)
+    thinking_type: ThinkingType
+    query: str = Field(min_length=1)
+    response: str | None = None
+    tool_names: tuple[str, ...] = ()
+
+
+class Message(BaseModel):
+    """One portable ms-swift conversation message."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    role: Literal["system", "user", "assistant", "tool_call", "tool_response"]
+    content: str = Field(min_length=1)
+
+
+def build_initial_messages(
+    policy: ActivePolicy,
+    sample: ModerationSample,
+) -> tuple[Message, Message]:
+    """Render the exact active-policy prompt and target conversation."""
+
+    if sample.policy_id != policy.policy_id:
+        raise ValueError("sample policy_id does not match the active policy")
+    lines = [f"[user]: {sample.query}"]
+    if sample.response is not None:
+        lines.append(f"[assistant]: {sample.response}")
+    return (
+        Message(
+            role="system",
+            content=render_guard_prompt(
+                policy.rules,
+                thinking_type=sample.thinking_type,
+            ),
+        ),
+        Message(role="user", content="\n".join(lines)),
+    )
+
+
 class ContentSample(BaseModel):
     """One normalized moderation target before policy conditioning."""
 
