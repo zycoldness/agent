@@ -291,7 +291,7 @@ Tests cover:
 4. preservation of Gemini-written slow reasoning;
 5. one-, two-, and three-turn tool trajectories with real tool results;
 6. invalid tool names, arguments, and turn-limit enforcement;
-7. grouped train/dev/holdout splitting and direct ms-swift readability;
+7. direct ms-swift readability of ordinary and tool-using rows;
 8. resume, budget, progress, and sanitized rejection artifacts.
 
 A small pilot of 20-30 examples must be manually reviewed before scaling data
