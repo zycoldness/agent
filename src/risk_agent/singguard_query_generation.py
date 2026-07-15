@@ -1,915 +1,364 @@
-"""Immutable query blueprints and deterministic release quota planning."""
+"""Generated-content contracts and deterministic local quality gates."""
 
 from __future__ import annotations
 
-import hashlib
-import json
-import random
-from collections import deque
-from collections.abc import Mapping, Sequence
-from fractions import Fraction
-from typing import Literal, TypeVar
+import re
+import unicodedata
+from types import MappingProxyType
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from risk_agent.contracts import PolicyRule
-from risk_agent.singguard import ActivePolicy
-from risk_agent.singguard_sources import SeedRecord
+from risk_agent.singguard_query_planning import (
+    QueryBlueprint,
+    SourceRef,
+    plan_blueprints,
+)
 
 
-ThinkingType = Literal["fast", "slow"]
-ConversationShape = Literal["query", "query_response"]
-ContentForm = Literal[
-    "short_ad",
-    "social_post",
-    "livestream_pitch",
-    "product_listing",
-    "comment",
-    "private_message",
-    "support_exchange",
-    "search_or_neutral",
-]
-Tone = Literal[
-    "formal",
-    "colloquial",
-    "promotional",
-    "urgent",
-    "testimonial",
-    "technical",
-    "humorous",
-    "neutral",
-]
-LengthBin = Literal["headline", "short", "medium", "long"]
-Difficulty = Literal["explicit", "paraphrased", "implicit", "exception"]
-NoiseProfile = Literal["none", "spelling", "emoji", "punctuation", "obfuscation"]
+MAX_CONTENT_CHARS = 5_000
+MAX_SOURCE_CHARS = 5_000
+ENGLISH_ALPHA_RATIO = 0.80
+NEAR_DUPLICATE_THRESHOLD = 0.85
+SOURCE_SIMILARITY_THRESHOLD = 0.50
+LENGTH_BOUNDS_VERSION = "singguard-length-bounds-v1"
+LENGTH_BOUNDS = MappingProxyType(
+    {
+        "headline": (1, 20),
+        "short": (5, 60),
+        "medium": (30, 160),
+        "long": (100, 400),
+    }
+)
+
+_ROLE_WRAPPER_RE = re.compile(r"\[(?:user|assistant)\](?:\s*:)?", re.IGNORECASE)
+_META_LANGUAGE_RES = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bdataset\s+(?:training\s+)?sample\b",
+        r"\btraining\s+sample\b",
+        r"\bexpected\s+label\b",
+        r"\boracle\s+answer\b",
+        r"\bannotat(?:or|ion)\s+instruction\b",
+        r"\bactive[- ]policy\s+(?:rule\s+)?id\b",
+        r"\brule[- ]id\s+metadata\b",
+        r"\bgenerate\s+(?:an?\s+)?(?:safe|unsafe)\s+example\b",
+    )
+)
+_EMAIL_RE = re.compile(
+    r"(?<![\w.+-])([A-Z0-9.!#$%&'*+/=?^_`{|}~-]+)@"
+    r"([A-Z0-9-]+(?:\.[A-Z0-9-]+)+)\b",
+    re.IGNORECASE,
+)
+_URL_RE = re.compile(
+    r"\b(?:https?://|www\.)([A-Z0-9-]+(?:\.[A-Z0-9-]+)+)(?::\d+)?(?:[/?#][^\s]*)?",
+    re.IGNORECASE,
+)
+_DOMAIN_RE = re.compile(
+    r"(?<![\w@.-])([A-Z0-9-]+(?:\.[A-Z0-9-]+)*\.[A-Z]{2,})(?![\w.-])",
+    re.IGNORECASE,
+)
+_HANDLE_RE = re.compile(r"(?<![\w@])@([A-Z0-9_]{2,32})\b", re.IGNORECASE)
+_PHONE_RE = re.compile(r"(?<![\w-])(?:\+?\d[\s().-]*){10,15}(?![\w-])")
+_CARD_RE = re.compile(r"(?<![\w-])(?:\d[ -]?){13,19}(?![\w-])")
+_CREDENTIAL_RE = re.compile(
+    r"\b(?:api[_ -]?key|access[_ -]?token|secret|password|passwd|pwd)\b"
+    r"\s*(?:is|=|:)\s*[\"']?[A-Z0-9_./+\-]{6,}",
+    re.IGNORECASE,
+)
+_ACCOUNT_RE = re.compile(
+    r"\b(?:bank\s+)?account\s+(?:number|no\.?|#)\s*[:=]?\s*\d{8,20}\b",
+    re.IGNORECASE,
+)
+_SEQUENCE_RE = re.compile(r"\b(?:first|then|next|finally|step\s+\d+)\b", re.IGNORECASE)
+_HARM_DOMAIN_RE = re.compile(
+    r"\b(?:weapon|explosive|detonator|credential\s+theft|clone\s+the\s+login|"
+    r"malware|ransomware|payload)\b",
+    re.IGNORECASE,
+)
+_HARM_ACTION_RE = re.compile(
+    r"\b(?:mix|pack|ignite|detonate|clone|capture|exfiltrate|write|download|"
+    r"configure|execute|deploy|install)\w*\b",
+    re.IGNORECASE,
+)
 
 
-class SourceRef(BaseModel):
-    """Minimal provenance for one governed open-data guidance seed."""
+class GeneratedContent(BaseModel):
+    """One provider-produced candidate tied to a planned blueprint."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    source: str = Field(min_length=1)
-    source_id: str = Field(min_length=1)
-    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    blueprint_id: str = Field(min_length=1, strict=True)
+    query: str = Field(min_length=1, max_length=MAX_CONTENT_CHARS, strict=True)
+    response: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_CONTENT_CHARS,
+        strict=True,
+    )
+
+    @field_validator("blueprint_id", "query", "response")
+    @classmethod
+    def reject_blank_strings(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("generated content strings must be non-blank")
+        return value
 
 
-class QueryBlueprint(BaseModel):
-    """One immutable content anchor to be generated in a later pipeline stage."""
+class GateResult(BaseModel):
+    """Stable first-failure result from the local gate sequence."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    blueprint_id: str = Field(min_length=1)
-    family_id: str = Field(min_length=1)
-    policy_id: str = Field(min_length=1)
-    active_rule_ids: tuple[str, ...] = Field(min_length=1)
-    active_rule_titles: tuple[str, ...] = Field(min_length=1)
-    intended_label: Literal["safe", "unsafe"]
-    primary_rule_id: str | None = None
-    primary_answer: str | None = None
-    intended_answers: tuple[str, ...] = ()
-    target_exception_rule_id: str | None = None
-    target_exception: str | None = None
-    conversation_shape: ConversationShape
-    content_form: ContentForm
-    thinking_type: ThinkingType
-    difficulty: Difficulty
-    tone: Tone
-    noise_profile: NoiseProfile
-    length_bin: LengthBin
-    tool_capable: bool
-    source_ref: SourceRef | None = None
+    accepted: bool
+    code: str = Field(min_length=1, strict=True)
+
+    @field_validator("code")
+    @classmethod
+    def reject_blank_code(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("gate result code must be non-blank")
+        return value
 
     @model_validator(mode="after")
-    def validate_intended_decision(self) -> "QueryBlueprint":
-        if not self.blueprint_id.strip() or not self.family_id.strip():
-            raise ValueError("blueprint and family IDs must be non-blank")
-        if self.blueprint_id == self.family_id:
-            raise ValueError("blueprint and family IDs must use distinct namespaces")
-        if not self.policy_id.strip():
-            raise ValueError("policy ID must be non-blank")
-        if any(not rule_id.strip() for rule_id in self.active_rule_ids):
-            raise ValueError("active rule IDs must be non-blank")
-        if len(self.active_rule_ids) != len(set(self.active_rule_ids)):
-            raise ValueError("active rule IDs must be unique")
-        if len(self.active_rule_titles) != len(self.active_rule_ids):
-            raise ValueError("active rule IDs and titles must have equal length")
-        if any(not title.strip() for title in self.active_rule_titles):
-            raise ValueError("active rule titles must be non-blank")
-        if len(self.active_rule_titles) != len(set(self.active_rule_titles)):
-            raise ValueError("active rule titles must be unique")
-        if len(self.intended_answers) != len(set(self.intended_answers)):
-            raise ValueError("intended answers must be unique")
-        if any(answer not in self.active_rule_titles for answer in self.intended_answers):
-            raise ValueError("intended answers must be active rule titles")
-        ordered_answers = tuple(
-            title for title in self.active_rule_titles if title in self.intended_answers
-        )
-        if self.intended_answers != ordered_answers:
-            raise ValueError("intended answers must follow active-policy order")
-        if (self.target_exception_rule_id is None) != (self.target_exception is None):
-            raise ValueError("exception target rule and text must be provided together")
-        if self.target_exception_rule_id is not None:
-            if self.intended_label != "safe" or self.difficulty != "exception":
-                raise ValueError("exception targets require a safe exception blueprint")
-            if self.target_exception_rule_id not in self.active_rule_ids:
-                raise ValueError("exception target rule must belong to the active policy")
-            if not self.target_exception.strip():
-                raise ValueError("exception target text must be non-blank")
-        if self.intended_label == "safe":
-            if (
-                self.primary_rule_id is not None
-                or self.primary_answer is not None
-                or self.intended_answers
-            ):
-                raise ValueError("safe blueprints cannot have intended answers")
-        else:
-            if self.primary_rule_id not in self.active_rule_ids:
-                raise ValueError("unsafe blueprints require an active primary rule ID")
-            primary_index = self.active_rule_ids.index(self.primary_rule_id)
-            expected_primary = self.active_rule_titles[primary_index]
-            if self.primary_answer != expected_primary:
-                raise ValueError("primary answer must be the primary rule's exact title")
-            if not self.intended_answers or self.primary_answer not in self.intended_answers:
-                raise ValueError(
-                    "unsafe blueprints require a primary answer among intended answers"
-                )
+    def validate_accepted_code(self) -> "GateResult":
+        if self.accepted and self.code != "accepted":
+            raise ValueError("accepted gate results must use the accepted code")
+        if not self.accepted and self.code == "accepted":
+            raise ValueError("rejected gate results cannot use the accepted code")
         return self
 
 
-_SUPPORTED_COUNTS = frozenset((100, 500, 2_000))
-_BASE_COUNT = 2_000
-_LABEL_QUOTAS = {"safe": 1_000, "unsafe": 1_000}
-_SHAPE_QUOTAS = {"query": 1_400, "query_response": 600}
-_THINKING_QUOTAS = {"fast": 1_400, "slow": 600}
-_GOVERNED_SOURCE_QUOTAS = {
-    "uci_sms_spam": 200,
-    "uci_youtube_spam": 100,
-    "nemotron_aegis_v2": 120,
-    "civil_comments": 100,
-    "amazon_esci": 80,
-}
-_SOURCE_FORM_COMPATIBILITY = {
-    "uci_sms_spam": frozenset(
-        ("short_ad", "private_message", "support_exchange", "social_post")
-    ),
-    "uci_youtube_spam": frozenset(
-        ("comment", "social_post", "livestream_pitch", "short_ad")
-    ),
-    "nemotron_aegis_v2": frozenset(ContentForm.__args__),
-    "civil_comments": frozenset(
-        ("comment", "social_post", "livestream_pitch", "support_exchange")
-    ),
-    "amazon_esci": frozenset(
-        (
-            "product_listing",
-            "search_or_neutral",
-            "short_ad",
-            "social_post",
-            "livestream_pitch",
+class CandidateIndex:
+    """Accepted candidates used by duplicate gates."""
+
+    def __init__(self) -> None:
+        self._rows: list[tuple[str, str, frozenset[tuple[str, ...]]]] = []
+
+    def add(self, family_id: str, content: GeneratedContent) -> None:
+        """Index an explicitly accepted candidate without changing the candidate."""
+
+        _validate_index_inputs(family_id, content)
+        self._rows.append(
+            (
+                family_id,
+                _canonical_candidate(content),
+                _five_grams(_combined_text(content)),
+            )
         )
-    ),
-}
-_FORM_QUOTAS = {
-    "short_ad": 400,
-    "social_post": 300,
-    "livestream_pitch": 300,
-    "product_listing": 300,
-    "comment": 200,
-    "private_message": 200,
-    "support_exchange": 200,
-    "search_or_neutral": 100,
-}
-_DIFFICULTY_QUOTAS = {
-    "explicit": 500,
-    "paraphrased": 600,
-    "implicit": 400,
-    "exception": 500,
-}
-_TONE_QUOTAS = {
-    "formal": 250,
-    "colloquial": 250,
-    "promotional": 250,
-    "urgent": 250,
-    "testimonial": 250,
-    "technical": 250,
-    "humorous": 250,
-    "neutral": 250,
-}
-_NOISE_QUOTAS = {
-    "none": 400,
-    "spelling": 400,
-    "emoji": 400,
-    "punctuation": 400,
-    "obfuscation": 400,
-}
-_LENGTH_QUOTAS = {"headline": 500, "short": 500, "medium": 500, "long": 500}
+
+    def duplicate_code(
+        self, family_id: str, content: GeneratedContent
+    ) -> str | None:
+        """Return the stable duplicate reason, if any, without adding the candidate."""
+
+        _validate_index_inputs(family_id, content)
+        canonical = _canonical_candidate(content)
+        grams = _five_grams(_combined_text(content))
+        if any(row_canonical == canonical for _, row_canonical, _ in self._rows):
+            return "exact_duplicate"
+        if any(
+            row_family != family_id
+            and _jaccard(grams, row_grams) >= NEAR_DUPLICATE_THRESHOLD
+            for row_family, _, row_grams in self._rows
+        ):
+            return "near_duplicate"
+        return None
 
 
-T = TypeVar("T")
+def _combined_text(content: GeneratedContent) -> str:
+    if content.response is None:
+        return content.query
+    return f"{content.query}\n{content.response}"
 
 
-def _apportion(weights: Mapping[T, int], count: int) -> dict[T, int]:
-    total_weight = sum(weights.values())
-    if total_weight <= 0:
-        raise RuntimeError("internal quota weights must have a positive total")
-    exact = {key: Fraction(value * count, total_weight) for key, value in weights.items()}
-    allocated = {key: int(value) for key, value in exact.items()}
-    remaining = count - sum(allocated.values())
-    order = sorted(
-        weights,
-        key=lambda key: exact[key] - allocated[key],
-        reverse=True,
+def _validate_index_inputs(family_id: str, content: GeneratedContent) -> None:
+    if type(family_id) is not str:
+        raise TypeError("family_id must be a string")
+    if not family_id.strip():
+        raise ValueError("family_id must be non-blank")
+    if not isinstance(content, GeneratedContent):
+        raise TypeError("content must be GeneratedContent")
+
+
+def _normalize_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return " ".join(normalized.split())
+
+
+def _canonical_candidate(content: GeneratedContent) -> str:
+    query = _normalize_text(content.query)
+    if content.response is None:
+        return f"query\x1f{query}\x1eresponse:none"
+    response = _normalize_text(content.response)
+    return f"query\x1f{query}\x1eresponse\x1f{response}"
+
+
+def _five_grams(text: str) -> frozenset[tuple[str, ...]]:
+    tokens = re.findall(r"[a-z0-9]+", _normalize_text(text))
+    return frozenset(tuple(tokens[index : index + 5]) for index in range(len(tokens) - 4))
+
+
+def _jaccard(
+    left: frozenset[tuple[str, ...]], right: frozenset[tuple[str, ...]]
+) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def _is_english_dominant(text: str) -> bool:
+    alphabetic_count = sum(character.isalpha() for character in text)
+    ascii_letter_count = sum(
+        ("a" <= character <= "z") or ("A" <= character <= "Z")
+        for character in text
     )
-    for key in order[:remaining]:
-        allocated[key] += 1
-    if sum(allocated.values()) != count:
-        raise RuntimeError("internal largest-remainder allocation failed")
-    return allocated
-
-
-def _largest_remainder(quotas: Mapping[T, int], count: int) -> dict[T, int]:
-    """Scale 2000-row quotas exactly, breaking equal remainders by declaration order."""
-
-    if sum(quotas.values()) != _BASE_COUNT:
-        raise RuntimeError("internal quota table does not total 2000")
-    return _apportion(quotas, count)
-
-
-def _scale_partial_quotas(quotas: Mapping[T, int], count: int) -> dict[T, int]:
-    exact = {key: Fraction(value * count, _BASE_COUNT) for key, value in quotas.items()}
-    allocated = {key: int(value) for key, value in exact.items()}
-    target_total = int(Fraction(sum(quotas.values()) * count, _BASE_COUNT))
-    remaining = target_total - sum(allocated.values())
-    order = sorted(
-        quotas,
-        key=lambda key: exact[key] - allocated[key],
-        reverse=True,
+    return bool(ascii_letter_count) and (
+        ascii_letter_count / alphabetic_count >= ENGLISH_ALPHA_RATIO
     )
-    for key in order[:remaining]:
-        allocated[key] += 1
-    return allocated
 
 
-def _shuffled_values(
-    quotas: Mapping[T, int], count: int, rng: random.Random
-) -> list[T]:
-    values = [
-        value
-        for value, allocation in _largest_remainder(quotas, count).items()
-        for _ in range(allocation)
-    ]
-    if len(values) != count:
-        raise RuntimeError("internal quota expansion produced the wrong row count")
-    rng.shuffle(values)
-    return values
+def _rejected(code: str) -> GateResult:
+    return GateResult(accepted=False, code=code)
 
 
-def _values_balanced_across_labels(
-    quotas: Mapping[T, int], count: int, rng: random.Random
-) -> dict[str, list[T]]:
-    scaled = _largest_remainder(quotas, count)
-    allocations = {
-        "safe": {value: amount // 2 for value, amount in scaled.items()},
-        "unsafe": {value: amount // 2 for value, amount in scaled.items()},
-    }
-    totals = {label: sum(values.values()) for label, values in allocations.items()}
-    for value, amount in scaled.items():
-        if amount % 2:
-            label = min(("safe", "unsafe"), key=lambda item: (totals[item], item != "safe"))
-            allocations[label][value] += 1
-            totals[label] += 1
-    expected_labels = _largest_remainder(_LABEL_QUOTAS, count)
-    if totals != expected_labels:
-        raise RuntimeError("internal label crossing could not satisfy exact marginals")
-    pools = {
-        label: [
-            value
-            for value, amount in label_allocations.items()
-            for _ in range(amount)
-        ]
-        for label, label_allocations in allocations.items()
-    }
-    for pool in pools.values():
-        rng.shuffle(pool)
-    return pools
+def _blank_spans(text: str, matches: list[re.Match[str]]) -> str:
+    characters = list(text)
+    for match in matches:
+        characters[match.start() : match.end()] = " " * (match.end() - match.start())
+    return "".join(characters)
 
 
-def _align_label_balanced_values(
-    labels: Sequence[str], quotas: Mapping[T, int], count: int, rng: random.Random
-) -> list[T]:
-    pools = _values_balanced_across_labels(quotas, count, rng)
-    offsets = {"safe": 0, "unsafe": 0}
-    values: list[T] = []
-    for label in labels:
-        values.append(pools[label][offsets[label]])
-        offsets[label] += 1
-    return values
+def _reserved_test_host(host: str) -> bool:
+    return host.casefold().rstrip(".").endswith(".test")
 
 
-def _validate_policies(
-    policies: tuple[ActivePolicy, ...],
-) -> tuple[tuple[str, ...], dict[str, tuple[ActivePolicy, ...]]]:
-    if not policies:
-        raise ValueError("at least one active policy is required")
-    if any(not isinstance(policy, ActivePolicy) for policy in policies):
-        raise TypeError("policies must contain only ActivePolicy values")
-    policy_ids = [policy.policy_id for policy in policies]
-    if any(not policy_id.strip() for policy_id in policy_ids):
-        raise ValueError("active policy IDs must be non-blank")
-    if len(policy_ids) != len(set(policy_ids)):
-        raise ValueError("duplicate policy IDs are not allowed")
-
-    definitions: dict[str, PolicyRule] = {}
-    owners: dict[str, list[ActivePolicy]] = {}
-    ordered_rule_ids: list[str] = []
-    for policy in policies:
-        if not policy.rules:
-            raise ValueError(f"active policy {policy.policy_id!r} has no rules")
-        local_ids: set[str] = set()
-        for rule in policy.rules:
-            if not isinstance(rule, PolicyRule):
-                raise TypeError("active policies must contain only PolicyRule values")
-            if not rule.rule_id.strip() or not rule.title.strip() or not rule.text.strip():
-                raise ValueError("active policy rule fields must be non-blank")
-            if rule.rule_id in local_ids:
-                raise ValueError("active policy contains duplicate rule IDs")
-            local_ids.add(rule.rule_id)
-            existing = definitions.get(rule.rule_id)
-            if existing is not None and existing != rule:
-                raise ValueError(f"inconsistent rule ID {rule.rule_id!r} across policies")
-            if existing is None:
-                definitions[rule.rule_id] = rule
-                ordered_rule_ids.append(rule.rule_id)
-            owners.setdefault(rule.rule_id, []).append(policy)
-    if not ordered_rule_ids:
-        raise ValueError("active policies must provide at least one rule")
-    return tuple(ordered_rule_ids), {
-        rule_id: tuple(rule_owners) for rule_id, rule_owners in owners.items()
-    }
+def _luhn_valid(digits: str) -> bool:
+    checksum = 0
+    parity = len(digits) % 2
+    for index, character in enumerate(digits):
+        value = int(character)
+        if index % 2 == parity:
+            value *= 2
+            if value > 9:
+                value -= 9
+        checksum += value
+    return checksum % 10 == 0
 
 
-def _validate_seeds(seed_records: tuple[SeedRecord, ...]) -> None:
-    if any(not isinstance(record, SeedRecord) for record in seed_records):
-        raise TypeError("seed_records must contain only SeedRecord values")
-    keys: set[tuple[str, str]] = set()
-    content_hashes: set[str] = set()
-    for record in seed_records:
-        if record.source not in _GOVERNED_SOURCE_QUOTAS:
-            raise ValueError(f"unknown governed source {record.source!r}")
-        key = (record.source, record.source_id)
-        if key in keys:
-            raise ValueError("duplicate seed source/source_id pair")
-        keys.add(key)
-        if record.content_hash in content_hashes:
-            raise ValueError("duplicate seed content hash")
-        content_hashes.add(record.content_hash)
-        expected_hash = hashlib.sha256(record.text.encode("utf-8")).hexdigest()
-        if record.content_hash != expected_hash:
-            raise ValueError("seed content_hash must be lowercase SHA256 of exact text")
+def _contains_external_identifier(text: str) -> bool:
+    email_matches = list(_EMAIL_RE.finditer(text))
+    if any(not _reserved_test_host(match.group(2)) for match in email_matches):
+        return True
+    scrubbed = _blank_spans(text, email_matches)
 
+    url_matches = list(_URL_RE.finditer(scrubbed))
+    if any(not _reserved_test_host(match.group(1)) for match in url_matches):
+        return True
+    scrubbed = _blank_spans(scrubbed, url_matches)
 
-def _balanced_label_allocations(category_counts: Mapping[str, int]) -> dict[str, int]:
-    safe_counts = {
-        category: amount // 2 for category, amount in category_counts.items()
-    }
-    target_safe = sum(category_counts.values()) // 2
-    remaining = target_safe - sum(safe_counts.values())
-    for category, amount in category_counts.items():
-        if remaining and amount % 2:
-            safe_counts[category] += 1
-            remaining -= 1
-    if remaining:
-        raise RuntimeError("internal source-label allocation failed")
-    return safe_counts
+    domain_matches = list(_DOMAIN_RE.finditer(scrubbed))
+    if any(not _reserved_test_host(match.group(1)) for match in domain_matches):
+        return True
+    scrubbed = _blank_spans(scrubbed, domain_matches)
 
-
-def _label_thinking_cell_counts(
-    category_counts: Mapping[str, int],
-) -> dict[str, dict[tuple[str, str], int]]:
-    safe_counts = _balanced_label_allocations(category_counts)
-    total = sum(category_counts.values())
-    target_fast = _apportion(_THINKING_QUOTAS, total)["fast"]
-    exact_fast = {
-        source: Fraction(amount * _THINKING_QUOTAS["fast"], _BASE_COUNT)
-        for source, amount in category_counts.items()
-    }
-    fast_counts = {source: int(value) for source, value in exact_fast.items()}
-    remaining_fast = target_fast - sum(fast_counts.values())
-    fast_remainder_order = sorted(
-        category_counts,
-        key=lambda source: exact_fast[source] - fast_counts[source],
-        reverse=True,
+    for match in _HANDLE_RE.finditer(scrubbed):
+        handle = match.group(1).casefold()
+        if not handle.startswith(("synthetic_", "test_", "example_")):
+            return True
+    if _CREDENTIAL_RE.search(scrubbed) or _ACCOUNT_RE.search(scrubbed):
+        return True
+    if _PHONE_RE.search(scrubbed):
+        return True
+    return any(
+        _luhn_valid("".join(character for character in match.group() if character.isdigit()))
+        for match in _CARD_RE.finditer(scrubbed)
     )
-    for source in fast_remainder_order[:remaining_fast]:
-        fast_counts[source] += 1
-    safe_fast_target = _apportion(_THINKING_QUOTAS, sum(safe_counts.values()))["fast"]
-    safe_fast_values: dict[str, int] = {}
-    safe_fast_bounds: dict[str, tuple[int, int]] = {}
-    safe_fast_ideals: dict[str, Fraction] = {}
-    for category, amount in category_counts.items():
-        safe = safe_counts[category]
-        fast = fast_counts[category]
-        slow = amount - fast
-        lower = max(0, safe - slow)
-        upper = min(safe, fast)
-        ideal = Fraction(safe * fast, amount) if amount else Fraction(0)
-        safe_fast_values[category] = max(lower, min(int(ideal), upper))
-        safe_fast_bounds[category] = (lower, upper)
-        safe_fast_ideals[category] = ideal
-    while sum(safe_fast_values.values()) < safe_fast_target:
-        candidates = [
-            category
-            for category, (_, upper) in safe_fast_bounds.items()
-            if safe_fast_values[category] < upper
-        ]
-        if not candidates:
-            raise RuntimeError("internal label-thinking allocation is infeasible")
-        category = max(
-            candidates,
-            key=lambda item: safe_fast_ideals[item] - safe_fast_values[item],
-        )
-        safe_fast_values[category] += 1
-    while sum(safe_fast_values.values()) > safe_fast_target:
-        candidates = [
-            category
-            for category, (lower, _) in safe_fast_bounds.items()
-            if safe_fast_values[category] > lower
-        ]
-        if not candidates:
-            raise RuntimeError("internal label-thinking allocation is infeasible")
-        category = min(
-            candidates,
-            key=lambda item: safe_fast_ideals[item] - safe_fast_values[item],
-        )
-        safe_fast_values[category] -= 1
-
-    result: dict[str, dict[tuple[str, str], int]] = {}
-    for category, amount in category_counts.items():
-        safe = safe_counts[category]
-        unsafe = amount - safe
-        fast = fast_counts[category]
-        safe_fast = safe_fast_values[category]
-        result[category] = {
-            ("safe", "fast"): safe_fast,
-            ("safe", "slow"): safe - safe_fast,
-            ("unsafe", "fast"): fast - safe_fast,
-            ("unsafe", "slow"): unsafe - (fast - safe_fast),
-        }
-        if any(value < 0 for value in result[category].values()):
-            raise RuntimeError("internal label-thinking crossing produced a negative cell")
-    return result
 
 
-def _align_label_thinking_values(
-    labels: Sequence[str],
-    thinking_types: Sequence[str],
-    quotas: Mapping[str, int],
-    count: int,
-    rng: random.Random,
-) -> list[str]:
-    category_counts = _largest_remainder(quotas, count)
-    cell_counts = _label_thinking_cell_counts(category_counts)
-    pools = {
-        cell: [
-            category
-            for category, category_cells in cell_counts.items()
-            for _ in range(category_cells[cell])
-        ]
-        for cell in (
-            ("safe", "fast"),
-            ("safe", "slow"),
-            ("unsafe", "fast"),
-            ("unsafe", "slow"),
-        )
-    }
-    for pool in pools.values():
-        rng.shuffle(pool)
-    offsets = {cell: 0 for cell in pools}
-    values: list[str] = []
-    for label, thinking_type in zip(labels, thinking_types, strict=True):
-        cell = (label, thinking_type)
-        values.append(pools[cell][offsets[cell]])
-        offsets[cell] += 1
-    return values
+def _is_operational_harm(text: str) -> bool:
+    return (
+        len(_SEQUENCE_RE.findall(text)) >= 2
+        and bool(_HARM_DOMAIN_RE.search(text))
+        and len(_HARM_ACTION_RE.findall(text)) >= 2
+    )
 
 
-def _allocate_source_forms(
-    demands: Mapping[str, int], capacities: Mapping[str, int]
-) -> dict[str, dict[str, int]]:
-    source_node = ("terminal", "source")
-    sink_node = ("terminal", "sink")
-    adjacency: dict[tuple[str, str], list[tuple[str, str]]] = {}
-    residual: dict[tuple[tuple[str, str], tuple[str, str]], int] = {}
-
-    def add_edge(
-        start: tuple[str, str], end: tuple[str, str], capacity: int
-    ) -> None:
-        adjacency.setdefault(start, []).append(end)
-        adjacency.setdefault(end, []).append(start)
-        residual[(start, end)] = capacity
-        residual[(end, start)] = 0
-
-    for source, demand in demands.items():
-        source_demand_node = ("source", source)
-        add_edge(source_node, source_demand_node, demand)
-        for form in capacities:
-            if form in _SOURCE_FORM_COMPATIBILITY[source]:
-                add_edge(source_demand_node, ("form", form), demand)
-    for form, capacity in capacities.items():
-        add_edge(("form", form), sink_node, capacity)
-
-    assigned = 0
-    while True:
-        parents: dict[tuple[str, str], tuple[str, str] | None] = {source_node: None}
-        queue = deque((source_node,))
-        while queue and sink_node not in parents:
-            node = queue.popleft()
-            for neighbor in adjacency[node]:
-                if neighbor not in parents and residual[(node, neighbor)] > 0:
-                    parents[neighbor] = node
-                    queue.append(neighbor)
-        if sink_node not in parents:
-            break
-        path_capacity = sum(demands.values())
-        node = sink_node
-        while parents[node] is not None:
-            parent = parents[node]
-            path_capacity = min(path_capacity, residual[(parent, node)])
-            node = parent
-        node = sink_node
-        while parents[node] is not None:
-            parent = parents[node]
-            residual[(parent, node)] -= path_capacity
-            residual[(node, parent)] += path_capacity
-            node = parent
-        assigned += path_capacity
-
-    if assigned != sum(demands.values()):
-        raise RuntimeError(
-            "source/form compatibility cannot satisfy governed quota in stratum"
-        )
-    return {
-        source: {
-            form: demand - residual[(('source', source), ('form', form))]
-            for form in capacities
-            if form in _SOURCE_FORM_COMPATIBILITY[source]
-        }
-        for source, demand in demands.items()
-    }
+def _word_count(text: str) -> int:
+    return len(re.findall(r"\b[\w']+\b", text, re.UNICODE))
 
 
-def _assign_source_refs(
+def gate_content(
+    blueprint: QueryBlueprint,
+    content: GeneratedContent,
     *,
-    seed_records: tuple[SeedRecord, ...],
-    count: int,
-    labels: Sequence[str],
-    thinking_types: Sequence[str],
-    forms: Sequence[str],
-    rng: random.Random,
-) -> list[SourceRef | None]:
-    scaled_quotas = _scale_partial_quotas(_GOVERNED_SOURCE_QUOTAS, count)
-    grouped: dict[str, list[SeedRecord]] = {
-        source: [] for source in _GOVERNED_SOURCE_QUOTAS
-    }
-    for record in seed_records:
-        grouped[record.source].append(record)
-    selected: dict[str, list[SeedRecord]] = {}
-    for source, records in grouped.items():
-        rng.shuffle(records)
-        selected[source] = records[: scaled_quotas[source]]
-    source_counts = {source: len(records) for source, records in selected.items()}
-    cell_counts = _label_thinking_cell_counts(source_counts)
-    refs: list[SourceRef | None] = [None] * count
-    available = set(range(count))
-    record_offsets = {source: 0 for source in selected}
-    cells = (("safe", "fast"), ("safe", "slow"), ("unsafe", "fast"), ("unsafe", "slow"))
-    for cell in cells:
-        label, thinking_type = cell
-        candidates = [
-            index
-            for index in available
-            if labels[index] == label and thinking_types[index] == thinking_type
-        ]
-        capacities = {
-            form: sum(forms[index] == form for index in candidates)
-            for form in _FORM_QUOTAS
-        }
-        demands = {
-            source: source_cells[cell] for source, source_cells in cell_counts.items()
-        }
-        allocation = _allocate_source_forms(demands, capacities)
-        indices_by_form = {
-            form: [index for index in candidates if forms[index] == form]
-            for form in _FORM_QUOTAS
-        }
-        for form_indices in indices_by_form.values():
-            rng.shuffle(form_indices)
-        for source, form_counts in allocation.items():
-            for form, amount in form_counts.items():
-                for _ in range(amount):
-                    index = indices_by_form[form].pop()
-                    record = selected[source][record_offsets[source]]
-                    record_offsets[source] += 1
-                    refs[index] = SourceRef(
-                        source=record.source,
-                        source_id=record.source_id,
-                        content_hash=record.content_hash,
-                    )
-                    available.remove(index)
-    if any(record_offsets[source] != len(records) for source, records in selected.items()):
-        raise RuntimeError("internal source assignment left records unused")
-    return refs
+    source_text: str | None,
+    index: CandidateIndex,
+) -> GateResult:
+    """Apply local checks in stable first-failure order."""
 
+    if not isinstance(blueprint, QueryBlueprint):
+        raise TypeError("blueprint must be a QueryBlueprint")
+    if not isinstance(content, GeneratedContent):
+        raise TypeError("content must be GeneratedContent")
+    if not isinstance(index, CandidateIndex):
+        raise TypeError("index must be CandidateIndex")
+    if source_text is not None:
+        if type(source_text) is not str:
+            raise TypeError("source_text must be a string or None")
+        if not source_text.strip():
+            raise ValueError("source_text must be non-blank when supplied")
+        if len(source_text) > MAX_SOURCE_CHARS:
+            raise ValueError(f"source_text cannot exceed {MAX_SOURCE_CHARS} characters")
 
-def _balanced_rule_schedule(
-    rule_ids: tuple[str, ...], count: int, rng: random.Random
-) -> list[str]:
-    if count < len(rule_ids):
-        raise ValueError(
-            "release does not contain enough unsafe rows to cover every active rule"
-        )
-    quotient, remainder = divmod(count, len(rule_ids))
-    schedule = [
-        rule_id
-        for index, rule_id in enumerate(rule_ids)
-        for _ in range(quotient + (index < remainder))
-    ]
-    if len(schedule) != count:
-        raise RuntimeError("internal rule balancing produced the wrong row count")
-    rng.shuffle(schedule)
-    return schedule
-
-
-def _balanced_policy_schedule(
-    policies: tuple[ActivePolicy, ...], count: int, rng: random.Random
-) -> list[ActivePolicy]:
-    quotient, remainder = divmod(count, len(policies))
-    schedule = [
-        policy
-        for index, policy in enumerate(policies)
-        for _ in range(quotient + (index < remainder))
-    ]
-    rng.shuffle(schedule)
-    return schedule
-
-
-def _balanced_schedule(
-    values: Sequence[T], count: int, rng: random.Random, *, shortage_message: str
-) -> list[T]:
-    if count < len(values):
-        raise ValueError(shortage_message)
-    quotient, remainder = divmod(count, len(values))
-    schedule = [
-        value
-        for index, value in enumerate(values)
-        for _ in range(quotient + (index < remainder))
-    ]
-    rng.shuffle(schedule)
-    return schedule
-
-
-def _stable_id(
-    namespace: str,
-    *,
-    semantic_fields: Mapping[str, object],
-    policy_fingerprint: str,
-    ordinal: int,
-) -> str:
-    payload = {
-        "planner_contract": "singguard-query-blueprint-v2",
-        "namespace": namespace,
-        "ordinal": ordinal,
-        "policy_fingerprint": policy_fingerprint,
-        "semantics": semantic_fields,
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
-    return f"sg-{namespace}-{digest}"
-
-
-def plan_blueprints(
-    policies: tuple[ActivePolicy, ...],
-    *,
-    count: int,
-    seed: int,
-    seed_records: tuple[SeedRecord, ...],
-) -> tuple[QueryBlueprint, ...]:
-    """Plan one deterministic, quota-controlled SingGuard query release."""
-
-    if isinstance(count, bool) or not isinstance(count, int):
-        raise TypeError("count must be an integer")
-    if count not in _SUPPORTED_COUNTS:
-        raise ValueError("supported release sizes are 100, 500, and 2000")
-    if isinstance(seed, bool) or not isinstance(seed, int):
-        raise TypeError("seed must be an integer")
-    rule_ids, rule_owners = _validate_policies(policies)
-    _validate_seeds(seed_records)
-    policy_fingerprints = {
-        policy.policy_id: hashlib.sha256(
-            json.dumps(
-                policy.model_dump(mode="json"),
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
-        for policy in policies
-    }
-
-    rng = random.Random(seed)
-    labels = _shuffled_values(_LABEL_QUOTAS, count, rng)
-    shapes = _align_label_balanced_values(labels, _SHAPE_QUOTAS, count, rng)
-    thinking_types = _align_label_balanced_values(
-        labels, _THINKING_QUOTAS, count, rng
-    )
-    forms = _align_label_thinking_values(
-        labels, thinking_types, _FORM_QUOTAS, count, rng
-    )
-    difficulties = _align_label_balanced_values(
-        labels, _DIFFICULTY_QUOTAS, count, rng
-    )
-    tones = _align_label_balanced_values(labels, _TONE_QUOTAS, count, rng)
-    noise_profiles = _align_label_balanced_values(
-        labels, _NOISE_QUOTAS, count, rng
-    )
-    length_bins = _align_label_balanced_values(
-        labels, _LENGTH_QUOTAS, count, rng
-    )
-
-    unsafe_count = labels.count("unsafe")
-    primary_rules = _balanced_rule_schedule(rule_ids, unsafe_count, rng)
-    primary_owner_offsets = {rule_id: 0 for rule_id in rule_ids}
-    unsafe_policies: list[ActivePolicy] = []
-    for rule_id in primary_rules:
-        owners = rule_owners[rule_id]
-        owner_offset = primary_owner_offsets[rule_id]
-        unsafe_policies.append(owners[owner_offset % len(owners)])
-        primary_owner_offsets[rule_id] = owner_offset + 1
-    multi_risk_target = unsafe_count // 5
-    eligible_multi_offsets = {rule_id: [] for rule_id in rule_ids}
-    for offset, (rule_id, policy) in enumerate(
-        zip(primary_rules, unsafe_policies, strict=True)
+    if (
+        content.blueprint_id != blueprint.blueprint_id
+        or (blueprint.conversation_shape == "query" and content.response is not None)
+        or (blueprint.conversation_shape == "query_response" and content.response is None)
     ):
-        if len(policy.rules) >= 2:
-            eligible_multi_offsets[rule_id].append(offset)
-    for offsets in eligible_multi_offsets.values():
-        rng.shuffle(offsets)
-    multi_risk_offsets: set[int] = set()
-    while len(multi_risk_offsets) < multi_risk_target:
-        progress = False
-        for rule_id in rule_ids:
-            if eligible_multi_offsets[rule_id]:
-                multi_risk_offsets.add(eligible_multi_offsets[rule_id].pop())
-                progress = True
-                if len(multi_risk_offsets) == multi_risk_target:
-                    break
-        if not progress:
-            break
+        return _rejected("schema_or_shape")
 
-    documented_exceptions: list[tuple[str, str]] = []
-    seen_exceptions: set[tuple[str, str]] = set()
-    for policy in policies:
-        for rule in policy.rules:
-            for exception in rule.exceptions:
-                pair = (rule.rule_id, exception)
-                if pair not in seen_exceptions:
-                    documented_exceptions.append(pair)
-                    seen_exceptions.add(pair)
-    safe_exception_count = sum(
-        label == "safe" and difficulty == "exception"
-        for label, difficulty in zip(labels, difficulties, strict=True)
-    )
-    exception_schedule = (
-        _balanced_schedule(
-            documented_exceptions,
-            safe_exception_count,
-            rng,
-            shortage_message=(
-                "release does not contain enough safe exception rows to cover every "
-                "documented exception"
-            ),
-        )
-        if documented_exceptions
-        else []
-    )
-    generic_safe_count = count - unsafe_count - (
-        safe_exception_count if documented_exceptions else 0
-    )
-    safe_policies = _balanced_policy_schedule(policies, generic_safe_count, rng)
+    combined = _combined_text(content)
+    if _ROLE_WRAPPER_RE.search(combined):
+        return _rejected("literal_role_wrapper")
+    if not _is_english_dominant(combined):
+        return _rejected("wrong_language")
+    if any(pattern.search(combined) for pattern in _META_LANGUAGE_RES):
+        return _rejected("generation_meta_language")
+    if _contains_external_identifier(combined):
+        return _rejected("pii_or_external_identifier")
+    if _is_operational_harm(combined):
+        return _rejected("operational_harm")
+    minimum, maximum = LENGTH_BOUNDS[blueprint.length_bin]
+    if not minimum <= _word_count(combined) <= maximum:
+        return _rejected("length_out_of_bin")
+    duplicate_code = index.duplicate_code(blueprint.family_id, content)
+    if duplicate_code == "exact_duplicate":
+        return _rejected("exact_duplicate")
+    if source_text is not None:
+        normalized_source = _normalize_text(source_text)
+        normalized_candidate = _normalize_text(combined)
+        if normalized_source == normalized_candidate or _jaccard(
+            _five_grams(source_text), _five_grams(combined)
+        ) >= SOURCE_SIMILARITY_THRESHOLD:
+            return _rejected("source_too_similar")
+    if duplicate_code == "near_duplicate":
+        return _rejected("near_duplicate")
+    return GateResult(accepted=True, code="accepted")
 
-    source_refs = _assign_source_refs(
-        seed_records=seed_records,
-        count=count,
-        labels=labels,
-        thinking_types=thinking_types,
-        forms=forms,
-        rng=rng,
-    )
 
-    exception_owner_offsets = {pair: 0 for pair in documented_exceptions}
-    secondary_offsets: dict[tuple[str, str], int] = {}
-    rows: list[QueryBlueprint] = []
-    unsafe_offset = 0
-    safe_offset = 0
-    generic_safe_offset = 0
-    exception_offset = 0
-    for index, label in enumerate(labels):
-        if label == "unsafe":
-            primary_rule_id = primary_rules[unsafe_offset]
-            multi_risk = unsafe_offset in multi_risk_offsets
-            policy = unsafe_policies[unsafe_offset]
-            unsafe_offset += 1
-            primary_answer = next(
-                rule.title for rule in policy.rules if rule.rule_id == primary_rule_id
-            )
-            if multi_risk:
-                secondary_rules = tuple(
-                    rule for rule in policy.rules if rule.rule_id != primary_rule_id
-                )
-                secondary_key = (policy.policy_id, primary_rule_id)
-                secondary_offset = secondary_offsets.get(secondary_key, 0)
-                secondary_rule_id = secondary_rules[
-                    secondary_offset % len(secondary_rules)
-                ].rule_id
-                secondary_offsets[secondary_key] = secondary_offset + 1
-                intended_rule_ids = {primary_rule_id, secondary_rule_id}
-                intended_answers = tuple(
-                    rule.title
-                    for rule in policy.rules
-                    if rule.rule_id in intended_rule_ids
-                )
-            else:
-                intended_answers = (primary_answer,)
-            target_exception_rule_id = None
-            target_exception = None
-        else:
-            primary_rule_id = None
-            primary_answer = None
-            intended_answers = ()
-            if difficulties[index] == "exception" and documented_exceptions:
-                target_exception_rule_id, target_exception = exception_schedule[
-                    exception_offset
-                ]
-                exception_offset += 1
-                pair = (target_exception_rule_id, target_exception)
-                owners = rule_owners[target_exception_rule_id]
-                owner_offset = exception_owner_offsets[pair]
-                policy = owners[owner_offset % len(owners)]
-                exception_owner_offsets[pair] = owner_offset + 1
-            else:
-                target_exception_rule_id = None
-                target_exception = None
-                policy = safe_policies[generic_safe_offset]
-                generic_safe_offset += 1
-            safe_offset += 1
-        active_rule_ids = tuple(rule.rule_id for rule in policy.rules)
-        active_rule_titles = tuple(rule.title for rule in policy.rules)
-        semantic_fields: dict[str, object] = {
-            "policy_id": policy.policy_id,
-            "active_rule_ids": active_rule_ids,
-            "active_rule_titles": active_rule_titles,
-            "intended_label": label,
-            "primary_rule_id": primary_rule_id,
-            "primary_answer": primary_answer,
-            "intended_answers": intended_answers,
-            "target_exception_rule_id": target_exception_rule_id,
-            "target_exception": target_exception,
-            "conversation_shape": shapes[index],
-            "content_form": forms[index],
-            "thinking_type": thinking_types[index],
-            "difficulty": difficulties[index],
-            "tone": tones[index],
-            "noise_profile": noise_profiles[index],
-            "length_bin": length_bins[index],
-            "tool_capable": False,
-            "source_ref": (
-                source_refs[index].model_dump(mode="json")
-                if source_refs[index] is not None
-                else None
-            ),
-        }
-        rows.append(
-            QueryBlueprint(
-                blueprint_id=_stable_id(
-                    "blueprint",
-                    semantic_fields=semantic_fields,
-                    policy_fingerprint=policy_fingerprints[policy.policy_id],
-                    ordinal=index,
-                ),
-                family_id=_stable_id(
-                    "family",
-                    semantic_fields=semantic_fields,
-                    policy_fingerprint=policy_fingerprints[policy.policy_id],
-                    ordinal=index,
-                ),
-                **semantic_fields,
-            )
-        )
-
-    if unsafe_offset != unsafe_count or safe_offset != count - unsafe_count:
-        raise RuntimeError("internal label assignment did not consume its schedules")
-    if generic_safe_offset != generic_safe_count:
-        raise RuntimeError("internal generic-safe assignment left policies unused")
-    if documented_exceptions and exception_offset != safe_exception_count:
-        raise RuntimeError("internal exception assignment left targets unused")
-    return tuple(rows)
+__all__ = [
+    "GeneratedContent",
+    "GateResult",
+    "CandidateIndex",
+    "ENGLISH_ALPHA_RATIO",
+    "LENGTH_BOUNDS",
+    "LENGTH_BOUNDS_VERSION",
+    "MAX_SOURCE_CHARS",
+    "NEAR_DUPLICATE_THRESHOLD",
+    "SOURCE_SIMILARITY_THRESHOLD",
+    "MAX_CONTENT_CHARS",
+    "QueryBlueprint",
+    "SourceRef",
+    "plan_blueprints",
+    "gate_content",
+]
