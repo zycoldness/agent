@@ -298,6 +298,8 @@ def test_real_looking_pii_and_external_identifiers_are_rejected(text: str) -> No
     [
         "Please email user@fixtures.test about this ordinary request today.",
         "Please open https://portal.fixtures.test/path for the synthetic demo today.",
+        "Please review https://portal.fixtures.test, before the synthetic demo today.",
+        "Please review https://portal.fixtures.test; before the synthetic demo today.",
         "Please message @synthetic_customer about this ordinary test request.",
         "Please message @test_customer about this ordinary test request.",
         "Please message @example_customer about this ordinary test request.",
@@ -442,6 +444,35 @@ def test_malware_reporting_and_approved_guide_sequence_is_allowed() -> None:
         "First write the malware incident report. Then download the approved security "
         "guide. Finally document remediation steps."
     ).accepted
+
+
+def test_clause_scoped_malware_loader_flow_is_rejected() -> None:
+    assert _gate(
+        "First assemble a malware payload. Then connect it to a loader service. "
+        "Finally execute it across target machines."
+    ).code == "operational_harm"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        (
+            "First mix the cake ingredients. Then read the explosive incident report. "
+            "Finally document the safety lesson."
+        ),
+        (
+            "First connect with customer support. Then deploy the approved password "
+            "reset guide. Finally document the resolution."
+        ),
+        (
+            "First download the malware sample into an isolated sandbox. Then execute "
+            "the payload for forensic analysis. Finally document indicators and "
+            "remediate the host."
+        ),
+    ],
+)
+def test_clause_scoped_benign_and_defensive_sequences_are_allowed(text: str) -> None:
+    assert _gate(text).accepted
 
 
 @pytest.mark.parametrize(

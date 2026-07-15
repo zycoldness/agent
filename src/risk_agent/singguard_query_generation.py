@@ -119,8 +119,13 @@ _ACCOUNT_RE = re.compile(
     re.IGNORECASE,
 )
 _SEQUENCE_RE = re.compile(r"\b(?:first|then|next|finally|step\s+\d+)\b", re.IGNORECASE)
-_CREDENTIAL_THEFT_CONTEXT_RE = re.compile(
-    r"\b(?:credential\s+theft|bank\s+login\s+page|login\s+page|sign-in\s+page|"
+_CLAUSE_SPLIT_RE = re.compile(
+    r"[.!?;]+|\b(?:first|then|next|finally|step\s+\d+)\b[:,]?",
+    re.IGNORECASE,
+)
+_CREDENTIAL_THEFT_LITERAL_RE = re.compile(r"\bcredential\s+theft\b", re.IGNORECASE)
+_CREDENTIAL_OBJECT_RE = re.compile(
+    r"\b(?:bank\s+login\s+page|login\s+page|sign-in\s+page|"
     r"passwords?|credentials?|capture\s+service)\b",
     re.IGNORECASE,
 )
@@ -155,6 +160,10 @@ _MALWARE_CREATION_RE = re.compile(
     r"(?:malware|ransomware|payload)\b(?!\s+(?:incident\s+)?report\b)",
     re.IGNORECASE,
 )
+_MALWARE_ASSEMBLY_RE = re.compile(
+    r"\bassemble\w*\s+(?:(?:a|an|the)\s+)?(?:malware|ransomware|payload)\b",
+    re.IGNORECASE,
+)
 _MALWARE_PERSISTENCE_RE = re.compile(
     r"\bconfigure\w*\s+persistence\b",
     re.IGNORECASE,
@@ -173,6 +182,19 @@ _MALWARE_DEPLOYMENT_OBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 _ATTACK_TARGET_RE = re.compile(r"\b(?:targets?|victims?|hosts?|servers?)\b", re.IGNORECASE)
+_LOADER_CONNECT_RE = re.compile(
+    r"\bconnect\w*(?:\s+\w+){0,5}\s+loader\s+service\b",
+    re.IGNORECASE,
+)
+_EXECUTE_PRONOUN_TARGET_RE = re.compile(
+    r"\bexecute\w*\s+(?:it|them|this|that)\b(?:\s+\w+){0,6}\s+"
+    r"(?:targets?|victims?|hosts?|servers?|target\s+machines?)\b",
+    re.IGNORECASE,
+)
+_MALWARE_REPORT_RE = re.compile(
+    r"\b(?:malware|ransomware|payload)\s+(?:incident\s+)?report\b",
+    re.IGNORECASE,
+)
 _MALWARE_SAMPLE_RE = re.compile(
     r"\b(?:packaged\s+)?(?:malware|ransomware|payload)\s+sample\b",
     re.IGNORECASE,
@@ -391,7 +413,8 @@ def _contains_credential_secret(text: str) -> bool:
 
 
 def _explicit_url_host(url: str) -> str | None:
-    candidate = url if "://" in url else f"http://{url}"
+    token = url.rstrip(",;.!?")
+    candidate = token if "://" in token else f"http://{token}"
     try:
         return urlsplit(candidate).hostname
     except ValueError:
@@ -439,49 +462,96 @@ def _contains_external_identifier(text: str) -> bool:
     return False
 
 
-def _is_explosive_or_weapon_procedure(text: str) -> bool:
-    if not _EXPLOSIVE_OR_WEAPON_DOMAIN_RE.search(text):
-        return False
-    return bool(_HARD_EXPLOSIVE_CONSTRUCTION_RE.search(text)) or len(
-        _EXPLOSIVE_ASSEMBLY_ACTION_RE.findall(text)
-    ) >= 2
-
-
-def _is_credential_theft_procedure(text: str) -> bool:
-    return bool(_CREDENTIAL_THEFT_CONTEXT_RE.search(text)) and len(
-        _CREDENTIAL_ATTACK_ACTION_RE.findall(text)
-    ) >= 2
-
-
-def _is_malware_procedure(text: str) -> bool:
-    if not _MALWARE_DOMAIN_RE.search(text):
-        return False
-    has_deployment = bool(_MALWARE_DEPLOYMENT_OBJECT_RE.search(text)) or (
-        bool(_MALWARE_DEPLOYMENT_ACTION_RE.search(text))
-        and bool(_ATTACK_TARGET_RE.search(text))
+def _harm_clauses(text: str) -> tuple[str, ...]:
+    return tuple(
+        clause.strip(" ,:\n\t")
+        for clause in _CLAUSE_SPLIT_RE.split(text)
+        if clause.strip(" ,:\n\t")
     )
-    if (
-        _MALWARE_CREATION_RE.search(text)
-        or _MALWARE_PERSISTENCE_RE.search(text)
-        or _MALWARE_EXECUTE_PAYLOAD_RE.search(text)
-        or has_deployment
+
+
+def _is_explosive_or_weapon_procedure(clauses: tuple[str, ...]) -> bool:
+    relevant_clauses = 0
+    for clause in clauses:
+        has_domain = bool(_EXPLOSIVE_OR_WEAPON_DOMAIN_RE.search(clause))
+        has_action = bool(
+            _HARD_EXPLOSIVE_CONSTRUCTION_RE.search(clause)
+            or _EXPLOSIVE_ASSEMBLY_ACTION_RE.search(clause)
+        )
+        relevant_clauses += has_domain and has_action
+    return relevant_clauses >= 2
+
+
+def _is_credential_theft_procedure(
+    text: str, clauses: tuple[str, ...]
+) -> bool:
+    literal_context = bool(_CREDENTIAL_THEFT_LITERAL_RE.search(text))
+    relevant_clauses = sum(
+        bool(_CREDENTIAL_ATTACK_ACTION_RE.search(clause))
+        and (literal_context or bool(_CREDENTIAL_OBJECT_RE.search(clause)))
+        for clause in clauses
+    )
+    return relevant_clauses >= 2
+
+
+def _is_defensive_malware_sample(text: str, clauses: tuple[str, ...]) -> bool:
+    if not (
+        _MALWARE_SAMPLE_RE.search(text)
+        and _DEFENSIVE_CONTEXT_RE.search(text)
+        and _DOWNLOAD_RE.search(text)
+        and _EXECUTE_RE.search(text)
     ):
-        return True
-    is_sample_execution = (
-        bool(_MALWARE_SAMPLE_RE.search(text))
-        and bool(_DOWNLOAD_RE.search(text))
-        and bool(_EXECUTE_RE.search(text))
+        return False
+    has_offensive_relationship = any(
+        _MALWARE_CREATION_RE.search(clause)
+        or _MALWARE_ASSEMBLY_RE.search(clause)
+        or _MALWARE_PERSISTENCE_RE.search(clause)
+        or _MALWARE_DEPLOYMENT_OBJECT_RE.search(clause)
+        or (
+            _MALWARE_DEPLOYMENT_ACTION_RE.search(clause)
+            and _ATTACK_TARGET_RE.search(clause)
+        )
+        for clause in clauses
     )
-    return is_sample_execution and not bool(_DEFENSIVE_CONTEXT_RE.search(text))
+    return not has_offensive_relationship
+
+
+def _is_malware_procedure(text: str, clauses: tuple[str, ...]) -> bool:
+    if _is_defensive_malware_sample(text, clauses):
+        return False
+    has_flow_context = any(
+        _MALWARE_DOMAIN_RE.search(clause) and not _MALWARE_REPORT_RE.search(clause)
+        for clause in clauses
+    )
+    if not has_flow_context:
+        return False
+    relevant_clauses = sum(
+        bool(
+            _MALWARE_CREATION_RE.search(clause)
+            or _MALWARE_ASSEMBLY_RE.search(clause)
+            or _MALWARE_PERSISTENCE_RE.search(clause)
+            or _MALWARE_EXECUTE_PAYLOAD_RE.search(clause)
+            or _MALWARE_DEPLOYMENT_OBJECT_RE.search(clause)
+            or _LOADER_CONNECT_RE.search(clause)
+            or _EXECUTE_PRONOUN_TARGET_RE.search(clause)
+            or (
+                _MALWARE_DEPLOYMENT_ACTION_RE.search(clause)
+                and _ATTACK_TARGET_RE.search(clause)
+            )
+        )
+        for clause in clauses
+    )
+    return relevant_clauses >= 2
 
 
 def _is_operational_harm(text: str) -> bool:
     if len(_SEQUENCE_RE.findall(text)) < 2:
         return False
+    clauses = _harm_clauses(text)
     return (
-        _is_explosive_or_weapon_procedure(text)
-        or _is_credential_theft_procedure(text)
-        or _is_malware_procedure(text)
+        _is_explosive_or_weapon_procedure(clauses)
+        or _is_credential_theft_procedure(text, clauses)
+        or _is_malware_procedure(text, clauses)
     )
 
 
