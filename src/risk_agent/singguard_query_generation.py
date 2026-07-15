@@ -142,9 +142,8 @@ _EXPLOSIVE_OR_WEAPON_DOMAIN_RE = re.compile(
     r"steel\s+pipe|timed\s+ignition|ignition|ammunition)\b",
     re.IGNORECASE,
 )
-_ASSEMBLE_RE = re.compile(r"\bassemble\w*\b", re.IGNORECASE)
 _EXPLOSIVE_ASSEMBLY_ACTION_RE = re.compile(
-    r"\b(?:load|connect|place|attach|insert|seal)\w*\b",
+    r"\b(?:assemble|load|connect|place|attach|insert|seal)\w*\b",
     re.IGNORECASE,
 )
 _MALWARE_DOMAIN_RE = re.compile(
@@ -395,10 +394,7 @@ def _is_operational_harm(text: str) -> bool:
             _EXPLOSIVE_OR_WEAPON_DOMAIN_RE.search(text)
         ) and (
             bool(_HARD_EXPLOSIVE_CONSTRUCTION_RE.search(text))
-            or (
-                bool(_ASSEMBLE_RE.search(text))
-                and bool(_EXPLOSIVE_ASSEMBLY_ACTION_RE.search(text))
-            )
+            or len(_EXPLOSIVE_ASSEMBLY_ACTION_RE.findall(text)) >= 2
         )
         is_credential_theft = bool(_CREDENTIAL_THEFT_DOMAIN_RE.search(text)) and len(
             _CREDENTIAL_THEFT_ACTION_RE.findall(text)
