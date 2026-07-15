@@ -369,56 +369,129 @@ def _validate_seeds(seed_records: tuple[SeedRecord, ...]) -> None:
             raise ValueError("seed content_hash must be lowercase SHA256 of exact text")
 
 
-def _source_label_allocations(source_counts: Mapping[str, int]) -> dict[str, int]:
-    safe_counts = {source: amount // 2 for source, amount in source_counts.items()}
-    target_safe = sum(source_counts.values()) // 2
+def _balanced_label_allocations(category_counts: Mapping[str, int]) -> dict[str, int]:
+    safe_counts = {
+        category: amount // 2 for category, amount in category_counts.items()
+    }
+    target_safe = sum(category_counts.values()) // 2
     remaining = target_safe - sum(safe_counts.values())
-    for source, amount in source_counts.items():
+    for category, amount in category_counts.items():
         if remaining and amount % 2:
-            safe_counts[source] += 1
+            safe_counts[category] += 1
             remaining -= 1
     if remaining:
         raise RuntimeError("internal source-label allocation failed")
     return safe_counts
 
 
-def _source_cell_counts(
-    source_counts: Mapping[str, int],
+def _label_thinking_cell_counts(
+    category_counts: Mapping[str, int],
 ) -> dict[str, dict[tuple[str, str], int]]:
-    safe_counts = _source_label_allocations(source_counts)
-    total_sources = sum(source_counts.values())
-    target_fast = _apportion(_THINKING_QUOTAS, total_sources)["fast"]
+    safe_counts = _balanced_label_allocations(category_counts)
+    total = sum(category_counts.values())
+    target_fast = _apportion(_THINKING_QUOTAS, total)["fast"]
     exact_fast = {
         source: Fraction(amount * _THINKING_QUOTAS["fast"], _BASE_COUNT)
-        for source, amount in source_counts.items()
+        for source, amount in category_counts.items()
     }
     fast_counts = {source: int(value) for source, value in exact_fast.items()}
     remaining_fast = target_fast - sum(fast_counts.values())
     fast_remainder_order = sorted(
-        source_counts,
+        category_counts,
         key=lambda source: exact_fast[source] - fast_counts[source],
         reverse=True,
     )
     for source in fast_remainder_order[:remaining_fast]:
         fast_counts[source] += 1
-    result: dict[str, dict[tuple[str, str], int]] = {}
-    for source, amount in source_counts.items():
-        safe = safe_counts[source]
-        unsafe = amount - safe
-        fast = fast_counts[source]
+    safe_fast_target = _apportion(_THINKING_QUOTAS, sum(safe_counts.values()))["fast"]
+    safe_fast_values: dict[str, int] = {}
+    safe_fast_bounds: dict[str, tuple[int, int]] = {}
+    safe_fast_ideals: dict[str, Fraction] = {}
+    for category, amount in category_counts.items():
+        safe = safe_counts[category]
+        fast = fast_counts[category]
         slow = amount - fast
-        ideal_safe_fast = Fraction(safe * fast, amount) if amount else Fraction(0)
-        safe_fast = int(ideal_safe_fast + Fraction(1, 2))
-        safe_fast = max(max(0, safe - slow), min(safe_fast, min(safe, fast)))
-        result[source] = {
+        lower = max(0, safe - slow)
+        upper = min(safe, fast)
+        ideal = Fraction(safe * fast, amount) if amount else Fraction(0)
+        safe_fast_values[category] = max(lower, min(int(ideal), upper))
+        safe_fast_bounds[category] = (lower, upper)
+        safe_fast_ideals[category] = ideal
+    while sum(safe_fast_values.values()) < safe_fast_target:
+        candidates = [
+            category
+            for category, (_, upper) in safe_fast_bounds.items()
+            if safe_fast_values[category] < upper
+        ]
+        if not candidates:
+            raise RuntimeError("internal label-thinking allocation is infeasible")
+        category = max(
+            candidates,
+            key=lambda item: safe_fast_ideals[item] - safe_fast_values[item],
+        )
+        safe_fast_values[category] += 1
+    while sum(safe_fast_values.values()) > safe_fast_target:
+        candidates = [
+            category
+            for category, (lower, _) in safe_fast_bounds.items()
+            if safe_fast_values[category] > lower
+        ]
+        if not candidates:
+            raise RuntimeError("internal label-thinking allocation is infeasible")
+        category = min(
+            candidates,
+            key=lambda item: safe_fast_ideals[item] - safe_fast_values[item],
+        )
+        safe_fast_values[category] -= 1
+
+    result: dict[str, dict[tuple[str, str], int]] = {}
+    for category, amount in category_counts.items():
+        safe = safe_counts[category]
+        unsafe = amount - safe
+        fast = fast_counts[category]
+        safe_fast = safe_fast_values[category]
+        result[category] = {
             ("safe", "fast"): safe_fast,
             ("safe", "slow"): safe - safe_fast,
             ("unsafe", "fast"): fast - safe_fast,
             ("unsafe", "slow"): unsafe - (fast - safe_fast),
         }
-        if any(value < 0 for value in result[source].values()):
-            raise RuntimeError("internal source crossing produced a negative cell")
+        if any(value < 0 for value in result[category].values()):
+            raise RuntimeError("internal label-thinking crossing produced a negative cell")
     return result
+
+
+def _align_label_thinking_values(
+    labels: Sequence[str],
+    thinking_types: Sequence[str],
+    quotas: Mapping[str, int],
+    count: int,
+    rng: random.Random,
+) -> list[str]:
+    category_counts = _largest_remainder(quotas, count)
+    cell_counts = _label_thinking_cell_counts(category_counts)
+    pools = {
+        cell: [
+            category
+            for category, category_cells in cell_counts.items()
+            for _ in range(category_cells[cell])
+        ]
+        for cell in (
+            ("safe", "fast"),
+            ("safe", "slow"),
+            ("unsafe", "fast"),
+            ("unsafe", "slow"),
+        )
+    }
+    for pool in pools.values():
+        rng.shuffle(pool)
+    offsets = {cell: 0 for cell in pools}
+    values: list[str] = []
+    for label, thinking_type in zip(labels, thinking_types, strict=True):
+        cell = (label, thinking_type)
+        values.append(pools[cell][offsets[cell]])
+        offsets[cell] += 1
+    return values
 
 
 def _allocate_source_forms(
@@ -506,7 +579,7 @@ def _assign_source_refs(
         rng.shuffle(records)
         selected[source] = records[: scaled_quotas[source]]
     source_counts = {source: len(records) for source, records in selected.items()}
-    cell_counts = _source_cell_counts(source_counts)
+    cell_counts = _label_thinking_cell_counts(source_counts)
     refs: list[SourceRef | None] = [None] * count
     available = set(range(count))
     record_offsets = {source: 0 for source in selected}
@@ -600,12 +673,14 @@ def _stable_id(
     namespace: str,
     *,
     semantic_fields: Mapping[str, object],
+    policy_fingerprint: str,
     ordinal: int,
 ) -> str:
     payload = {
         "planner_contract": "singguard-query-blueprint-v2",
         "namespace": namespace,
         "ordinal": ordinal,
+        "policy_fingerprint": policy_fingerprint,
         "semantics": semantic_fields,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -630,14 +705,26 @@ def plan_blueprints(
         raise TypeError("seed must be an integer")
     rule_ids, rule_owners = _validate_policies(policies)
     _validate_seeds(seed_records)
+    policy_fingerprints = {
+        policy.policy_id: hashlib.sha256(
+            json.dumps(
+                policy.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        for policy in policies
+    }
 
     rng = random.Random(seed)
     labels = _shuffled_values(_LABEL_QUOTAS, count, rng)
-    shapes = _shuffled_values(_SHAPE_QUOTAS, count, rng)
+    shapes = _align_label_balanced_values(labels, _SHAPE_QUOTAS, count, rng)
     thinking_types = _align_label_balanced_values(
         labels, _THINKING_QUOTAS, count, rng
     )
-    forms = _align_label_balanced_values(labels, _FORM_QUOTAS, count, rng)
+    forms = _align_label_thinking_values(
+        labels, thinking_types, _FORM_QUOTAS, count, rng
+    )
     difficulties = _align_label_balanced_values(
         labels, _DIFFICULTY_QUOTAS, count, rng
     )
@@ -651,7 +738,6 @@ def plan_blueprints(
 
     unsafe_count = labels.count("unsafe")
     primary_rules = _balanced_rule_schedule(rule_ids, unsafe_count, rng)
-    safe_policies = _balanced_policy_schedule(policies, count - unsafe_count, rng)
     primary_owner_offsets = {rule_id: 0 for rule_id in rule_ids}
     unsafe_policies: list[ActivePolicy] = []
     for rule_id in primary_rules:
@@ -660,13 +746,25 @@ def plan_blueprints(
         unsafe_policies.append(owners[owner_offset % len(owners)])
         primary_owner_offsets[rule_id] = owner_offset + 1
     multi_risk_target = unsafe_count // 5
-    multi_candidates = [
-        offset
-        for offset, policy in enumerate(unsafe_policies)
-        if len(policy.rules) >= 2
-    ]
-    rng.shuffle(multi_candidates)
-    multi_risk_offsets = set(multi_candidates[:multi_risk_target])
+    eligible_multi_offsets = {rule_id: [] for rule_id in rule_ids}
+    for offset, (rule_id, policy) in enumerate(
+        zip(primary_rules, unsafe_policies, strict=True)
+    ):
+        if len(policy.rules) >= 2:
+            eligible_multi_offsets[rule_id].append(offset)
+    for offsets in eligible_multi_offsets.values():
+        rng.shuffle(offsets)
+    multi_risk_offsets: set[int] = set()
+    while len(multi_risk_offsets) < multi_risk_target:
+        progress = False
+        for rule_id in rule_ids:
+            if eligible_multi_offsets[rule_id]:
+                multi_risk_offsets.add(eligible_multi_offsets[rule_id].pop())
+                progress = True
+                if len(multi_risk_offsets) == multi_risk_target:
+                    break
+        if not progress:
+            break
 
     documented_exceptions: list[tuple[str, str]] = []
     seen_exceptions: set[tuple[str, str]] = set()
@@ -694,6 +792,10 @@ def plan_blueprints(
         if documented_exceptions
         else []
     )
+    generic_safe_count = count - unsafe_count - (
+        safe_exception_count if documented_exceptions else 0
+    )
+    safe_policies = _balanced_policy_schedule(policies, generic_safe_count, rng)
 
     source_refs = _assign_source_refs(
         seed_records=seed_records,
@@ -705,9 +807,11 @@ def plan_blueprints(
     )
 
     exception_owner_offsets = {pair: 0 for pair in documented_exceptions}
+    secondary_offsets: dict[tuple[str, str], int] = {}
     rows: list[QueryBlueprint] = []
     unsafe_offset = 0
     safe_offset = 0
+    generic_safe_offset = 0
     exception_offset = 0
     for index, label in enumerate(labels):
         if label == "unsafe":
@@ -719,11 +823,15 @@ def plan_blueprints(
                 rule.title for rule in policy.rules if rule.rule_id == primary_rule_id
             )
             if multi_risk:
-                secondary_rule_id = next(
-                    rule.rule_id
-                    for rule in policy.rules
-                    if rule.rule_id != primary_rule_id
+                secondary_rules = tuple(
+                    rule for rule in policy.rules if rule.rule_id != primary_rule_id
                 )
+                secondary_key = (policy.policy_id, primary_rule_id)
+                secondary_offset = secondary_offsets.get(secondary_key, 0)
+                secondary_rule_id = secondary_rules[
+                    secondary_offset % len(secondary_rules)
+                ].rule_id
+                secondary_offsets[secondary_key] = secondary_offset + 1
                 intended_rule_ids = {primary_rule_id, secondary_rule_id}
                 intended_answers = tuple(
                     rule.title
@@ -751,7 +859,8 @@ def plan_blueprints(
             else:
                 target_exception_rule_id = None
                 target_exception = None
-                policy = safe_policies[safe_offset]
+                policy = safe_policies[generic_safe_offset]
+                generic_safe_offset += 1
             safe_offset += 1
         active_rule_ids = tuple(rule.rule_id for rule in policy.rules)
         active_rule_titles = tuple(rule.title for rule in policy.rules)
@@ -782,10 +891,16 @@ def plan_blueprints(
         rows.append(
             QueryBlueprint(
                 blueprint_id=_stable_id(
-                    "blueprint", semantic_fields=semantic_fields, ordinal=index
+                    "blueprint",
+                    semantic_fields=semantic_fields,
+                    policy_fingerprint=policy_fingerprints[policy.policy_id],
+                    ordinal=index,
                 ),
                 family_id=_stable_id(
-                    "family", semantic_fields=semantic_fields, ordinal=index
+                    "family",
+                    semantic_fields=semantic_fields,
+                    policy_fingerprint=policy_fingerprints[policy.policy_id],
+                    ordinal=index,
                 ),
                 **semantic_fields,
             )
@@ -793,6 +908,8 @@ def plan_blueprints(
 
     if unsafe_offset != unsafe_count or safe_offset != count - unsafe_count:
         raise RuntimeError("internal label assignment did not consume its schedules")
+    if generic_safe_offset != generic_safe_count:
+        raise RuntimeError("internal generic-safe assignment left policies unused")
     if documented_exceptions and exception_offset != safe_exception_count:
         raise RuntimeError("internal exception assignment left targets unused")
     return tuple(rows)

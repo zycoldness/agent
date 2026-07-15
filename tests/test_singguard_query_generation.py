@@ -227,6 +227,42 @@ def test_axes_are_balanced_within_each_label_and_label_thinking_is_crossed() -> 
             assert abs(safe_count - unsafe_count) <= 1
 
 
+def test_conversation_shape_is_crossed_with_label_for_seed_3033() -> None:
+    rows = _plan(count=100, seed=3_033, seed_count=0)
+
+    assert Counter((row.intended_label, row.conversation_shape) for row in rows) == {
+        ("safe", "query"): 35,
+        ("unsafe", "query"): 35,
+        ("safe", "query_response"): 15,
+        ("unsafe", "query_response"): 15,
+    }
+
+
+def test_content_form_is_crossed_with_thinking_for_seed_2272() -> None:
+    rows = _plan(count=100, seed=2_272, seed_count=0)
+    livestream = [row for row in rows if row.content_form == "livestream_pitch"]
+
+    assert Counter(row.thinking_type for row in livestream) == {"fast": 11, "slow": 4}
+    assert Counter(row.intended_label for row in livestream) == {
+        "safe": 8,
+        "unsafe": 7,
+    }
+
+
+def test_conversation_and_form_crossings_are_seed_invariant() -> None:
+    expected = None
+    for seed in range(40):
+        rows = _plan(count=100, seed=seed, seed_count=0)
+        counts = (
+            Counter((row.intended_label, row.conversation_shape) for row in rows),
+            Counter((row.intended_label, row.content_form) for row in rows),
+            Counter((row.thinking_type, row.content_form) for row in rows),
+        )
+        if expected is None:
+            expected = counts
+        assert counts == expected
+
+
 def test_identical_inputs_and_seed_produce_identical_immutable_blueprints() -> None:
     first = _plan(count=100, seed=13)
     second = _plan(count=100, seed=13)
@@ -299,8 +335,45 @@ def test_ids_change_when_policy_semantics_change() -> None:
         row.blueprint_id for row in changed_rows
     ]
     for original, updated in zip(original_rows, changed_rows, strict=True):
-        if original.policy_id == "safety-v1":
+        if original.policy_id == "commerce-v1":
+            assert original.blueprint_id != updated.blueprint_id
+            assert original.family_id != updated.family_id
+        else:
             assert original.blueprint_id == updated.blueprint_id
+            assert original.family_id == updated.family_id
+
+
+@pytest.mark.parametrize("changed_field", ("text", "exceptions", "priority"))
+def test_ids_include_complete_selected_policy_semantics(changed_field: str) -> None:
+    from risk_agent.singguard_query_generation import plan_blueprints
+
+    policies = _policies()
+    first_rule = policies[0].rules[0]
+    updates = {
+        "text": {"text": f"{first_rule.text} Updated."},
+        "exceptions": {
+            "exceptions": tuple(f"Updated {item}" for item in first_rule.exceptions)
+        },
+        "priority": {"priority": first_rule.priority + 1},
+    }
+    changed_policy = policies[0].model_copy(
+        update={
+            "rules": (
+                first_rule.model_copy(update=updates[changed_field]),
+                *policies[0].rules[1:],
+            )
+        }
+    )
+    changed = (changed_policy, policies[1])
+
+    original_rows = plan_blueprints(policies, count=100, seed=3, seed_records=())
+    changed_rows = plan_blueprints(changed, count=100, seed=3, seed_records=())
+
+    for original, updated in zip(original_rows, changed_rows, strict=True):
+        assert original.policy_id == updated.policy_id
+        if original.policy_id == changed_policy.policy_id:
+            assert original.blueprint_id != updated.blueprint_id
+            assert original.family_id != updated.family_id
 
 
 def test_changing_seed_text_and_hash_changes_only_the_affected_semantic_id() -> None:
@@ -438,6 +511,59 @@ def test_safe_exception_rows_cover_documented_exceptions_evenly() -> None:
         assert row.target_exception in rule.exceptions
 
 
+def test_generic_safe_policy_schedule_is_balanced_without_consuming_exception_rows() -> None:
+    from risk_agent.singguard_query_generation import plan_blueprints
+
+    policies = (
+        ActivePolicy(
+            policy_id="policy-a",
+            rules=(
+                PolicyRule(
+                    rule_id="A",
+                    title="Rule A",
+                    text="Rule A text.",
+                    exceptions=("Exception A",),
+                ),
+                PolicyRule(rule_id="A2", title="Rule A2", text="Rule A2 text."),
+            ),
+        ),
+        ActivePolicy(
+            policy_id="policy-b",
+            rules=(
+                PolicyRule(
+                    rule_id="B",
+                    title="Rule B",
+                    text="Rule B text.",
+                    exceptions=("Exception B",),
+                ),
+                PolicyRule(rule_id="B2", title="Rule B2", text="Rule B2 text."),
+            ),
+        ),
+    )
+
+    rows = plan_blueprints(policies, count=100, seed=31, seed_records=())
+    generic_safe = [
+        row
+        for row in rows
+        if row.intended_label == "safe" and row.target_exception_rule_id is None
+    ]
+    targeted = [row for row in rows if row.target_exception_rule_id is not None]
+
+    generic_counts = Counter(row.policy_id for row in generic_safe)
+    all_safe_counts = Counter(
+        row.policy_id for row in rows if row.intended_label == "safe"
+    )
+    assert abs(generic_counts["policy-a"] - generic_counts["policy-b"]) <= 1
+    assert abs(all_safe_counts["policy-a"] - all_safe_counts["policy-b"]) <= 1
+    assert {
+        (row.policy_id, row.target_exception_rule_id, row.target_exception)
+        for row in targeted
+    } == {
+        ("policy-a", "A", "Exception A"),
+        ("policy-b", "B", "Exception B"),
+    }
+
+
 def test_exception_difficulty_remains_generic_when_policy_has_no_exceptions() -> None:
     from risk_agent.singguard_query_generation import plan_blueprints
 
@@ -506,6 +632,55 @@ def test_multi_risk_quota_degrades_when_no_policy_has_two_rules() -> None:
     rows = plan_blueprints(policies, count=100, seed=1, seed_records=())
 
     assert all(len(row.intended_answers) <= 1 for row in rows)
+
+
+def test_multi_risk_balances_primaries_and_cycles_policy_local_secondaries() -> None:
+    from risk_agent.singguard_query_generation import plan_blueprints
+
+    policy = ActivePolicy(
+        policy_id="four-rules",
+        rules=tuple(
+            PolicyRule(
+                rule_id=f"R{index}", title=f"Rule {index}", text=f"Rule {index} text."
+            )
+            for index in range(4)
+        ),
+    )
+
+    rows = plan_blueprints((policy,), count=100, seed=17, seed_records=())
+    repeated = plan_blueprints((policy,), count=100, seed=17, seed_records=())
+    multi = [row for row in rows if len(row.intended_answers) == 2]
+    primary_counts = Counter(row.primary_rule_id for row in multi)
+    directed_pairs = {
+        (
+            row.primary_rule_id,
+            next(title for title in row.intended_answers if title != row.primary_answer),
+        )
+        for row in multi
+    }
+
+    assert len(multi) == 10
+    assert max(primary_counts.values()) - min(primary_counts.values()) <= 1
+    assert len(directed_pairs) == 10
+    for primary_rule_id, amount in primary_counts.items():
+        if amount == 3:
+            primary_title = policy.rules[int(primary_rule_id[1:])].title
+            secondaries = {
+                secondary
+                for primary, secondary in directed_pairs
+                if primary == primary_rule_id
+            }
+            assert secondaries == {
+                rule.title for rule in policy.rules if rule.title != primary_title
+            }
+    assert rows == repeated
+    assert all(
+        row.intended_answers
+        == tuple(
+            title for title in row.active_rule_titles if title in row.intended_answers
+        )
+        for row in multi
+    )
 
 
 def test_at_least_quota_seeds_assigns_exactly_600_unique_references() -> None:
