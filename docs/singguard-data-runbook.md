@@ -115,7 +115,7 @@ python scripts/generate_singguard_data.py \
   --resume
 ```
 
-Resume validates hashes of the normalized policies, samples, four tool tables,
+Resume validates hashes of the normalized policies, samples, three tool tables,
 and every fully rendered system prompt. It also checks that saved accepted and
 rejected row counts match the checkpoint before making another provider request.
 The provider/model generation contract and tool-call limit must also match. It
