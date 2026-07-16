@@ -4,6 +4,39 @@ from pathlib import Path
 import pytest
 
 
+def test_load_seeds_keeps_first_row_for_duplicate_content_hash(
+    tmp_path: Path, capsys
+) -> None:
+    from scripts.generate_singguard_queries import _load_seeds
+
+    content_hash = "a" * 64
+    common = {
+        "provenance_url": "https://example.com/dataset",
+        "license": "CC-BY-4.0",
+        "usage_scope": "research",
+        "source_role": "query_seed",
+        "text": "The same normalized seed content",
+        "source_label": None,
+        "content_hash": content_hash,
+        "retrieved_at": "2026-07-16T00:00:00Z",
+        "adapter_version": "v1",
+    }
+    path = tmp_path / "seeds.jsonl"
+    rows = [
+        {**common, "source": "first", "source_id": "1"},
+        {**common, "source": "second", "source_id": "2"},
+    ]
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    records = _load_seeds(path)
+
+    assert len(records) == 1
+    assert records[0].source == "first"
+    assert "ignored 1 duplicate seed rows" in capsys.readouterr().err
+
+
 def test_cli_requires_model_unless_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     from scripts.generate_singguard_queries import main
 

@@ -86,7 +86,19 @@ def _load_seeds(path: Path | None) -> tuple[SeedRecord, ...]:
         )
     except (OSError, ValidationError, ValueError):
         raise ValueError("seed JSONL contains an invalid record") from None
-    return records
+    unique_records: list[SeedRecord] = []
+    seen_hashes: set[str] = set()
+    for record in records:
+        if record.content_hash in seen_hashes:
+            continue
+        seen_hashes.add(record.content_hash)
+        unique_records.append(record)
+    duplicate_count = len(records) - len(unique_records)
+    if duplicate_count:
+        sys.stderr.write(
+            f"warning: ignored {duplicate_count} duplicate seed rows by content_hash\n"
+        )
+    return tuple(unique_records)
 
 
 def _write_dry_plan(
