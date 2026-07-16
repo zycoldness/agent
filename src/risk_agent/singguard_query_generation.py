@@ -1084,6 +1084,55 @@ _QUERY_ARTIFACTS = (
     "events.jsonl",
 )
 _GATE_VERSION = "singguard-local-gates-v1"
+_COMPATIBILITY_KEYS = frozenset(
+    {
+        "contract_version",
+        "plan_sha256",
+        "policy_sha256",
+        "source_sha256",
+        "source_text_sha256",
+        "prompt_sha256",
+        "gate_sha256",
+        "config_sha256",
+        "config",
+    }
+)
+_CHECKPOINT_STATE_KEYS = frozenset(
+    {
+        "completed_ids",
+        "terminal_rejected_ids",
+        "attempt_counts",
+        "artifact_sha256",
+        "artifact_counts",
+        "teacher_usage",
+    }
+)
+_USAGE_KEYS = frozenset(
+    {
+        "request_count",
+        "input_tokens",
+        "output_tokens",
+        "estimated_cost_usd",
+        "accounting_complete",
+    }
+)
+_SAMPLE_KEYS = frozenset(ModerationSample.model_fields)
+_REJECTION_CODES = frozenset(
+    {
+        "schema_or_shape",
+        "literal_role_wrapper",
+        "wrong_language",
+        "generation_meta_language",
+        "pii_or_external_identifier",
+        "operational_harm",
+        "length_out_of_bin",
+        "exact_duplicate",
+        "source_too_similar",
+        "near_duplicate",
+        "parse_invalid_batch",
+        "provider_request",
+    }
+)
 
 
 def _stable_json_bytes(payload: object) -> bytes:
@@ -1134,6 +1183,10 @@ def _sha256_file(path: Path) -> str:
         raise ValueError(f"cannot read query artifact {path.name}") from None
 
 
+def _same_json(left: object, right: object) -> bool:
+    return _stable_json_bytes(left) == _stable_json_bytes(right)
+
+
 def _strict_json_loads(text: str, *, artifact: str) -> object:
     try:
         return json.loads(
@@ -1163,7 +1216,8 @@ def _read_json(path: Path) -> dict[str, object]:
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
     try:
-        text = path.read_text(encoding="utf-8")
+        raw = path.read_bytes()
+        text = raw.decode("utf-8")
     except (OSError, UnicodeError):
         raise ValueError(f"cannot read query artifact {path.name}") from None
     if text and not text.endswith("\n"):
@@ -1174,6 +1228,8 @@ def _read_jsonl(path: Path) -> list[dict[str, object]]:
         if not isinstance(value, dict):
             raise ValueError(f"invalid {path.name}")
         rows.append(value)
+    if raw != _stable_jsonl_bytes(rows):
+        raise ValueError(f"invalid or noncanonical {path.name}")
     return rows
 
 
@@ -1255,11 +1311,19 @@ def _quota_coverage(
 ) -> dict[str, object]:
     dimensions: dict[str, Callable[[QueryBlueprint], object]] = {
         "label": lambda row: row.intended_label,
+        "primary_rule": lambda row: row.primary_rule_id or "none",
         "primary_answer": lambda row: row.primary_answer or "none",
-        "form": lambda row: row.content_form,
+        "content_form": lambda row: row.content_form,
         "source_mode": lambda row: "governed" if row.source_ref else "none",
+        "source_name": lambda row: row.source_ref.source if row.source_ref else "none",
+        "difficulty": lambda row: row.difficulty,
+        "tone": lambda row: row.tone,
+        "noise_profile": lambda row: row.noise_profile,
+        "length_bin": lambda row: row.length_bin,
         "thinking_type": lambda row: row.thinking_type,
-        "shape": lambda row: row.conversation_shape,
+        "conversation_shape": lambda row: row.conversation_shape,
+        "tool_capable": lambda row: row.tool_capable,
+        "policy": lambda row: row.policy_id,
     }
 
     def counts(rows: Sequence[QueryBlueprint]) -> dict[str, dict[str, int]]:
@@ -1329,9 +1393,11 @@ def _review_rows(
             continue
         key = (
             blueprint.intended_label,
+            blueprint.primary_rule_id or "none",
             blueprint.primary_answer or "none",
             blueprint.content_form,
             "governed" if blueprint.source_ref else "none",
+            blueprint.difficulty,
             blueprint.thinking_type,
             blueprint.conversation_shape,
         )
@@ -1351,7 +1417,39 @@ def _review_rows(
                     break
         if not changed:
             break
-    return [{**samples[item_id], **metadata[item_id]} for item_id in selected]
+    rows: list[dict[str, object]] = []
+    for item_id in selected:
+        sample = samples[item_id]
+        detail = metadata[item_id]
+        rows.append(
+            {
+                "sample_id": sample["sample_id"],
+                "blueprint_id": detail["blueprint_id"],
+                "family_id": detail["family_id"],
+                "policy_id": sample["policy_id"],
+                "thinking_type": sample["thinking_type"],
+                "query": sample["query"],
+                "response": sample["response"],
+                "tool_names": sample["tool_names"],
+                "tool_policy": sample["tool_policy"],
+                "expected_label": sample["expected_label"],
+                "expected_answers": sample["expected_answers"],
+                "primary_rule_id": detail["primary_rule_id"],
+                "primary_answer": detail["primary_answer"],
+                "intended_label": detail["intended_label"],
+                "intended_answers": detail["intended_answers"],
+                "content_form": detail["content_form"],
+                "difficulty": detail["difficulty"],
+                "tone": detail["tone"],
+                "length_bin": detail["length_bin"],
+                "noise_profile": detail["noise_profile"],
+                "conversation_shape": detail["conversation_shape"],
+                "tool_capable": detail["tool_capable"],
+                "source_mode": detail["source_mode"],
+                "attempt": detail["attempt"],
+            }
+        )
+    return rows
 
 
 def _usage_add(aggregate: dict[str, object], usage: TeacherUsage) -> None:
@@ -1492,12 +1590,125 @@ def _validate_run_inputs(
     )
 
 
+def _validated_usage(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != _USAGE_KEYS:
+        raise ValueError("resume teacher usage has invalid fields")
+    for name in ("request_count", "input_tokens", "output_tokens"):
+        item = value[name]
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise ValueError("resume teacher usage has invalid counts")
+    cost = value["estimated_cost_usd"]
+    if cost is not None and (
+        isinstance(cost, bool)
+        or not isinstance(cost, (int, float))
+        or not math.isfinite(float(cost))
+        or cost < 0
+    ):
+        raise ValueError("resume teacher usage has invalid cost")
+    if type(value["accounting_complete"]) is not bool:
+        raise ValueError("resume teacher usage has invalid accounting flag")
+    return dict(value)
+
+
+def _validate_events(
+    rows: list[dict[str, object]], *, count: int, batch_size: int
+) -> None:
+    if not rows:
+        raise ValueError("resume events artifact is empty")
+    schemas: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+        "initialize": (
+            frozenset({"sequence", "event", "code"}),
+            frozenset({"fresh"}),
+        ),
+        "resume": (
+            frozenset({"sequence", "event", "code", "completed_count"}),
+            frozenset({"validated"}),
+        ),
+        "provider_stop": (
+            frozenset({"sequence", "event", "code", "batch_count"}),
+            frozenset({"budget_exceeded", "provider_request"}),
+        ),
+        "batch_rejected": (
+            frozenset({"sequence", "event", "code", "batch_count"}),
+            frozenset({"parse_invalid_batch"}),
+        ),
+        "batch_complete": (
+            frozenset(
+                {"sequence", "event", "code", "batch_count", "accepted_count"}
+            ),
+            frozenset({"gated"}),
+        ),
+    }
+    for sequence, row in enumerate(rows, start=1):
+        event = row.get("event")
+        if type(event) is not str or event not in schemas:
+            raise ValueError("resume event type is invalid")
+        keys, codes = schemas[event]
+        if (
+            set(row) != keys
+            or type(row.get("sequence")) is not int
+            or row.get("sequence") != sequence
+            or row.get("code") not in codes
+        ):
+            raise ValueError("resume event schema is invalid")
+        if event == "initialize" and sequence != 1:
+            raise ValueError("resume initialize event is out of order")
+        if "batch_count" in row:
+            value = row["batch_count"]
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= batch_size:
+                raise ValueError("resume event batch count is invalid")
+        if event == "resume":
+            value = row["completed_count"]
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= count:
+                raise ValueError("resume event completed count is invalid")
+        if event == "batch_complete":
+            accepted = row["accepted_count"]
+            if (
+                isinstance(accepted, bool)
+                or not isinstance(accepted, int)
+                or not 0 <= accepted <= row["batch_count"]
+            ):
+                raise ValueError("resume event accepted count is invalid")
+
+
+def _validate_rejections(
+    rows: list[dict[str, object]],
+    *,
+    known_ids: set[str],
+    max_attempts: int,
+) -> dict[str, list[int]]:
+    histories: dict[str, list[int]] = defaultdict(list)
+    for row in rows:
+        if set(row) != {"blueprint_id", "attempt", "code"}:
+            raise ValueError("resume rejected row schema is invalid")
+        item_id = row["blueprint_id"]
+        attempt = row["attempt"]
+        code = row["code"]
+        if type(item_id) is not str or item_id not in known_ids:
+            raise ValueError("resume rejected blueprint ID is invalid")
+        if (
+            isinstance(attempt, bool)
+            or not isinstance(attempt, int)
+            or not 1 <= attempt <= max_attempts
+            or type(code) is not str
+            or code not in _REJECTION_CODES
+        ):
+            raise ValueError("resume rejected attempt is invalid")
+        histories[item_id].append(attempt)
+    if any(attempts != list(range(1, len(attempts) + 1)) for attempts in histories.values()):
+        raise ValueError("resume rejected attempt history is not contiguous")
+    return histories
+
+
 def _resume_state(
     *,
     output_dir: Path,
     blueprints: tuple[QueryBlueprint, ...],
     plan_rows: list[dict[str, object]],
     compatibility: Mapping[str, object],
+    source_texts: Mapping[object, str],
+    batch_size: int,
+    max_attempts: int,
 ) -> tuple[
     dict[str, dict[str, object]],
     dict[str, dict[str, object]],
@@ -1506,18 +1717,36 @@ def _resume_state(
     dict[str, int],
     set[str],
     dict[str, object],
+    CandidateIndex,
 ]:
     checkpoint = _read_json(output_dir / "checkpoint.json")
     manifest = _read_json(output_dir / "manifest.json")
+    if set(checkpoint) != _COMPATIBILITY_KEYS | _CHECKPOINT_STATE_KEYS:
+        raise ValueError("resume checkpoint schema is invalid")
     for key, expected in compatibility.items():
-        if checkpoint.get(key) != expected or manifest.get(key) != expected:
+        if not _same_json(checkpoint.get(key), expected) or not _same_json(
+            manifest.get(key), expected
+        ):
             raise ValueError(f"resume compatibility mismatch: {key}")
     existing_plan = _read_jsonl(output_dir / "plan.jsonl")
     if _stable_jsonl_bytes(existing_plan) != _stable_jsonl_bytes(plan_rows):
         raise ValueError("resume deterministic plan mismatch")
     expected_hashes = checkpoint.get("artifact_sha256")
     expected_counts = checkpoint.get("artifact_counts")
-    if not isinstance(expected_hashes, dict) or not isinstance(expected_counts, dict):
+    if (
+        not isinstance(expected_hashes, dict)
+        or set(expected_hashes) != set(_QUERY_ARTIFACTS)
+        or not isinstance(expected_counts, dict)
+        or set(expected_counts) != set(_QUERY_ARTIFACTS)
+    ):
+        raise ValueError("resume checkpoint artifact metadata is invalid")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in expected_counts.values()
+    ) or any(
+        type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in expected_hashes.values()
+    ):
         raise ValueError("resume checkpoint artifact metadata is invalid")
     artifact_rows: dict[str, list[dict[str, object]]] = {"plan.jsonl": existing_plan}
     for name in _QUERY_ARTIFACTS:
@@ -1528,38 +1757,23 @@ def _resume_state(
         if expected_counts.get(name) != len(artifact_rows[name]):
             raise ValueError(f"resume artifact count mismatch: {name}")
     manifest_hashes = manifest.get("artifact_sha256")
-    if not isinstance(manifest_hashes, dict):
+    if not isinstance(manifest_hashes, dict) or set(manifest_hashes) != {
+        *_QUERY_ARTIFACTS,
+        "checkpoint.json",
+    }:
         raise ValueError("resume manifest artifact metadata is invalid")
     for name in (*_QUERY_ARTIFACTS, "checkpoint.json"):
         if manifest_hashes.get(name) != _sha256_file(output_dir / name):
             raise ValueError(f"resume manifest hash mismatch: {name}")
 
-    known_ids = {row.blueprint_id for row in blueprints}
+    ordered_ids = [row.blueprint_id for row in blueprints]
+    known_ids = set(ordered_ids)
+    by_id = {row.blueprint_id: row for row in blueprints}
     sample_rows = artifact_rows["content_samples.jsonl"]
     metadata_rows = artifact_rows["sample_metadata.jsonl"]
     sample_ids = [row.get("sample_id") for row in sample_rows]
     metadata_ids = [row.get("sample_id") for row in metadata_rows]
-    if (
-        any(type(item_id) is not str or item_id not in known_ids for item_id in sample_ids)
-        or len(sample_ids) != len(set(sample_ids))
-        or metadata_ids != sample_ids
-    ):
-        raise ValueError("resume accepted artifacts have invalid or duplicate IDs")
-    for row in sample_rows:
-        try:
-            ModerationSample.model_validate_json(
-                json.dumps(row, ensure_ascii=False, allow_nan=False), strict=True
-            )
-        except (ValidationError, ValueError, TypeError):
-            raise ValueError("resume content sample is invalid") from None
-
     rejected_rows = artifact_rows["rejected.jsonl"]
-    rejection_keys = [(row.get("blueprint_id"), row.get("attempt")) for row in rejected_rows]
-    if (
-        any(type(item_id) is not str or item_id not in known_ids for item_id, _ in rejection_keys)
-        or len(rejection_keys) != len(set(rejection_keys))
-    ):
-        raise ValueError("resume rejected artifact has invalid or duplicate attempts")
     attempts_raw = checkpoint.get("attempt_counts")
     completed_raw = checkpoint.get("completed_ids")
     terminal_raw = checkpoint.get("terminal_rejected_ids")
@@ -1568,34 +1782,127 @@ def _resume_state(
         or set(attempts_raw) != known_ids
         or not isinstance(completed_raw, list)
         or not isinstance(terminal_raw, list)
-        or completed_raw != sample_ids
-        or len(terminal_raw) != len(set(terminal_raw))
-        or any(item_id not in known_ids for item_id in terminal_raw)
-        or set(completed_raw) & set(terminal_raw)
     ):
         raise ValueError("resume checkpoint state is inconsistent")
     attempts: dict[str, int] = {}
     for item_id, value in attempts_raw.items():
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= max_attempts
+        ):
             raise ValueError("resume attempt counts are invalid")
         attempts[item_id] = value
-    samples = {str(row["sample_id"]): row for row in sample_rows}
-    metadata = {str(row["sample_id"]): row for row in metadata_rows}
     events = artifact_rows["events.jsonl"]
-    usage = checkpoint.get("teacher_usage")
-    if not isinstance(usage, dict) or usage != manifest.get("teacher_usage"):
+    _validate_events(events, count=len(blueprints), batch_size=batch_size)
+    histories = _validate_rejections(
+        rejected_rows, known_ids=known_ids, max_attempts=max_attempts
+    )
+    usage = _validated_usage(checkpoint.get("teacher_usage"))
+    if usage != manifest.get("teacher_usage"):
         raise ValueError("resume teacher usage is inconsistent")
+
+    if (
+        sample_ids != completed_raw
+        or metadata_ids != sample_ids
+        or len(sample_ids) != len(set(sample_ids))
+        or any(type(item_id) is not str or item_id not in known_ids for item_id in sample_ids)
+        or completed_raw != [item_id for item_id in ordered_ids if item_id in set(completed_raw)]
+        or terminal_raw != [item_id for item_id in ordered_ids if item_id in set(terminal_raw)]
+        or len(terminal_raw) != len(set(terminal_raw))
+        or any(type(item_id) is not str or item_id not in known_ids for item_id in terminal_raw)
+        or set(completed_raw) & set(terminal_raw)
+    ):
+        raise ValueError("resume accepted or terminal ID ordering is inconsistent")
+
+    parsed_samples: dict[str, ModerationSample] = {}
+    samples: dict[str, dict[str, object]] = {}
+    for row in sample_rows:
+        if set(row) != _SAMPLE_KEYS:
+            raise ValueError("resume content sample schema is invalid")
+        try:
+            sample = ModerationSample.model_validate_json(
+                json.dumps(row, ensure_ascii=False, allow_nan=False), strict=True
+            )
+        except (ValidationError, ValueError, TypeError):
+            raise ValueError("resume content sample is invalid") from None
+        blueprint = by_id[sample.sample_id]
+        if (
+            sample.policy_id != blueprint.policy_id
+            or sample.thinking_type != blueprint.thinking_type
+            or sample.tool_names != ()
+            or sample.tool_policy != "auto"
+            or sample.expected_label != blueprint.intended_label
+            or sample.expected_answers != blueprint.intended_answers
+        ):
+            raise ValueError("resume content sample does not match its blueprint")
+        parsed_samples[sample.sample_id] = sample
+        samples[sample.sample_id] = row
+
+    terminal_set = set(terminal_raw)
+    completed_set = set(completed_raw)
+    expected_terminal: set[str] = set()
+    metadata: dict[str, dict[str, object]] = {}
+    for item_id in ordered_ids:
+        history = histories.get(item_id, [])
+        attempt_count = attempts[item_id]
+        if item_id in completed_set:
+            if attempt_count != len(history) + 1:
+                raise ValueError("resume completed attempt history is inconsistent")
+        elif attempt_count != len(history):
+            raise ValueError("resume pending attempt history is inconsistent")
+        if item_id not in completed_set and attempt_count == max_attempts:
+            expected_terminal.add(item_id)
+        if item_id not in completed_set and item_id not in expected_terminal and attempt_count >= max_attempts:
+            raise ValueError("resume pending blueprint exhausted its attempts")
+    if terminal_set != expected_terminal:
+        raise ValueError("resume terminal rejected IDs are inconsistent")
+
+    for row in metadata_rows:
+        item_id = row["sample_id"]
+        expected = _metadata_row(by_id[item_id], attempt=attempts[item_id])
+        if not _same_json(row, expected):
+            raise ValueError("resume sample metadata does not match its blueprint")
+        metadata[item_id] = row
+
+    expected_review = _review_rows(blueprints, samples, metadata)
+    if _stable_jsonl_bytes(
+        artifact_rows["content_review_sample.jsonl"]
+    ) != _stable_jsonl_bytes(expected_review):
+        raise ValueError("resume content review sample is inconsistent")
+
+    index = CandidateIndex()
+    for item_id in ordered_ids:
+        if item_id not in parsed_samples:
+            continue
+        blueprint = by_id[item_id]
+        sample = parsed_samples[item_id]
+        content = GeneratedContent(
+            blueprint_id=item_id,
+            query=sample.query,
+            response=sample.response,
+        )
+        source_text = (
+            source_texts[(blueprint.source_ref.source, blueprint.source_ref.source_id)]
+            if blueprint.source_ref is not None
+            else None
+        )
+        result = gate_content(blueprint, content, source_text=source_text, index=index)
+        if not result.accepted:
+            raise ValueError("resume accepted content fails its local gate")
+        index.add(blueprint.family_id, content)
+
     expected_manifest = _manifest_payload(
         compatibility=compatibility,
         blueprints=blueprints,
         completed_ids=set(samples),
-        terminal_ids=set(terminal_raw),
+        terminal_ids=terminal_set,
         artifact_hashes=manifest_hashes,
         usage=usage,
     )
-    if manifest != expected_manifest:
+    if not _same_json(manifest, expected_manifest):
         raise ValueError("resume manifest is inconsistent")
-    return samples, metadata, rejected_rows, events, attempts, set(terminal_raw), usage
+    return samples, metadata, rejected_rows, events, attempts, terminal_set, usage, index
 
 
 def run_query_batch(
@@ -1648,11 +1955,15 @@ def run_query_batch(
             attempts,
             terminal_ids,
             usage,
+            index,
         ) = _resume_state(
             output_dir=output_dir,
             blueprints=blueprints,
             plan_rows=plan_rows,
             compatibility=compatibility,
+            source_texts=source_texts,
+            batch_size=batch_size,
+            max_attempts=max_attempts_per_blueprint,
         )
         events.append(
             {
@@ -1677,19 +1988,7 @@ def run_query_batch(
             "estimated_cost_usd": 0.0,
             "accounting_complete": True,
         }
-
-    index = CandidateIndex()
-    for blueprint in blueprints:
-        sample = samples.get(blueprint.blueprint_id)
-        if sample is not None:
-            index.add(
-                blueprint.family_id,
-                GeneratedContent(
-                    blueprint_id=blueprint.blueprint_id,
-                    query=str(sample["query"]),
-                    response=sample.get("response"),
-                ),
-            )
+        index = CandidateIndex()
 
     manifest = _persist_query_state(
         output_dir=output_dir,
@@ -1735,25 +2034,15 @@ def run_query_batch(
             stopped = True
         except TeacherRequestError as error:
             _usage_add(usage, error.usage)
-            for item_id in batch_ids:
-                attempts[item_id] = batch_attempts[item_id]
-                rejected_rows.append(
-                    {
-                        "blueprint_id": item_id,
-                        "attempt": attempts[item_id],
-                        "code": "provider_request",
-                    }
-                )
-                if attempts[item_id] >= max_attempts_per_blueprint:
-                    terminal_ids.add(item_id)
             events.append(
                 {
                     "sequence": len(events) + 1,
-                    "event": "provider_failure",
+                    "event": "provider_stop",
                     "code": "provider_request",
                     "batch_count": len(batch),
                 }
             )
+            stopped = True
         else:
             if not isinstance(reply, TeacherReply):
                 raise TypeError("teacher.generate must return TeacherReply")

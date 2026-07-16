@@ -1908,7 +1908,7 @@ def test_provider_request_failure_is_sanitized_and_usage_is_aggregated(
 ) -> None:
     from risk_agent.singguard_query_generation import run_query_batch
 
-    output = tmp_path / "provider-retry"
+    output = tmp_path / "provider-stop"
     teacher = _RequestFailOnceTeacher()
     manifest = run_query_batch(
         policies=_content_policies(),
@@ -1918,12 +1918,13 @@ def test_provider_request_failure_is_sanitized_and_usage_is_aggregated(
         seed=109,
         teacher=teacher,
     )
-    assert manifest["status"] == "complete"
-    assert teacher.attempted[1] == teacher.attempted[0]
+    assert manifest["status"] == "incomplete"
+    assert len(teacher.attempted) == 1
+    assert manifest["counts"] == {"accepted": 0, "rejected": 0, "pending": 100}
     assert manifest["teacher_usage"] == {
-        "request_count": 27,
-        "input_tokens": 257,
-        "output_tokens": 503,
+        "request_count": 2,
+        "input_tokens": 7,
+        "output_tokens": 3,
         "estimated_cost_usd": None,
         "accounting_complete": True,
     }
@@ -1935,10 +1936,16 @@ def test_provider_request_failure_is_sanitized_and_usage_is_aggregated(
     assert "secret upstream" not in persisted
     assert "secret-provider-name" not in persisted
     assert "secret-model-name" not in persisted
-    assert _jsonl(output / "rejected.jsonl")[:4] == [
-        {"attempt": 1, "blueprint_id": item_id, "code": "provider_request"}
-        for item_id in teacher.attempted[0]
-    ]
+    assert _jsonl(output / "rejected.jsonl") == []
+    assert json.loads((output / "checkpoint.json").read_text())["attempt_counts"] == {
+        row["blueprint_id"]: 0 for row in _jsonl(output / "plan.jsonl")
+    }
+    assert _jsonl(output / "events.jsonl")[-1] == {
+        "batch_count": 4,
+        "code": "provider_request",
+        "event": "provider_stop",
+        "sequence": 2,
+    }
 
 
 class _ExhaustOneTeacher(_RecordingContentTeacher):
@@ -2203,6 +2210,376 @@ def test_resume_rejects_noncanonical_manifest_bytes_before_provider(tmp_path: Pa
     run_query_batch(**kwargs, teacher=_BudgetStoppingTeacher(0))
     with (output / "manifest.json").open("a", encoding="utf-8") as handle:
         handle.write("\n")
+    teacher = _NoCallTeacher()
+    with pytest.raises(ValueError, match="manifest"):
+        run_query_batch(**kwargs, teacher=teacher, resume=True)
+    assert teacher.calls == 0
+
+
+def _canonical_test_json(payload: object) -> bytes:
+    return (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode()
+
+
+def _canonical_test_jsonl(rows: list[dict[str, object]]) -> bytes:
+    return b"".join(_canonical_test_json(row) for row in rows)
+
+
+def _coherently_rehash(output: Path, names: tuple[str, ...]) -> None:
+    checkpoint_path = output / "checkpoint.json"
+    manifest_path = output / "manifest.json"
+    checkpoint = json.loads(checkpoint_path.read_text())
+    for name in names:
+        payload = (output / name).read_bytes()
+        checkpoint["artifact_sha256"][name] = hashlib.sha256(payload).hexdigest()
+        checkpoint["artifact_counts"][name] = len(payload.splitlines())
+    checkpoint_path.write_bytes(_canonical_test_json(checkpoint))
+    manifest = json.loads(manifest_path.read_text())
+    for name in names:
+        manifest["artifact_sha256"][name] = checkpoint["artifact_sha256"][name]
+    manifest["artifact_sha256"]["checkpoint.json"] = hashlib.sha256(
+        checkpoint_path.read_bytes()
+    ).hexdigest()
+    manifest_path.write_bytes(_canonical_test_json(manifest))
+
+
+def _incomplete_release(tmp_path: Path, name: str, *, successful_calls: int = 1) -> tuple[Path, dict[str, object]]:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    output = tmp_path / name
+    kwargs: dict[str, object] = {
+        "policies": _content_policies(),
+        "seed_records": _orchestration_seeds(),
+        "output_dir": output,
+        "count": 100,
+        "seed": 151,
+    }
+    run_query_batch(**kwargs, teacher=_BudgetStoppingTeacher(successful_calls))
+    return output, kwargs
+
+
+def test_resume_semantically_gates_coherently_rehashed_content_before_provider(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    output, kwargs = _incomplete_release(tmp_path, "forged-content")
+    samples = _jsonl(output / "content_samples.jsonl")
+    samples[0]["query"] += " contact forged.person@host.example"
+    (output / "content_samples.jsonl").write_bytes(_canonical_test_jsonl(samples))
+    review = _jsonl(output / "content_review_sample.jsonl")
+    next(row for row in review if row["sample_id"] == samples[0]["sample_id"])[
+        "query"
+    ] = samples[0]["query"]
+    (output / "content_review_sample.jsonl").write_bytes(_canonical_test_jsonl(review))
+    _coherently_rehash(
+        output, ("content_samples.jsonl", "content_review_sample.jsonl")
+    )
+    teacher = _NoCallTeacher()
+    with pytest.raises(ValueError, match="sample|gate|accepted"):
+        run_query_batch(**kwargs, teacher=teacher, resume=True)
+    assert teacher.calls == 0
+
+
+def test_resume_rejects_coherently_rehashed_metadata_extra_before_provider(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    output, kwargs = _incomplete_release(tmp_path, "forged-metadata")
+    metadata = _jsonl(output / "sample_metadata.jsonl")
+    metadata[0]["provider_reasoning"] = "forged raw metadata"
+    (output / "sample_metadata.jsonl").write_bytes(_canonical_test_jsonl(metadata))
+    _coherently_rehash(output, ("sample_metadata.jsonl",))
+    teacher = _NoCallTeacher()
+    with pytest.raises(ValueError, match="metadata"):
+        run_query_batch(**kwargs, teacher=teacher, resume=True)
+    assert teacher.calls == 0
+
+
+def test_resume_recomputes_review_and_rejects_coherent_tamper_before_provider(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    output, kwargs = _incomplete_release(tmp_path, "forged-review")
+    review = _jsonl(output / "content_review_sample.jsonl")
+    review[0]["query"] += " forged review"
+    (output / "content_review_sample.jsonl").write_bytes(_canonical_test_jsonl(review))
+    _coherently_rehash(output, ("content_review_sample.jsonl",))
+    teacher = _NoCallTeacher()
+    with pytest.raises(ValueError, match="review"):
+        run_query_batch(**kwargs, teacher=teacher, resume=True)
+    assert teacher.calls == 0
+
+
+def test_resume_rejects_coherently_rehashed_event_extra_before_provider(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    output, kwargs = _incomplete_release(tmp_path, "forged-events")
+    events = _jsonl(output / "events.jsonl")
+    events[-1]["raw_error"] = "secret forged error"
+    (output / "events.jsonl").write_bytes(_canonical_test_jsonl(events))
+    _coherently_rehash(output, ("events.jsonl",))
+    teacher = _NoCallTeacher()
+    with pytest.raises(ValueError, match="event"):
+        run_query_batch(**kwargs, teacher=teacher, resume=True)
+    assert teacher.calls == 0
+
+
+def test_resume_rejects_coherently_rehashed_noncontiguous_attempt_history(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    output = tmp_path / "forged-attempts"
+    kwargs = {
+        "policies": _content_policies(),
+        "seed_records": _orchestration_seeds(),
+        "output_dir": output,
+        "count": 100,
+        "seed": 157,
+        "max_attempts_per_blueprint": 3,
+    }
+    run_query_batch(**kwargs, teacher=_ExhaustOneTeacher())
+    checkpoint = json.loads((output / "checkpoint.json").read_text())
+    target = checkpoint["terminal_rejected_ids"][0]
+    rejected = _jsonl(output / "rejected.jsonl")
+    next(row for row in rejected if row["blueprint_id"] == target and row["attempt"] == 1)[
+        "attempt"
+    ] = 2
+    (output / "rejected.jsonl").write_bytes(_canonical_test_jsonl(rejected))
+    _coherently_rehash(output, ("rejected.jsonl",))
+    teacher = _NoCallTeacher()
+    with pytest.raises(ValueError, match="attempt|rejected"):
+        run_query_batch(**kwargs, teacher=teacher, resume=True)
+    assert teacher.calls == 0
+
+
+def test_resume_rejects_coherently_rehashed_noncanonical_jsonl_bytes(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    output, kwargs = _incomplete_release(
+        tmp_path, "noncanonical-jsonl", successful_calls=0
+    )
+    plan_path = output / "plan.jsonl"
+    plan_path.write_bytes(plan_path.read_bytes().replace(b"\n", b" \n"))
+    _coherently_rehash(output, ("plan.jsonl",))
+    teacher = _NoCallTeacher()
+    with pytest.raises(ValueError, match="plan|canonical"):
+        run_query_batch(**kwargs, teacher=teacher, resume=True)
+    assert teacher.calls == 0
+
+
+def test_resume_rejects_checkpoint_extra_and_nonallowlisted_usage_before_provider(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    for case in ("checkpoint-extra", "usage-extra"):
+        output, kwargs = _incomplete_release(tmp_path, case, successful_calls=0)
+        checkpoint_path = output / "checkpoint.json"
+        manifest_path = output / "manifest.json"
+        checkpoint = json.loads(checkpoint_path.read_text())
+        manifest = json.loads(manifest_path.read_text())
+        if case == "checkpoint-extra":
+            checkpoint["raw_provider_state"] = "secret"
+        else:
+            checkpoint["teacher_usage"]["provider"] = "secret-provider"
+            manifest["teacher_usage"]["provider"] = "secret-provider"
+        checkpoint_path.write_bytes(_canonical_test_json(checkpoint))
+        manifest["artifact_sha256"]["checkpoint.json"] = hashlib.sha256(
+            checkpoint_path.read_bytes()
+        ).hexdigest()
+        manifest_path.write_bytes(_canonical_test_json(manifest))
+        teacher = _NoCallTeacher()
+        with pytest.raises(ValueError, match="checkpoint|usage"):
+            run_query_batch(**kwargs, teacher=teacher, resume=True)
+        assert teacher.calls == 0
+
+
+def test_review_rows_are_bounded_stratified_deterministic_and_source_free() -> None:
+    import risk_agent.singguard_query_generation as generation
+
+    blueprints = planning_plan_blueprints(
+        _content_policies(), count=500, seed=163, seed_records=_orchestration_seeds()
+    )
+    samples: dict[str, dict[str, object]] = {}
+    metadata: dict[str, dict[str, object]] = {}
+    minimums = {"headline": 1, "short": 5, "medium": 30, "long": 100}
+    for blueprint in blueprints:
+        unique = blueprint.blueprint_id.replace("-", "")
+        words = [
+            f"review{unique}word{index}"
+            for index in range(minimums[blueprint.length_bin])
+        ]
+        response = None
+        query = " ".join(words)
+        if blueprint.conversation_shape == "query_response":
+            split = max(1, len(words) // 2)
+            query = " ".join(words[:split])
+            response = " ".join(words[split:] or [f"reply{unique}"])
+        samples[blueprint.blueprint_id] = {
+            "sample_id": blueprint.blueprint_id,
+            "policy_id": blueprint.policy_id,
+            "thinking_type": blueprint.thinking_type,
+            "query": query,
+            "response": response,
+            "tool_names": [],
+            "tool_policy": "auto",
+            "expected_label": blueprint.intended_label,
+            "expected_answers": list(blueprint.intended_answers),
+        }
+        metadata[blueprint.blueprint_id] = generation._metadata_row(
+            blueprint, attempt=1
+        )
+    first = generation._review_rows(blueprints, samples, metadata)
+    second = generation._review_rows(blueprints, samples, metadata)
+    assert first == second
+    assert len(first) == 100
+    assert {row["difficulty"] for row in first} == {
+        blueprint.difficulty for blueprint in blueprints
+    }
+    assert all("source" not in row and "content_hash" not in row for row in first)
+    expected_keys = {
+        "sample_id",
+        "blueprint_id",
+        "family_id",
+        "policy_id",
+        "thinking_type",
+        "query",
+        "response",
+        "tool_names",
+        "tool_policy",
+        "expected_label",
+        "expected_answers",
+        "primary_rule_id",
+        "primary_answer",
+        "intended_label",
+        "intended_answers",
+        "content_form",
+        "difficulty",
+        "tone",
+        "length_bin",
+        "noise_profile",
+        "conversation_shape",
+        "tool_capable",
+        "source_mode",
+        "attempt",
+    }
+    assert all(set(row) == expected_keys for row in first)
+
+
+def test_quota_coverage_includes_every_controlled_dimension() -> None:
+    import risk_agent.singguard_query_generation as generation
+
+    blueprints = planning_plan_blueprints(
+        _content_policies(), count=100, seed=167, seed_records=_orchestration_seeds()
+    )
+    accepted_ids = {row.blueprint_id for row in blueprints[:7]}
+    coverage = generation._quota_coverage(blueprints, accepted_ids)
+    expected_dimensions = {
+        "label",
+        "primary_rule",
+        "primary_answer",
+        "content_form",
+        "source_mode",
+        "source_name",
+        "difficulty",
+        "tone",
+        "noise_profile",
+        "length_bin",
+        "thinking_type",
+        "conversation_shape",
+        "tool_capable",
+        "policy",
+    }
+    assert set(coverage["planned"]) == expected_dimensions
+    assert set(coverage["accepted"]) == expected_dimensions
+    assert sum(coverage["accepted"]["label"].values()) == 7
+
+
+def test_resume_rejects_bool_int_coercion_in_metadata_events_and_counts(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    output, kwargs = _incomplete_release(tmp_path, "bool-metadata")
+    metadata = _jsonl(output / "sample_metadata.jsonl")
+    metadata[0]["tool_capable"] = 0
+    (output / "sample_metadata.jsonl").write_bytes(_canonical_test_jsonl(metadata))
+    review = _jsonl(output / "content_review_sample.jsonl")
+    next(row for row in review if row["sample_id"] == metadata[0]["sample_id"])[
+        "tool_capable"
+    ] = 0
+    (output / "content_review_sample.jsonl").write_bytes(_canonical_test_jsonl(review))
+    _coherently_rehash(
+        output, ("sample_metadata.jsonl", "content_review_sample.jsonl")
+    )
+    teacher = _NoCallTeacher()
+    with pytest.raises(ValueError, match="metadata"):
+        run_query_batch(**kwargs, teacher=teacher, resume=True)
+    assert teacher.calls == 0
+
+    output, kwargs = _incomplete_release(tmp_path, "bool-event")
+    events = _jsonl(output / "events.jsonl")
+    events[0]["sequence"] = True
+    (output / "events.jsonl").write_bytes(_canonical_test_jsonl(events))
+    _coherently_rehash(output, ("events.jsonl",))
+    teacher = _NoCallTeacher()
+    with pytest.raises(ValueError, match="event"):
+        run_query_batch(**kwargs, teacher=teacher, resume=True)
+    assert teacher.calls == 0
+
+    output, kwargs = _incomplete_release(
+        tmp_path, "bool-artifact-count", successful_calls=0
+    )
+    checkpoint_path = output / "checkpoint.json"
+    manifest_path = output / "manifest.json"
+    checkpoint = json.loads(checkpoint_path.read_text())
+    checkpoint["artifact_counts"]["rejected.jsonl"] = False
+    checkpoint_path.write_bytes(_canonical_test_json(checkpoint))
+    manifest = json.loads(manifest_path.read_text())
+    manifest["artifact_sha256"]["checkpoint.json"] = hashlib.sha256(
+        checkpoint_path.read_bytes()
+    ).hexdigest()
+    manifest_path.write_bytes(_canonical_test_json(manifest))
+    teacher = _NoCallTeacher()
+    with pytest.raises(ValueError, match="artifact"):
+        run_query_batch(**kwargs, teacher=teacher, resume=True)
+    assert teacher.calls == 0
+
+
+def test_resume_rejects_bool_int_coercion_in_manifest_counts(tmp_path: Path) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    output = tmp_path / "bool-manifest"
+    kwargs = {
+        "policies": _content_policies(),
+        "seed_records": _orchestration_seeds(),
+        "output_dir": output,
+        "count": 100,
+        "seed": 173,
+        "batch_size": 1,
+    }
+    run_query_batch(**kwargs, teacher=_BudgetStoppingTeacher(1))
+    manifest_path = output / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["counts"]["accepted"] == 1
+    manifest["counts"]["accepted"] = True
+    manifest_path.write_bytes(_canonical_test_json(manifest))
     teacher = _NoCallTeacher()
     with pytest.raises(ValueError, match="manifest"):
         run_query_batch(**kwargs, teacher=teacher, resume=True)
