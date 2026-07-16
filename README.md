@@ -39,6 +39,29 @@ needs the repository in editable mode:
 pip install -e '.[dev]'
 ```
 
+## Generate the text corpus
+
+Generate and independently review a 100-row content pilot before producing
+SingGuard traces:
+
+```bash
+export GEMINI_GENERATOR_MODEL='your-gemini-model'
+
+rm -rf outputs/query-pilot-v2
+python scripts/generate_singguard_queries.py \
+  data/active_policies.jsonl \
+  outputs/query-pilot-v2 \
+  --seeds outputs/singguard-seeds/seeds.jsonl \
+  --count 100 \
+  --seed 42
+```
+
+Unsafe blueprints target one primary rule while the full active policy remains
+visible. The generator receives explicit combined word-count ranges. A separate
+Gemini request then classifies each candidate without seeing the planned label
+or answers; disagreements are retried and recorded as `semantic_mismatch`.
+Only use `content_samples.jsonl` when `manifest.json` reports `status=complete`.
+
 ## Generate the smoke batch
 
 Use either `GEMINI_API_KEY`, or Vertex AI environment variables. A blank Vertex

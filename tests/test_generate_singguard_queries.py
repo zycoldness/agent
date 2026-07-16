@@ -79,3 +79,44 @@ def test_cli_help_lists_minimal_query_options(capsys) -> None:
     assert "--count {100,500,2000}" in help_text
     assert "--dry-run" in help_text
     assert "--seeds" in help_text
+
+
+def test_cli_wires_separate_generator_and_blind_semantic_verifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    import scripts.generate_singguard_queries as cli
+
+    created: list[tuple[object, dict[str, object]]] = []
+
+    class FixtureTeacher:
+        def generate(self, _request):  # pragma: no cover - wiring only
+            raise AssertionError("provider must not be called by wiring test")
+
+    def teacher_factory(**kwargs):
+        teacher = FixtureTeacher()
+        created.append((teacher, kwargs))
+        return teacher
+
+    captured: dict[str, object] = {}
+
+    def fake_run_query_batch(**kwargs):
+        captured.update(kwargs)
+        return {"status": "complete"}
+
+    monkeypatch.setattr(cli, "GeminiTeacher", teacher_factory)
+    monkeypatch.setattr(cli, "run_query_batch", fake_run_query_batch)
+    output = tmp_path / "query"
+
+    assert cli.main([
+        "data/active_policies.jsonl",
+        str(output),
+        "--count", "100",
+        "--model", "fixture-model",
+    ]) == 0
+
+    assert len(created) == 2
+    assert created[0][1]["response_schema"] == cli.CONTENT_BATCH_SCHEMA
+    assert created[1][1]["response_schema"] == cli.SEMANTIC_REVIEW_SCHEMA
+    assert captured["teacher"] is created[0][0]
+    assert captured["verifier"] is created[1][0]
+    capsys.readouterr()

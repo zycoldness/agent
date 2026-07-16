@@ -745,27 +745,6 @@ def plan_blueprints(
         owner_offset = primary_owner_offsets[rule_id]
         unsafe_policies.append(owners[owner_offset % len(owners)])
         primary_owner_offsets[rule_id] = owner_offset + 1
-    multi_risk_target = unsafe_count // 5
-    eligible_multi_offsets = {rule_id: [] for rule_id in rule_ids}
-    for offset, (rule_id, policy) in enumerate(
-        zip(primary_rules, unsafe_policies, strict=True)
-    ):
-        if len(policy.rules) >= 2:
-            eligible_multi_offsets[rule_id].append(offset)
-    for offsets in eligible_multi_offsets.values():
-        rng.shuffle(offsets)
-    multi_risk_offsets: set[int] = set()
-    while len(multi_risk_offsets) < multi_risk_target:
-        progress = False
-        for rule_id in rule_ids:
-            if eligible_multi_offsets[rule_id]:
-                multi_risk_offsets.add(eligible_multi_offsets[rule_id].pop())
-                progress = True
-                if len(multi_risk_offsets) == multi_risk_target:
-                    break
-        if not progress:
-            break
-
     documented_exceptions: list[tuple[str, str]] = []
     seen_exceptions: set[tuple[str, str]] = set()
     for policy in policies:
@@ -807,7 +786,6 @@ def plan_blueprints(
     )
 
     exception_owner_offsets = {pair: 0 for pair in documented_exceptions}
-    secondary_offsets: dict[tuple[str, str], int] = {}
     rows: list[QueryBlueprint] = []
     unsafe_offset = 0
     safe_offset = 0
@@ -816,30 +794,12 @@ def plan_blueprints(
     for index, label in enumerate(labels):
         if label == "unsafe":
             primary_rule_id = primary_rules[unsafe_offset]
-            multi_risk = unsafe_offset in multi_risk_offsets
             policy = unsafe_policies[unsafe_offset]
             unsafe_offset += 1
             primary_answer = next(
                 rule.title for rule in policy.rules if rule.rule_id == primary_rule_id
             )
-            if multi_risk:
-                secondary_rules = tuple(
-                    rule for rule in policy.rules if rule.rule_id != primary_rule_id
-                )
-                secondary_key = (policy.policy_id, primary_rule_id)
-                secondary_offset = secondary_offsets.get(secondary_key, 0)
-                secondary_rule_id = secondary_rules[
-                    secondary_offset % len(secondary_rules)
-                ].rule_id
-                secondary_offsets[secondary_key] = secondary_offset + 1
-                intended_rule_ids = {primary_rule_id, secondary_rule_id}
-                intended_answers = tuple(
-                    rule.title
-                    for rule in policy.rules
-                    if rule.rule_id in intended_rule_ids
-                )
-            else:
-                intended_answers = (primary_answer,)
+            intended_answers = (primary_answer,)
             target_exception_rule_id = None
             target_exception = None
         else:

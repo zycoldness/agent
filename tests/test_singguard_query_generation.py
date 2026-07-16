@@ -145,6 +145,12 @@ def test_content_request_contains_policy_controls_targets_and_redacted_untrusted
             {"blueprint_id": "string", "query": "string", "response": "string|null"}
         ]
     }
+    assert request["length_bounds_words"] == {
+        "headline": [1, 20],
+        "short": [5, 60],
+        "medium": [30, 160],
+        "long": [100, 400],
+    }
     assert request["active_policies"] == [
         {
             "policy_id": "commerce-v1",
@@ -225,6 +231,58 @@ def test_content_request_does_not_leak_source_metadata_or_unused_seed_text() -> 
         "TOP SECRET UNUSED SEED",
     ):
         assert forbidden not in encoded
+
+
+def test_semantic_review_request_is_blind_to_planned_target() -> None:
+    from risk_agent.singguard_query_generation import (
+        GeneratedContent,
+        build_semantic_review_request,
+    )
+
+    blueprint = _unsafe_blueprint()
+    content = GeneratedContent(
+        blueprint_id=blueprint.blueprint_id,
+        query="Could this qualified product description be acceptable?",
+    )
+    request = build_semantic_review_request(
+        ((blueprint, content),), policies=_content_policies()
+    )
+
+    encoded = json.dumps(request, sort_keys=True)
+    assert request["contract_version"] == "singguard-query-semantic-reviewer-v1"
+    assert request["items"] == [
+        {
+            "blueprint_id": blueprint.blueprint_id,
+            "policy_id": blueprint.policy_id,
+            "query": content.query,
+            "response": None,
+        }
+    ]
+    assert "intended_target" not in encoded
+    assert "intended_label" not in encoded
+    assert "intended_answers" not in encoded
+    assert "primary_answer" not in encoded
+    assert "independently classify" in request["prompt"].lower()
+
+
+def test_parse_semantic_review_batch_preserves_policy_ordered_answers() -> None:
+    from risk_agent.singguard_query_generation import parse_semantic_review_batch
+
+    rows = parse_semantic_review_batch(
+        {
+            "items": [
+                {
+                    "blueprint_id": "bp-1",
+                    "label": "unsafe",
+                    "answers": ["Deceptive Efficacy", "Risky Solicitation"],
+                }
+            ]
+        },
+        expected_ids=("bp-1",),
+    )
+
+    assert rows[0].label == "unsafe"
+    assert rows[0].answers == ("Deceptive Efficacy", "Risky Solicitation")
 
 
 def test_content_request_redacts_personal_and_external_identifiers_from_seed() -> None:
@@ -656,6 +714,7 @@ def test_versioned_prompt_contains_content_only_security_contract_and_stable_has
         "untrusted quoted data",
         "exactly once",
         "no extra fields",
+        "combined query and response word count",
     ):
         assert requirement in prompt
 
@@ -1588,6 +1647,36 @@ class _RecordingContentTeacher:
         )
 
 
+class _AlwaysSafeSemanticVerifier:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+
+    def generate(self, request: object) -> TeacherReply:
+        assert isinstance(request, dict)
+        encoded = json.dumps(request, sort_keys=True)
+        assert "intended_label" not in encoded
+        assert "intended_answers" not in encoded
+        items = request["items"]
+        assert isinstance(items, list)
+        ids = tuple(item["blueprint_id"] for item in items)
+        self.calls.append(ids)
+        return TeacherReply(
+            payload={
+                "items": [
+                    {"blueprint_id": item_id, "label": "safe", "answers": []}
+                    for item_id in ids
+                ]
+            },
+            usage=TeacherUsage(
+                provider="fixture",
+                model="semantic-v1",
+                input_tokens=5,
+                output_tokens=5,
+                accounting_complete=True,
+            ),
+        )
+
+
 def _jsonl(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
@@ -1638,6 +1727,31 @@ def test_run_query_batch_fresh_100_writes_complete_hashed_artifacts(tmp_path: Pa
     for name, digest in manifest["artifact_sha256"].items():
         assert hashlib.sha256((output / name).read_bytes()).hexdigest() == digest
     assert json.loads((output / "manifest.json").read_text(encoding="utf-8")) == manifest
+
+
+def test_run_query_batch_rejects_candidates_when_blind_semantic_review_disagrees(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    verifier = _AlwaysSafeSemanticVerifier()
+    output = tmp_path / "semantic-review"
+    manifest = run_query_batch(
+        policies=_content_policies(),
+        seed_records=_orchestration_seeds(),
+        output_dir=output,
+        count=100,
+        seed=71,
+        teacher=_RecordingContentTeacher(),
+        verifier=verifier,
+        max_attempts_per_blueprint=1,
+    )
+
+    assert manifest["counts"] == {"accepted": 50, "rejected": 50, "pending": 0}
+    assert len(verifier.calls) == 25
+    rejected = _jsonl(output / "rejected.jsonl")
+    assert len(rejected) == 50
+    assert {row["code"] for row in rejected} == {"semantic_mismatch"}
 
 
 class _BudgetStoppingTeacher(_RecordingContentTeacher):

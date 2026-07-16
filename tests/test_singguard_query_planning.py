@@ -598,89 +598,13 @@ def test_plan_rejects_too_few_safe_exception_slots_for_documented_pairs() -> Non
         plan_blueprints((policy,), count=100, seed=1, seed_records=())
 
 
-@pytest.mark.parametrize(("count", "expected"), ((100, 10), (500, 50), (2_000, 200)))
-def test_multi_risk_rows_use_exactly_two_policy_ordered_titles(
-    count: int, expected: int
-) -> None:
+@pytest.mark.parametrize("count", (100, 500, 2_000))
+def test_unsafe_rows_target_only_the_primary_rule(count: int) -> None:
     rows = _plan(count=count, seed_count=0)
-    multi = [row for row in rows if len(row.intended_answers) == 2]
+    unsafe = [row for row in rows if row.intended_label == "unsafe"]
 
-    assert len(multi) == expected
-    for row in multi:
-        assert len(set(row.intended_answers)) == 2
-        assert row.primary_answer in row.intended_answers
-        assert row.intended_answers == tuple(
-            title for title in row.active_rule_titles if title in row.intended_answers
-        )
-
-
-def test_multi_risk_quota_degrades_when_no_policy_has_two_rules() -> None:
-    from risk_agent.singguard_query_planning import plan_blueprints
-
-    policies = tuple(
-        ActivePolicy(
-            policy_id=f"single-{index}",
-            rules=(
-                PolicyRule(
-                    rule_id=f"R{index}", title=f"Rule {index}", text="Rule text."
-                ),
-            ),
-        )
-        for index in range(2)
-    )
-
-    rows = plan_blueprints(policies, count=100, seed=1, seed_records=())
-
-    assert all(len(row.intended_answers) <= 1 for row in rows)
-
-
-def test_multi_risk_balances_primaries_and_cycles_policy_local_secondaries() -> None:
-    from risk_agent.singguard_query_planning import plan_blueprints
-
-    policy = ActivePolicy(
-        policy_id="four-rules",
-        rules=tuple(
-            PolicyRule(
-                rule_id=f"R{index}", title=f"Rule {index}", text=f"Rule {index} text."
-            )
-            for index in range(4)
-        ),
-    )
-
-    rows = plan_blueprints((policy,), count=100, seed=17, seed_records=())
-    repeated = plan_blueprints((policy,), count=100, seed=17, seed_records=())
-    multi = [row for row in rows if len(row.intended_answers) == 2]
-    primary_counts = Counter(row.primary_rule_id for row in multi)
-    directed_pairs = {
-        (
-            row.primary_rule_id,
-            next(title for title in row.intended_answers if title != row.primary_answer),
-        )
-        for row in multi
-    }
-
-    assert len(multi) == 10
-    assert max(primary_counts.values()) - min(primary_counts.values()) <= 1
-    assert len(directed_pairs) == 10
-    for primary_rule_id, amount in primary_counts.items():
-        if amount == 3:
-            primary_title = policy.rules[int(primary_rule_id[1:])].title
-            secondaries = {
-                secondary
-                for primary, secondary in directed_pairs
-                if primary == primary_rule_id
-            }
-            assert secondaries == {
-                rule.title for rule in policy.rules if rule.title != primary_title
-            }
-    assert rows == repeated
-    assert all(
-        row.intended_answers
-        == tuple(
-            title for title in row.active_rule_titles if title in row.intended_answers
-        )
-        for row in multi
-    )
+    assert unsafe
+    assert all(row.intended_answers == (row.primary_answer,) for row in unsafe)
 
 
 def test_at_least_quota_seeds_assigns_exactly_600_unique_references() -> None:

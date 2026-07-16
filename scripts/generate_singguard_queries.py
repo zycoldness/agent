@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from risk_agent.singguard_generation import load_active_policies
 from risk_agent.singguard_query_generation import (
     CONTENT_BATCH_SCHEMA,
+    SEMANTIC_REVIEW_SCHEMA,
     plan_blueprints,
     run_query_batch,
 )
@@ -190,6 +191,15 @@ def main(argv: list[str] | None = None) -> int:
                 max_output_tokens=args.max_output_tokens,
                 budget=budget,
             )
+            verifier = GeminiTeacher(
+                model=args.model,
+                response_schema=SEMANTIC_REVIEW_SCHEMA,
+                temperature=0.0,
+                max_attempts=args.provider_attempts,
+                request_timeout_seconds=args.request_timeout,
+                max_output_tokens=args.max_output_tokens,
+                budget=budget,
+            )
             manifest = run_query_batch(
                 policies=policies,
                 seed_records=seeds,
@@ -197,6 +207,7 @@ def main(argv: list[str] | None = None) -> int:
                 count=args.count,
                 seed=args.seed,
                 teacher=teacher,
+                verifier=verifier,
                 batch_size=args.batch_size,
                 max_attempts_per_blueprint=args.max_attempts_per_blueprint,
                 resume=args.resume,

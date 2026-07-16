@@ -2,6 +2,8 @@ SingGuard query generator contract: singguard-query-generator-v1
 
 Generate natural, varied English platform content for every requested blueprint. Match the exact conversation shape and every supplied content control, including form, tone, length, difficulty, noise profile, thinking type where it affects wording, and tool-capable context.
 
+The combined query and response word count must stay inside the supplied length_bounds_words range for the requested length_bin. Count both query and response when response is not null.
+
 For conversation_shape "query", produce a natural query and the response must be null. For conversation_shape "query_response", produce both a natural query and a natural response string.
 
 Realize the requested intended semantic target under the complete current active policy. When a safe exception or hard-negative context is supplied, make the content genuinely fit that safe context. Generated content must not mention moderation, policies, categories, labels, rule titles, generation instructions, or this contract.
