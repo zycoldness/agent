@@ -2584,3 +2584,94 @@ def test_resume_rejects_bool_int_coercion_in_manifest_counts(tmp_path: Path) -> 
     with pytest.raises(ValueError, match="manifest"):
         run_query_batch(**kwargs, teacher=teacher, resume=True)
     assert teacher.calls == 0
+
+
+def test_resume_rejects_unreachable_coherently_rehashed_event_histories(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    for case in (
+        "missing-initialize",
+        "later-initialize",
+        "wrong-resume-count",
+        "wrong-batch-totals",
+    ):
+        output, kwargs = _incomplete_release(tmp_path, case)
+        if case == "wrong-resume-count":
+            run_query_batch(
+                **kwargs, teacher=_BudgetStoppingTeacher(0), resume=True
+            )
+        events = _jsonl(output / "events.jsonl")
+        if case == "missing-initialize":
+            events[0] = {
+                "sequence": 1,
+                "event": "resume",
+                "code": "validated",
+                "completed_count": 0,
+            }
+        elif case == "later-initialize":
+            events[-1] = {
+                "sequence": events[-1]["sequence"],
+                "event": "initialize",
+                "code": "fresh",
+            }
+        elif case == "wrong-resume-count":
+            resume_event = next(row for row in events if row["event"] == "resume")
+            resume_event["completed_count"] = 0
+        else:
+            complete_event = next(
+                row for row in events if row["event"] == "batch_complete"
+            )
+            complete_event["accepted_count"] -= 1
+        (output / "events.jsonl").write_bytes(_canonical_test_jsonl(events))
+        _coherently_rehash(output, ("events.jsonl",))
+        teacher = _NoCallTeacher()
+        with pytest.raises(ValueError, match="event"):
+            run_query_batch(**kwargs, teacher=teacher, resume=True)
+        assert teacher.calls == 0
+
+
+def test_resume_rejects_provider_stop_followed_by_batch_without_resume(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    output, kwargs = _incomplete_release(tmp_path, "stop-without-resume")
+    run_query_batch(**kwargs, teacher=_RecordingContentTeacher(), resume=True)
+    events = _jsonl(output / "events.jsonl")
+    events = [row for row in events if row["event"] != "resume"]
+    for sequence, row in enumerate(events, start=1):
+        row["sequence"] = sequence
+    assert any(
+        left["event"] == "provider_stop" and right["event"].startswith("batch_")
+        for left, right in zip(events, events[1:])
+    )
+    (output / "events.jsonl").write_bytes(_canonical_test_jsonl(events))
+    _coherently_rehash(output, ("events.jsonl",))
+    teacher = _NoCallTeacher()
+    with pytest.raises(ValueError, match="event"):
+        run_query_batch(**kwargs, teacher=teacher, resume=True)
+    assert teacher.calls == 0
+
+
+def test_repeated_no_call_resumes_are_reachable_event_history(tmp_path: Path) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    output = tmp_path / "repeated-complete-resume"
+    kwargs = {
+        "policies": _content_policies(),
+        "seed_records": _orchestration_seeds(),
+        "output_dir": output,
+        "count": 100,
+        "seed": 179,
+    }
+    run_query_batch(**kwargs, teacher=_RecordingContentTeacher())
+    for _ in range(2):
+        teacher = _NoCallTeacher()
+        manifest = run_query_batch(**kwargs, teacher=teacher, resume=True)
+        assert manifest["status"] == "complete"
+        assert teacher.calls == 0
+    events = _jsonl(output / "events.jsonl")
+    assert [row["event"] for row in events[-2:]] == ["resume", "resume"]
+    assert all(row["completed_count"] == 100 for row in events[-2:])

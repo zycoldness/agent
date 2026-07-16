@@ -1612,7 +1612,7 @@ def _validated_usage(value: object) -> dict[str, object]:
 
 def _validate_events(
     rows: list[dict[str, object]], *, count: int, batch_size: int
-) -> None:
+) -> tuple[int, int, int]:
     if not rows:
         raise ValueError("resume events artifact is empty")
     schemas: dict[str, tuple[frozenset[str], frozenset[str]]] = {
@@ -1639,6 +1639,10 @@ def _validate_events(
             frozenset({"gated"}),
         ),
     }
+    cumulative_accepted = 0
+    attempted = 0
+    rejected = 0
+    provider_stopped = False
     for sequence, row in enumerate(rows, start=1):
         event = row.get("event")
         if type(event) is not str or event not in schemas:
@@ -1651,8 +1655,12 @@ def _validate_events(
             or row.get("code") not in codes
         ):
             raise ValueError("resume event schema is invalid")
+        if sequence == 1 and event != "initialize":
+            raise ValueError("resume event history must begin with initialize")
         if event == "initialize" and sequence != 1:
             raise ValueError("resume initialize event is out of order")
+        if provider_stopped and event != "resume":
+            raise ValueError("resume event must follow provider stop")
         if "batch_count" in row:
             value = row["batch_count"]
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= batch_size:
@@ -1661,6 +1669,9 @@ def _validate_events(
             value = row["completed_count"]
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= count:
                 raise ValueError("resume event completed count is invalid")
+            if value != cumulative_accepted:
+                raise ValueError("resume event completed count is unreachable")
+            provider_stopped = False
         if event == "batch_complete":
             accepted = row["accepted_count"]
             if (
@@ -1669,6 +1680,15 @@ def _validate_events(
                 or not 0 <= accepted <= row["batch_count"]
             ):
                 raise ValueError("resume event accepted count is invalid")
+            cumulative_accepted += accepted
+            attempted += row["batch_count"]
+            rejected += row["batch_count"] - accepted
+        elif event == "batch_rejected":
+            attempted += row["batch_count"]
+            rejected += row["batch_count"]
+        elif event == "provider_stop":
+            provider_stopped = True
+    return cumulative_accepted, attempted, rejected
 
 
 def _validate_rejections(
@@ -1794,7 +1814,15 @@ def _resume_state(
             raise ValueError("resume attempt counts are invalid")
         attempts[item_id] = value
     events = artifact_rows["events.jsonl"]
-    _validate_events(events, count=len(blueprints), batch_size=batch_size)
+    event_accepted, event_attempted, event_rejected = _validate_events(
+        events, count=len(blueprints), batch_size=batch_size
+    )
+    if (
+        event_accepted != len(sample_rows)
+        or event_attempted != sum(attempts.values())
+        or event_rejected != len(rejected_rows)
+    ):
+        raise ValueError("resume event totals do not match persisted state")
     histories = _validate_rejections(
         rejected_rows, known_ids=known_ids, max_attempts=max_attempts
     )
