@@ -16,6 +16,9 @@ from risk_agent.singguard_query_planning import (
     SourceRef as PlanningSourceRef,
     plan_blueprints as planning_plan_blueprints,
 )
+from risk_agent.singguard_sources import SeedRecord
+from risk_agent.teacher import TeacherReply, TeacherUsage
+from risk_agent.teacher import TeacherBudgetExceeded, TeacherRequestError
 
 
 def _blueprint(**overrides: object) -> PlanningQueryBlueprint:
@@ -1514,3 +1517,693 @@ def test_gate_results_are_deterministic_across_repeated_calls() -> None:
     query = "Please review this ordinary product request today"
     results = [_gate(query, source_text="Unrelated governed guidance text here", index=index) for _ in range(5)]
     assert all(result == results[0] for result in results)
+
+
+def _orchestration_seed(number: int, source: str = "nemotron_aegis_v2") -> SeedRecord:
+    text = f"Governed {source} style example {number}"
+    return SeedRecord(
+        source=source,
+        source_id=f"{source}-{number}",
+        provenance_url="https://example.test/source",
+        license="CC-BY-4.0",
+        usage_scope="research_only",
+        source_role="style_seed",
+        text=text,
+        content_hash=hashlib.sha256(text.encode()).hexdigest(),
+        retrieved_at="2026-07-15T00:00:00Z",
+    )
+
+
+def _orchestration_seeds() -> tuple[SeedRecord, ...]:
+    sources = (
+        ("uci_sms_spam", 34),
+        ("uci_youtube_spam", 17),
+        ("nemotron_aegis_v2", 20),
+        ("civil_comments", 17),
+        ("amazon_esci", 14),
+    )
+    return tuple(
+        _orchestration_seed(number, source)
+        for source, amount in sources
+        for number in range(amount)
+    )
+
+
+class _RecordingContentTeacher:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+
+    def generate(self, request: object) -> TeacherReply:
+        assert isinstance(request, dict)
+        items = request["items"]
+        assert isinstance(items, list)
+        ids = tuple(item["blueprint_id"] for item in items)
+        self.calls.append(ids)
+        generated = []
+        minimums = {"headline": 1, "short": 5, "medium": 30, "long": 100}
+        for item in items:
+            controls = item["controls"]
+            word_count = minimums[controls["length_bin"]]
+            unique = item["blueprint_id"].replace("-", "")
+            words = [f"calm{unique}word{index}" for index in range(word_count)]
+            response = None
+            if controls["conversation_shape"] == "query_response":
+                split = max(1, word_count // 2)
+                query = " ".join(words[:split])
+                response = " ".join(words[split:] or [f"reply{unique}"])
+            else:
+                query = " ".join(words)
+            generated.append(
+                {"blueprint_id": item["blueprint_id"], "query": query, "response": response}
+            )
+        return TeacherReply(
+            payload={"items": generated},
+            usage=TeacherUsage(
+                provider="fixture",
+                model="content-v1",
+                input_tokens=10,
+                output_tokens=20,
+                accounting_complete=True,
+            ),
+        )
+
+
+def _jsonl(path: Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_run_query_batch_fresh_100_writes_complete_hashed_artifacts(tmp_path: Path) -> None:
+    from risk_agent.singguard import ModerationSample
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    teacher = _RecordingContentTeacher()
+    output = tmp_path / "query-release"
+    manifest = run_query_batch(
+        policies=_content_policies(),
+        seed_records=_orchestration_seeds(),
+        output_dir=output,
+        count=100,
+        seed=71,
+        teacher=teacher,
+    )
+
+    assert manifest["contract_version"] == "singguard-query-v1"
+    assert manifest["status"] == "complete"
+    assert manifest["counts"] == {"accepted": 100, "rejected": 0, "pending": 0}
+    assert len(teacher.calls) == 25
+    assert all(1 <= len(batch) <= 4 for batch in teacher.calls)
+    assert len({item_id for batch in teacher.calls for item_id in batch}) == 100
+
+    plans = _jsonl(output / "plan.jsonl")
+    samples = _jsonl(output / "content_samples.jsonl")
+    metadata = _jsonl(output / "sample_metadata.jsonl")
+    review = _jsonl(output / "content_review_sample.jsonl")
+    assert len(plans) == len(samples) == len(metadata) == len(review) == 100
+    assert _jsonl(output / "rejected.jsonl") == []
+    by_id = {row["blueprint_id"]: row for row in plans}
+    for row in samples:
+        sample = ModerationSample.model_validate_json(json.dumps(row), strict=True)
+        plan = by_id[sample.sample_id]
+        assert sample.policy_id == plan["policy_id"]
+        assert sample.thinking_type == plan["thinking_type"]
+        assert sample.tool_names == ()
+        assert sample.tool_policy == "auto"
+        assert sample.expected_label == plan["intended_label"]
+        assert sample.expected_answers == tuple(plan["intended_answers"])
+        assert (sample.response is None) == (plan["conversation_shape"] == "query")
+
+    assert {row["sample_id"] for row in metadata} == {row["sample_id"] for row in samples}
+    assert all("text" not in row and "license" not in row for row in metadata)
+    assert manifest["quota_coverage"]["accepted"] == manifest["quota_coverage"]["planned"]
+    for name, digest in manifest["artifact_sha256"].items():
+        assert hashlib.sha256((output / name).read_bytes()).hexdigest() == digest
+    assert json.loads((output / "manifest.json").read_text(encoding="utf-8")) == manifest
+
+
+class _BudgetStoppingTeacher(_RecordingContentTeacher):
+    def __init__(self, successful_calls: int) -> None:
+        super().__init__()
+        self.successful_calls = successful_calls
+
+    def generate(self, request: object) -> TeacherReply:
+        if len(self.calls) == self.successful_calls:
+            raise TeacherBudgetExceeded("secret budget detail")
+        return super().generate(request)
+
+
+def test_run_query_batch_budget_stop_resumes_without_completed_ids(tmp_path: Path) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    output = tmp_path / "resumable"
+    first = _BudgetStoppingTeacher(successful_calls=2)
+    incomplete = run_query_batch(
+        policies=_content_policies(),
+        seed_records=_orchestration_seeds(),
+        output_dir=output,
+        count=100,
+        seed=89,
+        teacher=first,
+    )
+    completed = {row["sample_id"] for row in _jsonl(output / "content_samples.jsonl")}
+    assert incomplete["status"] == "incomplete"
+    assert incomplete["counts"] == {"accepted": 8, "rejected": 0, "pending": 92}
+    assert len(completed) == 8
+
+    resumed_teacher = _RecordingContentTeacher()
+    complete = run_query_batch(
+        policies=_content_policies(),
+        seed_records=_orchestration_seeds(),
+        output_dir=output,
+        count=100,
+        seed=89,
+        teacher=resumed_teacher,
+        resume=True,
+    )
+    resumed_ids = {item_id for call in resumed_teacher.calls for item_id in call}
+    assert complete["status"] == "complete"
+    assert resumed_ids.isdisjoint(completed)
+    assert len(resumed_ids) == 92
+
+
+class _OneGateFailureTeacher(_RecordingContentTeacher):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed_id: str | None = None
+
+    def generate(self, request: object) -> TeacherReply:
+        reply = super().generate(request)
+        if self.failed_id is None:
+            self.failed_id = reply.payload["items"][0]["blueprint_id"]
+            controls = request["items"][0]["controls"]
+            reply.payload["items"][0]["response"] = (
+                "wrong shape secret candidate"
+                if controls["conversation_shape"] == "query"
+                else None
+            )
+        return reply
+
+
+def test_gate_retry_only_regenerates_failed_blueprint_and_sanitizes_reject(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    teacher = _OneGateFailureTeacher()
+    output = tmp_path / "gate-retry"
+    result = run_query_batch(
+        policies=_content_policies(),
+        seed_records=_orchestration_seeds(),
+        output_dir=output,
+        count=100,
+        seed=97,
+        teacher=teacher,
+        batch_size=2,
+    )
+
+    assert result["status"] == "complete"
+    assert teacher.failed_id is not None
+    assert teacher.calls[1][0] == teacher.failed_id
+    accepted_sibling = teacher.calls[0][1]
+    assert all(accepted_sibling not in call for call in teacher.calls[1:])
+    rejected = _jsonl(output / "rejected.jsonl")
+    assert rejected == [
+        {"attempt": 1, "blueprint_id": teacher.failed_id, "code": "schema_or_shape"}
+    ]
+    persisted = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in output.iterdir()
+        if path.is_file()
+    )
+    assert "wrong shape secret candidate" not in persisted
+
+
+class _MalformedOnceTeacher(_RecordingContentTeacher):
+    def generate(self, request: object) -> TeacherReply:
+        reply = super().generate(request)
+        if len(self.calls) == 1:
+            payload = {
+                "items": [
+                    *reply.payload["items"],
+                    {
+                        "blueprint_id": "extra-secret-id",
+                        "query": "raw secret rejected body",
+                        "response": None,
+                    },
+                ],
+                "private_reasoning": "raw provider chain of thought",
+            }
+            return TeacherReply(payload=payload, usage=reply.usage)
+        return reply
+
+
+def test_malformed_whole_batch_retries_all_with_stable_sanitized_code(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    teacher = _MalformedOnceTeacher()
+    output = tmp_path / "malformed"
+    result = run_query_batch(
+        policies=_content_policies(),
+        seed_records=_orchestration_seeds(),
+        output_dir=output,
+        count=100,
+        seed=101,
+        teacher=teacher,
+    )
+    assert result["status"] == "complete"
+    assert teacher.calls[1] == teacher.calls[0]
+    rejected = _jsonl(output / "rejected.jsonl")
+    assert [row["code"] for row in rejected] == ["parse_invalid_batch"] * 4
+    persisted = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in output.iterdir()
+        if path.is_file()
+    )
+    assert "raw secret" not in persisted
+    assert "extra-secret-id" not in persisted
+    assert all(json.loads(line) for line in (output / "events.jsonl").read_text().splitlines())
+
+
+class _NoCallTeacher:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, request: object) -> TeacherReply:
+        self.calls += 1
+        raise AssertionError("provider must not be called")
+
+
+def test_resume_rejects_compatibility_changes_and_artifact_tampering_before_calls(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    base_kwargs = {
+        "policies": _content_policies(),
+        "seed_records": _orchestration_seeds(),
+        "count": 100,
+        "seed": 107,
+    }
+    changes: list[dict[str, object]] = [
+        {"batch_size": 3},
+        {"max_attempts_per_blueprint": 2},
+        {"seed": 108},
+        {
+            "policies": (
+                _content_policies()[0].model_copy(
+                    update={
+                        "rules": (
+                            _content_policies()[0].rules[0].model_copy(
+                                update={"text": "Changed active policy text."}
+                            ),
+                            _content_policies()[0].rules[1],
+                        )
+                    }
+                ),
+                _content_policies()[1],
+            )
+        },
+    ]
+    for index, change in enumerate(changes):
+        output = tmp_path / f"mismatch-{index}"
+        run_query_batch(
+            **base_kwargs,
+            output_dir=output,
+            teacher=_BudgetStoppingTeacher(0),
+        )
+        teacher = _NoCallTeacher()
+        with pytest.raises(ValueError, match="resume"):
+            run_query_batch(
+                **{**base_kwargs, **change},
+                output_dir=output,
+                teacher=teacher,
+                resume=True,
+            )
+        assert teacher.calls == 0
+
+    tampered = tmp_path / "tampered"
+    run_query_batch(
+        **base_kwargs,
+        output_dir=tampered,
+        teacher=_BudgetStoppingTeacher(0),
+    )
+    first_plan = (tampered / "plan.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    with (tampered / "plan.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(first_plan + "\n")
+    teacher = _NoCallTeacher()
+    with pytest.raises(ValueError, match="plan|artifact"):
+        run_query_batch(
+            **base_kwargs,
+            output_dir=tampered,
+            teacher=teacher,
+            resume=True,
+        )
+    assert teacher.calls == 0
+
+
+def test_atomic_writer_preserves_previous_file_when_replace_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import risk_agent.singguard_query_generation as generation
+
+    path = tmp_path / "artifact.jsonl"
+    path.write_bytes(b'{"old":true}\n')
+
+    def fail_replace(source: object, destination: object) -> None:
+        raise OSError("simulated atomic replace failure")
+
+    monkeypatch.setattr(generation.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="simulated"):
+        generation._atomic_bytes(path, b'{"new":true}\n')
+    assert path.read_bytes() == b'{"old":true}\n'
+    assert list(tmp_path.iterdir()) == [path]
+
+
+class _RequestFailOnceTeacher(_RecordingContentTeacher):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempted: list[tuple[str, ...]] = []
+
+    def generate(self, request: object) -> TeacherReply:
+        ids = tuple(item["blueprint_id"] for item in request["items"])
+        self.attempted.append(ids)
+        if len(self.attempted) == 1:
+            raise TeacherRequestError(
+                "secret upstream body and credential",
+                TeacherUsage(
+                    provider="secret-provider-name",
+                    model="secret-model-name",
+                    request_count=2,
+                    input_tokens=7,
+                    output_tokens=3,
+                    accounting_complete=True,
+                ),
+            )
+        return super().generate(request)
+
+
+def test_provider_request_failure_is_sanitized_and_usage_is_aggregated(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    output = tmp_path / "provider-retry"
+    teacher = _RequestFailOnceTeacher()
+    manifest = run_query_batch(
+        policies=_content_policies(),
+        seed_records=_orchestration_seeds(),
+        output_dir=output,
+        count=100,
+        seed=109,
+        teacher=teacher,
+    )
+    assert manifest["status"] == "complete"
+    assert teacher.attempted[1] == teacher.attempted[0]
+    assert manifest["teacher_usage"] == {
+        "request_count": 27,
+        "input_tokens": 257,
+        "output_tokens": 503,
+        "estimated_cost_usd": None,
+        "accounting_complete": True,
+    }
+    persisted = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in output.iterdir()
+        if path.is_file()
+    )
+    assert "secret upstream" not in persisted
+    assert "secret-provider-name" not in persisted
+    assert "secret-model-name" not in persisted
+    assert _jsonl(output / "rejected.jsonl")[:4] == [
+        {"attempt": 1, "blueprint_id": item_id, "code": "provider_request"}
+        for item_id in teacher.attempted[0]
+    ]
+
+
+class _ExhaustOneTeacher(_RecordingContentTeacher):
+    def __init__(self) -> None:
+        super().__init__()
+        self.target: str | None = None
+
+    def generate(self, request: object) -> TeacherReply:
+        reply = super().generate(request)
+        if self.target is None:
+            self.target = request["items"][0]["blueprint_id"]
+        for source_item, generated in zip(request["items"], reply.payload["items"], strict=True):
+            if source_item["blueprint_id"] == self.target:
+                generated["response"] = (
+                    "stable invalid response"
+                    if source_item["controls"]["conversation_shape"] == "query"
+                    else None
+                )
+        return reply
+
+
+def test_failed_blueprint_exhausts_exact_attempt_limit_and_becomes_terminal(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    output = tmp_path / "exhausted"
+    teacher = _ExhaustOneTeacher()
+    manifest = run_query_batch(
+        policies=_content_policies(),
+        seed_records=_orchestration_seeds(),
+        output_dir=output,
+        count=100,
+        seed=113,
+        teacher=teacher,
+        max_attempts_per_blueprint=3,
+    )
+    assert manifest["status"] == "incomplete"
+    assert manifest["counts"] == {"accepted": 99, "rejected": 1, "pending": 0}
+    assert teacher.target is not None
+    target_rejects = [
+        row for row in _jsonl(output / "rejected.jsonl") if row["blueprint_id"] == teacher.target
+    ]
+    assert [row["attempt"] for row in target_rejects] == [1, 2, 3]
+    checkpoint = json.loads((output / "checkpoint.json").read_text())
+    assert checkpoint["terminal_rejected_ids"] == [teacher.target]
+    assert checkpoint["attempt_counts"][teacher.target] == 3
+
+
+class _ResumeDuplicateTeacher(_RecordingContentTeacher):
+    def __init__(self, prior: dict[tuple[str, str], dict[str, object]]) -> None:
+        super().__init__()
+        self.prior = prior
+        self.duplicated_id: str | None = None
+
+    def generate(self, request: object) -> TeacherReply:
+        reply = super().generate(request)
+        if self.duplicated_id is None:
+            for request_item, generated in zip(
+                request["items"], reply.payload["items"], strict=True
+            ):
+                controls = request_item["controls"]
+                previous = self.prior.get(
+                    (controls["conversation_shape"], controls["length_bin"])
+                )
+                if previous is not None:
+                    generated["query"] = previous["query"]
+                    generated["response"] = previous["response"]
+                    self.duplicated_id = generated["blueprint_id"]
+                    break
+        return reply
+
+
+def test_resume_reconstructs_candidate_index_for_cross_run_duplicates(tmp_path: Path) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    output = tmp_path / "resume-duplicate"
+    run_query_batch(
+        policies=_content_policies(),
+        seed_records=_orchestration_seeds(),
+        output_dir=output,
+        count=100,
+        seed=127,
+        teacher=_BudgetStoppingTeacher(5),
+    )
+    samples = {row["sample_id"]: row for row in _jsonl(output / "content_samples.jsonl")}
+    metadata = {row["sample_id"]: row for row in _jsonl(output / "sample_metadata.jsonl")}
+    prior = {
+        (metadata[item_id]["conversation_shape"], metadata[item_id]["length_bin"]): row
+        for item_id, row in samples.items()
+    }
+    teacher = _ResumeDuplicateTeacher(prior)
+    manifest = run_query_batch(
+        policies=_content_policies(),
+        seed_records=_orchestration_seeds(),
+        output_dir=output,
+        count=100,
+        seed=127,
+        teacher=teacher,
+        resume=True,
+    )
+    assert manifest["status"] == "complete"
+    assert teacher.duplicated_id is not None
+    assert any(
+        row == {
+            "attempt": 1,
+            "blueprint_id": teacher.duplicated_id,
+            "code": "exact_duplicate",
+        }
+        for row in _jsonl(output / "rejected.jsonl")
+    )
+
+
+def test_identical_fixture_runs_have_identical_semantic_artifact_bytes(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    outputs = (tmp_path / "first", tmp_path / "second")
+    for output in outputs:
+        run_query_batch(
+            policies=_content_policies(),
+            seed_records=_orchestration_seeds(),
+            output_dir=output,
+            count=100,
+            seed=131,
+            teacher=_RecordingContentTeacher(),
+        )
+    names = {
+        "plan.jsonl",
+        "content_samples.jsonl",
+        "sample_metadata.jsonl",
+        "rejected.jsonl",
+        "content_review_sample.jsonl",
+        "checkpoint.json",
+        "manifest.json",
+    }
+    assert all((outputs[0] / name).read_bytes() == (outputs[1] / name).read_bytes() for name in names)
+    review = _jsonl(outputs[0] / "content_review_sample.jsonl")
+    assert len(review) == 100
+    assert all(
+        {"intended_label", "primary_answer", "content_form", "source_mode", "thinking_type", "conversation_shape"}
+        <= row.keys()
+        for row in review
+    )
+    assert not any(
+        forbidden in json.dumps(review)
+        for forbidden in ("provenance_url", "license", "source_label", "Governed ")
+    )
+
+
+def test_resume_rejects_source_prompt_and_gate_drift_before_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import risk_agent.singguard_query_generation as generation
+
+    kwargs = {
+        "policies": _content_policies(),
+        "seed_records": _orchestration_seeds(),
+        "output_dir": tmp_path / "compatibility",
+        "count": 100,
+        "seed": 137,
+    }
+    generation.run_query_batch(**kwargs, teacher=_BudgetStoppingTeacher(0))
+
+    original = kwargs["seed_records"][0]
+    changed_text = original.text + " changed"
+    changed_source = original.model_copy(
+        update={
+            "text": changed_text,
+            "content_hash": hashlib.sha256(changed_text.encode()).hexdigest(),
+        }
+    )
+    no_call = _NoCallTeacher()
+    with pytest.raises(ValueError, match="resume"):
+        generation.run_query_batch(
+            **{**kwargs, "seed_records": (changed_source, *kwargs["seed_records"][1:])},
+            teacher=no_call,
+            resume=True,
+        )
+    assert no_call.calls == 0
+
+    metadata_changed = original.model_copy(update={"source_label": "changed-label"})
+    no_call = _NoCallTeacher()
+    with pytest.raises(ValueError, match="resume"):
+        generation.run_query_batch(
+            **{
+                **kwargs,
+                "seed_records": (metadata_changed, *kwargs["seed_records"][1:]),
+            },
+            teacher=no_call,
+            resume=True,
+        )
+    assert no_call.calls == 0
+
+    original_prompt = generation._prompt_bytes
+    monkeypatch.setattr(generation, "_prompt_bytes", lambda: original_prompt() + b"drift")
+    no_call = _NoCallTeacher()
+    with pytest.raises(ValueError, match="resume"):
+        generation.run_query_batch(**kwargs, teacher=no_call, resume=True)
+    assert no_call.calls == 0
+    monkeypatch.setattr(generation, "_prompt_bytes", original_prompt)
+
+    monkeypatch.setattr(generation, "NEAR_DUPLICATE_THRESHOLD", 0.84)
+    no_call = _NoCallTeacher()
+    with pytest.raises(ValueError, match="resume"):
+        generation.run_query_batch(**kwargs, teacher=no_call, resume=True)
+    assert no_call.calls == 0
+
+
+def test_fresh_and_resume_output_directory_contracts_validate_before_provider(
+    tmp_path: Path,
+) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    kwargs = {
+        "policies": _content_policies(),
+        "seed_records": _orchestration_seeds(),
+        "count": 100,
+        "seed": 139,
+    }
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    teacher = _NoCallTeacher()
+    with pytest.raises(FileExistsError, match="fresh"):
+        run_query_batch(**kwargs, output_dir=existing, teacher=teacher)
+    with pytest.raises(ValueError, match="resume"):
+        run_query_batch(
+            **kwargs,
+            output_dir=tmp_path / "missing",
+            teacher=teacher,
+            resume=True,
+        )
+    with pytest.raises(ValueError, match="batch_size"):
+        run_query_batch(
+            **kwargs,
+            output_dir=tmp_path / "never-created",
+            teacher=teacher,
+            batch_size=5,
+        )
+    with pytest.raises(ValueError, match="max_attempts"):
+        run_query_batch(
+            **kwargs,
+            output_dir=tmp_path / "never-created",
+            teacher=teacher,
+            max_attempts_per_blueprint=4,
+        )
+    assert teacher.calls == 0
+
+
+def test_resume_rejects_noncanonical_manifest_bytes_before_provider(tmp_path: Path) -> None:
+    from risk_agent.singguard_query_generation import run_query_batch
+
+    output = tmp_path / "manifest-tamper"
+    kwargs = {
+        "policies": _content_policies(),
+        "seed_records": _orchestration_seeds(),
+        "output_dir": output,
+        "count": 100,
+        "seed": 149,
+    }
+    run_query_batch(**kwargs, teacher=_BudgetStoppingTeacher(0))
+    with (output / "manifest.json").open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+    teacher = _NoCallTeacher()
+    with pytest.raises(ValueError, match="manifest"):
+        run_query_batch(**kwargs, teacher=teacher, resume=True)
+    assert teacher.calls == 0

@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import math
+import os
 import re
+import tempfile
 import unicodedata
-from collections.abc import Mapping
+from collections import Counter, defaultdict
+from collections.abc import Callable, Mapping, Sequence
 from ipaddress import ip_address
 from pathlib import Path
 from types import MappingProxyType
@@ -21,11 +26,19 @@ from pydantic import (
     model_validator,
 )
 
-from risk_agent.singguard import ActivePolicy
+from risk_agent.singguard import ActivePolicy, ModerationSample
 from risk_agent.singguard_query_planning import (
     QueryBlueprint,
     SourceRef,
     plan_blueprints,
+)
+from risk_agent.singguard_sources import SeedRecord
+from risk_agent.teacher import (
+    Teacher,
+    TeacherBudgetExceeded,
+    TeacherReply,
+    TeacherRequestError,
+    TeacherUsage,
 )
 
 
@@ -36,6 +49,7 @@ ENGLISH_ALPHA_RATIO = 0.80
 NEAR_DUPLICATE_THRESHOLD = 0.85
 SOURCE_SIMILARITY_THRESHOLD = 0.50
 LENGTH_BOUNDS_VERSION = "singguard-length-bounds-v1"
+QUERY_BATCH_CONTRACT_VERSION = "singguard-query-v1"
 _CANONICAL_PROMPT_BYTES = b'''SingGuard query generator contract: singguard-query-generator-v1
 
 Generate natural, varied English platform content for every requested blueprint. Match the exact conversation shape and every supplied content control, including form, tone, length, difficulty, noise profile, thinking type where it affects wording, and tool-capable context.
@@ -1061,6 +1075,778 @@ def gate_content(
     return GateResult(accepted=True, code="accepted")
 
 
+_QUERY_ARTIFACTS = (
+    "plan.jsonl",
+    "content_samples.jsonl",
+    "sample_metadata.jsonl",
+    "rejected.jsonl",
+    "content_review_sample.jsonl",
+    "events.jsonl",
+)
+_GATE_VERSION = "singguard-local-gates-v1"
+
+
+def _stable_json_bytes(payload: object) -> bytes:
+    return (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _stable_jsonl_bytes(rows: Sequence[object]) -> bytes:
+    return b"".join(_stable_json_bytes(row) for row in rows)
+
+
+def _atomic_bytes(path: Path, payload: bytes) -> None:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        raise ValueError(f"cannot read query artifact {path.name}") from None
+
+
+def _strict_json_loads(text: str, *, artifact: str) -> object:
+    try:
+        return json.loads(
+            text,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ValueError("nonfinite JSON number")
+            ),
+        )
+    except (json.JSONDecodeError, ValueError, TypeError):
+        raise ValueError(f"invalid or truncated {artifact}") from None
+
+
+def _read_json(path: Path) -> dict[str, object]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        raise ValueError(f"cannot read query artifact {path.name}") from None
+    if not text.endswith("\n"):
+        raise ValueError(f"invalid or truncated {path.name}")
+    value = _strict_json_loads(text, artifact=path.name)
+    if not isinstance(value, dict):
+        raise ValueError(f"invalid {path.name}")
+    if text.encode("utf-8") != _stable_json_bytes(value):
+        raise ValueError(f"invalid or noncanonical {path.name}")
+    return value
+
+
+def _read_jsonl(path: Path) -> list[dict[str, object]]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        raise ValueError(f"cannot read query artifact {path.name}") from None
+    if text and not text.endswith("\n"):
+        raise ValueError(f"invalid or truncated {path.name}")
+    rows: list[dict[str, object]] = []
+    for line in text.splitlines():
+        value = _strict_json_loads(line, artifact=path.name)
+        if not isinstance(value, dict):
+            raise ValueError(f"invalid {path.name}")
+        rows.append(value)
+    return rows
+
+
+def _policy_hash(policies: tuple[ActivePolicy, ...]) -> str:
+    return _sha256_bytes(
+        _stable_json_bytes([policy.model_dump(mode="json") for policy in policies])
+    )
+
+
+def _source_hashes(seed_records: tuple[SeedRecord, ...]) -> tuple[str, str]:
+    snapshots = []
+    for record in seed_records:
+        snapshot = record.model_dump(mode="json")
+        del snapshot["text"]
+        snapshots.append(snapshot)
+    texts = [
+        {
+            "key": [record.source, record.source_id],
+            "text_sha256": hashlib.sha256(record.text.encode("utf-8")).hexdigest(),
+        }
+        for record in seed_records
+    ]
+    return (
+        _sha256_bytes(_stable_json_bytes(snapshots)),
+        _sha256_bytes(_stable_json_bytes(texts)),
+    )
+
+
+def _gate_hash() -> str:
+    return _sha256_bytes(
+        _stable_json_bytes(
+            {
+                "version": _GATE_VERSION,
+                "content_contract": CONTENT_CONTRACT_VERSION,
+                "length_bounds_version": LENGTH_BOUNDS_VERSION,
+                "length_bounds": dict(LENGTH_BOUNDS),
+                "english_alpha_ratio": ENGLISH_ALPHA_RATIO,
+                "near_duplicate_threshold": NEAR_DUPLICATE_THRESHOLD,
+                "source_similarity_threshold": SOURCE_SIMILARITY_THRESHOLD,
+                "max_content_chars": MAX_CONTENT_CHARS,
+                "max_source_chars": MAX_SOURCE_CHARS,
+            }
+        )
+    )
+
+
+def _compatibility(
+    *,
+    policies: tuple[ActivePolicy, ...],
+    seed_records: tuple[SeedRecord, ...],
+    plan_rows: list[dict[str, object]],
+    count: int,
+    seed: int,
+    batch_size: int,
+    max_attempts_per_blueprint: int,
+) -> dict[str, object]:
+    source_sha256, source_text_sha256 = _source_hashes(seed_records)
+    config = {
+        "count": count,
+        "seed": seed,
+        "batch_size": batch_size,
+        "max_attempts_per_blueprint": max_attempts_per_blueprint,
+    }
+    return {
+        "contract_version": QUERY_BATCH_CONTRACT_VERSION,
+        "plan_sha256": _sha256_bytes(_stable_jsonl_bytes(plan_rows)),
+        "policy_sha256": _policy_hash(policies),
+        "source_sha256": source_sha256,
+        "source_text_sha256": source_text_sha256,
+        "prompt_sha256": hashlib.sha256(_prompt_bytes()).hexdigest(),
+        "gate_sha256": _gate_hash(),
+        "config_sha256": _sha256_bytes(_stable_json_bytes(config)),
+        "config": config,
+    }
+
+
+def _quota_coverage(
+    blueprints: Sequence[QueryBlueprint], accepted_ids: set[str]
+) -> dict[str, object]:
+    dimensions: dict[str, Callable[[QueryBlueprint], object]] = {
+        "label": lambda row: row.intended_label,
+        "primary_answer": lambda row: row.primary_answer or "none",
+        "form": lambda row: row.content_form,
+        "source_mode": lambda row: "governed" if row.source_ref else "none",
+        "thinking_type": lambda row: row.thinking_type,
+        "shape": lambda row: row.conversation_shape,
+    }
+
+    def counts(rows: Sequence[QueryBlueprint]) -> dict[str, dict[str, int]]:
+        return {
+            name: dict(
+                sorted(Counter(str(selector(row)) for row in rows).items())
+            )
+            for name, selector in dimensions.items()
+        }
+
+    accepted = [row for row in blueprints if row.blueprint_id in accepted_ids]
+    return {"planned": counts(blueprints), "accepted": counts(accepted)}
+
+
+def _sample_row(blueprint: QueryBlueprint, content: GeneratedContent) -> dict[str, object]:
+    sample = ModerationSample(
+        sample_id=blueprint.blueprint_id,
+        policy_id=blueprint.policy_id,
+        thinking_type=blueprint.thinking_type,
+        query=content.query,
+        response=content.response,
+        tool_names=(),
+        tool_policy="auto",
+        expected_label=blueprint.intended_label,
+        expected_answers=blueprint.intended_answers,
+    )
+    return sample.model_dump(mode="json")
+
+
+def _metadata_row(blueprint: QueryBlueprint, *, attempt: int) -> dict[str, object]:
+    source = None
+    if blueprint.source_ref is not None:
+        source = {
+            "name": blueprint.source_ref.source,
+            "content_hash": blueprint.source_ref.content_hash,
+        }
+    return {
+        "sample_id": blueprint.blueprint_id,
+        "blueprint_id": blueprint.blueprint_id,
+        "family_id": blueprint.family_id,
+        "primary_rule_id": blueprint.primary_rule_id,
+        "primary_answer": blueprint.primary_answer,
+        "intended_label": blueprint.intended_label,
+        "intended_answers": list(blueprint.intended_answers),
+        "conversation_shape": blueprint.conversation_shape,
+        "content_form": blueprint.content_form,
+        "tone": blueprint.tone,
+        "length_bin": blueprint.length_bin,
+        "difficulty": blueprint.difficulty,
+        "noise_profile": blueprint.noise_profile,
+        "thinking_type": blueprint.thinking_type,
+        "tool_capable": blueprint.tool_capable,
+        "source_mode": "governed" if source is not None else "none",
+        "source": source,
+        "attempt": attempt,
+    }
+
+
+def _review_rows(
+    blueprints: Sequence[QueryBlueprint],
+    samples: Mapping[str, dict[str, object]],
+    metadata: Mapping[str, dict[str, object]],
+) -> list[dict[str, object]]:
+    buckets: dict[tuple[str, ...], list[str]] = defaultdict(list)
+    for blueprint in blueprints:
+        if blueprint.blueprint_id not in samples:
+            continue
+        key = (
+            blueprint.intended_label,
+            blueprint.primary_answer or "none",
+            blueprint.content_form,
+            "governed" if blueprint.source_ref else "none",
+            blueprint.thinking_type,
+            blueprint.conversation_shape,
+        )
+        buckets[key].append(blueprint.blueprint_id)
+    selected: list[str] = []
+    offsets = {key: 0 for key in buckets}
+    keys = sorted(buckets)
+    while len(selected) < min(100, len(samples)):
+        changed = False
+        for key in keys:
+            offset = offsets[key]
+            if offset < len(buckets[key]):
+                selected.append(buckets[key][offset])
+                offsets[key] += 1
+                changed = True
+                if len(selected) == min(100, len(samples)):
+                    break
+        if not changed:
+            break
+    return [{**samples[item_id], **metadata[item_id]} for item_id in selected]
+
+
+def _usage_add(aggregate: dict[str, object], usage: TeacherUsage) -> None:
+    aggregate["request_count"] = int(aggregate["request_count"]) + usage.request_count
+    aggregate["input_tokens"] = int(aggregate["input_tokens"]) + usage.input_tokens
+    aggregate["output_tokens"] = int(aggregate["output_tokens"]) + usage.output_tokens
+    aggregate["accounting_complete"] = bool(aggregate["accounting_complete"]) and usage.accounting_complete
+    current_cost = aggregate["estimated_cost_usd"]
+    if current_cost is None or usage.estimated_cost_usd is None:
+        aggregate["estimated_cost_usd"] = None
+    else:
+        total = float(current_cost) + usage.estimated_cost_usd
+        aggregate["estimated_cost_usd"] = total if math.isfinite(total) else None
+        if not math.isfinite(total):
+            aggregate["accounting_complete"] = False
+
+
+def _manifest_payload(
+    *,
+    compatibility: Mapping[str, object],
+    blueprints: Sequence[QueryBlueprint],
+    completed_ids: set[str],
+    terminal_ids: set[str],
+    artifact_hashes: Mapping[str, str],
+    usage: Mapping[str, object],
+) -> dict[str, object]:
+    counts = {
+        "accepted": len(completed_ids),
+        "rejected": len(terminal_ids),
+        "pending": len(blueprints) - len(completed_ids) - len(terminal_ids),
+    }
+    return {
+        **compatibility,
+        "status": "complete" if len(completed_ids) == len(blueprints) else "incomplete",
+        "counts": counts,
+        "quota_coverage": _quota_coverage(blueprints, completed_ids),
+        "artifact_sha256": dict(sorted(artifact_hashes.items())),
+        "teacher_usage": dict(usage),
+    }
+
+
+def _persist_query_state(
+    *,
+    output_dir: Path,
+    plan_rows: list[dict[str, object]],
+    blueprints: tuple[QueryBlueprint, ...],
+    samples: Mapping[str, dict[str, object]],
+    metadata: Mapping[str, dict[str, object]],
+    rejected_rows: list[dict[str, object]],
+    events: list[dict[str, object]],
+    attempts: Mapping[str, int],
+    terminal_ids: set[str],
+    compatibility: Mapping[str, object],
+    usage: Mapping[str, object],
+) -> dict[str, object]:
+    ordered_ids = [row.blueprint_id for row in blueprints]
+    sample_rows = [samples[item_id] for item_id in ordered_ids if item_id in samples]
+    metadata_rows = [metadata[item_id] for item_id in ordered_ids if item_id in metadata]
+    review_rows = _review_rows(blueprints, samples, metadata)
+    rows_by_name: dict[str, list[dict[str, object]]] = {
+        "plan.jsonl": plan_rows,
+        "content_samples.jsonl": sample_rows,
+        "sample_metadata.jsonl": metadata_rows,
+        "rejected.jsonl": rejected_rows,
+        "content_review_sample.jsonl": review_rows,
+        "events.jsonl": events,
+    }
+    for name in _QUERY_ARTIFACTS:
+        _atomic_bytes(output_dir / name, _stable_jsonl_bytes(rows_by_name[name]))
+    artifact_hashes = {
+        name: _sha256_file(output_dir / name) for name in _QUERY_ARTIFACTS
+    }
+    completed_ids = set(samples)
+    checkpoint = {
+        **compatibility,
+        "completed_ids": [item_id for item_id in ordered_ids if item_id in completed_ids],
+        "terminal_rejected_ids": [item_id for item_id in ordered_ids if item_id in terminal_ids],
+        "attempt_counts": {item_id: attempts[item_id] for item_id in ordered_ids},
+        "artifact_sha256": artifact_hashes,
+        "artifact_counts": {name: len(rows_by_name[name]) for name in _QUERY_ARTIFACTS},
+        "teacher_usage": dict(usage),
+    }
+    _atomic_bytes(output_dir / "checkpoint.json", _stable_json_bytes(checkpoint))
+    manifest_hashes = {
+        **artifact_hashes,
+        "checkpoint.json": _sha256_file(output_dir / "checkpoint.json"),
+    }
+    manifest = _manifest_payload(
+        compatibility=compatibility,
+        blueprints=blueprints,
+        completed_ids=completed_ids,
+        terminal_ids=terminal_ids,
+        artifact_hashes=manifest_hashes,
+        usage=usage,
+    )
+    _atomic_bytes(output_dir / "manifest.json", _stable_json_bytes(manifest))
+    return manifest
+
+
+def _validate_run_inputs(
+    *,
+    policies: tuple[ActivePolicy, ...],
+    seed_records: tuple[SeedRecord, ...],
+    output_dir: Path,
+    count: int,
+    seed: int,
+    teacher: Teacher,
+    batch_size: int,
+    max_attempts_per_blueprint: int,
+    resume: bool,
+    progress: Callable[[Mapping[str, object]], object] | None,
+) -> tuple[QueryBlueprint, ...]:
+    if not isinstance(output_dir, Path):
+        raise TypeError("output_dir must be a Path")
+    if type(policies) is not tuple or type(seed_records) is not tuple:
+        raise TypeError("policies and seed_records must be tuples")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 4:
+        raise ValueError("batch_size must be an integer from 1 to 4")
+    if (
+        isinstance(max_attempts_per_blueprint, bool)
+        or not isinstance(max_attempts_per_blueprint, int)
+        or not 1 <= max_attempts_per_blueprint <= 3
+    ):
+        raise ValueError("max_attempts_per_blueprint must be an integer from 1 to 3")
+    if type(resume) is not bool:
+        raise TypeError("resume must be a bool")
+    if progress is not None and not callable(progress):
+        raise TypeError("progress must be callable or None")
+    if not callable(getattr(teacher, "generate", None)):
+        raise TypeError("teacher must provide generate(request)")
+    if resume and not output_dir.is_dir():
+        raise ValueError("resume requires an existing output directory")
+    if not resume and output_dir.exists():
+        raise FileExistsError("fresh output directory must not exist")
+    # The planner owns strict count, seed, policy, and governed-source validation.
+    return plan_blueprints(
+        policies, count=count, seed=seed, seed_records=seed_records
+    )
+
+
+def _resume_state(
+    *,
+    output_dir: Path,
+    blueprints: tuple[QueryBlueprint, ...],
+    plan_rows: list[dict[str, object]],
+    compatibility: Mapping[str, object],
+) -> tuple[
+    dict[str, dict[str, object]],
+    dict[str, dict[str, object]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+    dict[str, int],
+    set[str],
+    dict[str, object],
+]:
+    checkpoint = _read_json(output_dir / "checkpoint.json")
+    manifest = _read_json(output_dir / "manifest.json")
+    for key, expected in compatibility.items():
+        if checkpoint.get(key) != expected or manifest.get(key) != expected:
+            raise ValueError(f"resume compatibility mismatch: {key}")
+    existing_plan = _read_jsonl(output_dir / "plan.jsonl")
+    if _stable_jsonl_bytes(existing_plan) != _stable_jsonl_bytes(plan_rows):
+        raise ValueError("resume deterministic plan mismatch")
+    expected_hashes = checkpoint.get("artifact_sha256")
+    expected_counts = checkpoint.get("artifact_counts")
+    if not isinstance(expected_hashes, dict) or not isinstance(expected_counts, dict):
+        raise ValueError("resume checkpoint artifact metadata is invalid")
+    artifact_rows: dict[str, list[dict[str, object]]] = {"plan.jsonl": existing_plan}
+    for name in _QUERY_ARTIFACTS:
+        if name not in artifact_rows:
+            artifact_rows[name] = _read_jsonl(output_dir / name)
+        if expected_hashes.get(name) != _sha256_file(output_dir / name):
+            raise ValueError(f"resume artifact hash mismatch: {name}")
+        if expected_counts.get(name) != len(artifact_rows[name]):
+            raise ValueError(f"resume artifact count mismatch: {name}")
+    manifest_hashes = manifest.get("artifact_sha256")
+    if not isinstance(manifest_hashes, dict):
+        raise ValueError("resume manifest artifact metadata is invalid")
+    for name in (*_QUERY_ARTIFACTS, "checkpoint.json"):
+        if manifest_hashes.get(name) != _sha256_file(output_dir / name):
+            raise ValueError(f"resume manifest hash mismatch: {name}")
+
+    known_ids = {row.blueprint_id for row in blueprints}
+    sample_rows = artifact_rows["content_samples.jsonl"]
+    metadata_rows = artifact_rows["sample_metadata.jsonl"]
+    sample_ids = [row.get("sample_id") for row in sample_rows]
+    metadata_ids = [row.get("sample_id") for row in metadata_rows]
+    if (
+        any(type(item_id) is not str or item_id not in known_ids for item_id in sample_ids)
+        or len(sample_ids) != len(set(sample_ids))
+        or metadata_ids != sample_ids
+    ):
+        raise ValueError("resume accepted artifacts have invalid or duplicate IDs")
+    for row in sample_rows:
+        try:
+            ModerationSample.model_validate_json(
+                json.dumps(row, ensure_ascii=False, allow_nan=False), strict=True
+            )
+        except (ValidationError, ValueError, TypeError):
+            raise ValueError("resume content sample is invalid") from None
+
+    rejected_rows = artifact_rows["rejected.jsonl"]
+    rejection_keys = [(row.get("blueprint_id"), row.get("attempt")) for row in rejected_rows]
+    if (
+        any(type(item_id) is not str or item_id not in known_ids for item_id, _ in rejection_keys)
+        or len(rejection_keys) != len(set(rejection_keys))
+    ):
+        raise ValueError("resume rejected artifact has invalid or duplicate attempts")
+    attempts_raw = checkpoint.get("attempt_counts")
+    completed_raw = checkpoint.get("completed_ids")
+    terminal_raw = checkpoint.get("terminal_rejected_ids")
+    if (
+        not isinstance(attempts_raw, dict)
+        or set(attempts_raw) != known_ids
+        or not isinstance(completed_raw, list)
+        or not isinstance(terminal_raw, list)
+        or completed_raw != sample_ids
+        or len(terminal_raw) != len(set(terminal_raw))
+        or any(item_id not in known_ids for item_id in terminal_raw)
+        or set(completed_raw) & set(terminal_raw)
+    ):
+        raise ValueError("resume checkpoint state is inconsistent")
+    attempts: dict[str, int] = {}
+    for item_id, value in attempts_raw.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("resume attempt counts are invalid")
+        attempts[item_id] = value
+    samples = {str(row["sample_id"]): row for row in sample_rows}
+    metadata = {str(row["sample_id"]): row for row in metadata_rows}
+    events = artifact_rows["events.jsonl"]
+    usage = checkpoint.get("teacher_usage")
+    if not isinstance(usage, dict) or usage != manifest.get("teacher_usage"):
+        raise ValueError("resume teacher usage is inconsistent")
+    expected_manifest = _manifest_payload(
+        compatibility=compatibility,
+        blueprints=blueprints,
+        completed_ids=set(samples),
+        terminal_ids=set(terminal_raw),
+        artifact_hashes=manifest_hashes,
+        usage=usage,
+    )
+    if manifest != expected_manifest:
+        raise ValueError("resume manifest is inconsistent")
+    return samples, metadata, rejected_rows, events, attempts, set(terminal_raw), usage
+
+
+def run_query_batch(
+    *,
+    policies: tuple[ActivePolicy, ...],
+    seed_records: tuple[SeedRecord, ...],
+    output_dir: Path,
+    count: int,
+    seed: int,
+    teacher: Teacher,
+    batch_size: int = 4,
+    max_attempts_per_blueprint: int = 3,
+    resume: bool = False,
+    progress: Callable[[Mapping[str, object]], object] | None = None,
+) -> dict[str, object]:
+    """Generate one deterministic, crash-safe batch of gated query content."""
+
+    blueprints = _validate_run_inputs(
+        policies=policies,
+        seed_records=seed_records,
+        output_dir=output_dir,
+        count=count,
+        seed=seed,
+        teacher=teacher,
+        batch_size=batch_size,
+        max_attempts_per_blueprint=max_attempts_per_blueprint,
+        resume=resume,
+        progress=progress,
+    )
+    plan_rows = [row.model_dump(mode="json") for row in blueprints]
+    compatibility = _compatibility(
+        policies=policies,
+        seed_records=seed_records,
+        plan_rows=plan_rows,
+        count=count,
+        seed=seed,
+        batch_size=batch_size,
+        max_attempts_per_blueprint=max_attempts_per_blueprint,
+    )
+    source_texts = {
+        (record.source, record.source_id): record.text for record in seed_records
+    }
+    by_id = {row.blueprint_id: row for row in blueprints}
+    if resume:
+        (
+            samples,
+            metadata,
+            rejected_rows,
+            events,
+            attempts,
+            terminal_ids,
+            usage,
+        ) = _resume_state(
+            output_dir=output_dir,
+            blueprints=blueprints,
+            plan_rows=plan_rows,
+            compatibility=compatibility,
+        )
+        events.append(
+            {
+                "sequence": len(events) + 1,
+                "event": "resume",
+                "code": "validated",
+                "completed_count": len(samples),
+            }
+        )
+    else:
+        output_dir.mkdir(parents=True)
+        samples = {}
+        metadata = {}
+        rejected_rows = []
+        events = [{"sequence": 1, "event": "initialize", "code": "fresh"}]
+        attempts = {row.blueprint_id: 0 for row in blueprints}
+        terminal_ids = set()
+        usage = {
+            "request_count": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "estimated_cost_usd": 0.0,
+            "accounting_complete": True,
+        }
+
+    index = CandidateIndex()
+    for blueprint in blueprints:
+        sample = samples.get(blueprint.blueprint_id)
+        if sample is not None:
+            index.add(
+                blueprint.family_id,
+                GeneratedContent(
+                    blueprint_id=blueprint.blueprint_id,
+                    query=str(sample["query"]),
+                    response=sample.get("response"),
+                ),
+            )
+
+    manifest = _persist_query_state(
+        output_dir=output_dir,
+        plan_rows=plan_rows,
+        blueprints=blueprints,
+        samples=samples,
+        metadata=metadata,
+        rejected_rows=rejected_rows,
+        events=events,
+        attempts=attempts,
+        terminal_ids=terminal_ids,
+        compatibility=compatibility,
+        usage=usage,
+    )
+    stopped = False
+    while not stopped:
+        pending = [
+            row
+            for row in blueprints
+            if row.blueprint_id not in samples and row.blueprint_id not in terminal_ids
+        ]
+        if not pending:
+            break
+        batch = tuple(pending[:batch_size])
+        batch_ids = tuple(row.blueprint_id for row in batch)
+        batch_attempts = {
+            item_id: attempts[item_id] + 1 for item_id in batch_ids
+        }
+        request = build_content_request(
+            batch, policies=policies, source_texts=source_texts
+        )
+        try:
+            reply = teacher.generate(request)
+        except TeacherBudgetExceeded:
+            events.append(
+                {
+                    "sequence": len(events) + 1,
+                    "event": "provider_stop",
+                    "code": "budget_exceeded",
+                    "batch_count": len(batch),
+                }
+            )
+            stopped = True
+        except TeacherRequestError as error:
+            _usage_add(usage, error.usage)
+            for item_id in batch_ids:
+                attempts[item_id] = batch_attempts[item_id]
+                rejected_rows.append(
+                    {
+                        "blueprint_id": item_id,
+                        "attempt": attempts[item_id],
+                        "code": "provider_request",
+                    }
+                )
+                if attempts[item_id] >= max_attempts_per_blueprint:
+                    terminal_ids.add(item_id)
+            events.append(
+                {
+                    "sequence": len(events) + 1,
+                    "event": "provider_failure",
+                    "code": "provider_request",
+                    "batch_count": len(batch),
+                }
+            )
+        else:
+            if not isinstance(reply, TeacherReply):
+                raise TypeError("teacher.generate must return TeacherReply")
+            _usage_add(usage, reply.usage)
+            try:
+                parsed = parse_content_batch(reply.payload, expected_ids=batch_ids)
+            except (TypeError, ValueError, ValidationError):
+                for item_id in batch_ids:
+                    attempts[item_id] = batch_attempts[item_id]
+                    rejected_rows.append(
+                        {
+                            "blueprint_id": item_id,
+                            "attempt": attempts[item_id],
+                            "code": "parse_invalid_batch",
+                        }
+                    )
+                    if attempts[item_id] >= max_attempts_per_blueprint:
+                        terminal_ids.add(item_id)
+                events.append(
+                    {
+                        "sequence": len(events) + 1,
+                        "event": "batch_rejected",
+                        "code": "parse_invalid_batch",
+                        "batch_count": len(batch),
+                    }
+                )
+            else:
+                parsed_by_id = {item.blueprint_id: item for item in parsed}
+                accepted_count = 0
+                for blueprint in batch:
+                    item_id = blueprint.blueprint_id
+                    attempts[item_id] = batch_attempts[item_id]
+                    candidate = parsed_by_id[item_id]
+                    source_text = (
+                        source_texts[(blueprint.source_ref.source, blueprint.source_ref.source_id)]
+                        if blueprint.source_ref is not None
+                        else None
+                    )
+                    result = gate_content(
+                        blueprint, candidate, source_text=source_text, index=index
+                    )
+                    if result.accepted:
+                        samples[item_id] = _sample_row(blueprint, candidate)
+                        metadata[item_id] = _metadata_row(
+                            blueprint, attempt=attempts[item_id]
+                        )
+                        index.add(blueprint.family_id, candidate)
+                        accepted_count += 1
+                    else:
+                        rejected_rows.append(
+                            {
+                                "blueprint_id": item_id,
+                                "attempt": attempts[item_id],
+                                "code": result.code,
+                            }
+                        )
+                        if attempts[item_id] >= max_attempts_per_blueprint:
+                            terminal_ids.add(item_id)
+                events.append(
+                    {
+                        "sequence": len(events) + 1,
+                        "event": "batch_complete",
+                        "code": "gated",
+                        "batch_count": len(batch),
+                        "accepted_count": accepted_count,
+                    }
+                )
+
+        manifest = _persist_query_state(
+            output_dir=output_dir,
+            plan_rows=plan_rows,
+            blueprints=blueprints,
+            samples=samples,
+            metadata=metadata,
+            rejected_rows=rejected_rows,
+            events=events,
+            attempts=attempts,
+            terminal_ids=terminal_ids,
+            compatibility=compatibility,
+            usage=usage,
+        )
+        if progress is not None:
+            progress(
+                {
+                    "status": manifest["status"],
+                    "accepted": len(samples),
+                    "rejected": len(terminal_ids),
+                    "pending": count - len(samples) - len(terminal_ids),
+                }
+            )
+    return manifest
+
+
 __all__ = [
     "GeneratedContent",
     "GateResult",
@@ -1076,4 +1862,5 @@ __all__ = [
     "SourceRef",
     "plan_blueprints",
     "gate_content",
+    "run_query_batch",
 ]
