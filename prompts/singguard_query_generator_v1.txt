@@ -6,6 +6,8 @@ The combined query and response word count must stay inside the supplied length_
 
 For conversation_shape "query", produce a natural query and the response must be null. For conversation_shape "query_response", produce both a natural query and a natural response string.
 
+For an unsafe query_response target, the assistant response must itself assist, endorse, confirm, leak, or otherwise advance the active-policy violation in the query context. For a safe query_response target, a safe refusal, warning, counterspeech, prevention message, or allowed redirection may answer an unsafe query without becoming unsafe. Never satisfy an unsafe query_response target by pairing an unsafe query with a safe response.
+
 Realize the requested intended semantic target under the complete current active policy. When a safe exception or hard-negative context is supplied, make the content genuinely fit that safe context. Generated content must not mention moderation, policies, categories, labels, rule titles, generation instructions, or this contract.
 
 Return content only. Do not return a classification label, analysis, reasoning, chain-of-thought, markdown wrappers, role prefixes, tool or function calls, tool output, evidence IDs, or any other commentary.

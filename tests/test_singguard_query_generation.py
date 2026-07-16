@@ -265,6 +265,51 @@ def test_semantic_review_request_is_blind_to_planned_target() -> None:
     assert "independently classify" in request["prompt"].lower()
 
 
+def test_semantic_review_prompt_judges_query_response_by_assistant_behavior() -> None:
+    from risk_agent.singguard_query_generation import (
+        GeneratedContent,
+        build_semantic_review_request,
+    )
+
+    blueprint = _unsafe_blueprint()
+    request = build_semantic_review_request(
+        (
+            (
+                blueprint,
+                GeneratedContent(
+                    blueprint_id=blueprint.blueprint_id,
+                    query="Message me privately to discuss the offer.",
+                    response=(
+                        "Do not move this conversation off platform; use the official "
+                        "support channel instead."
+                    ),
+                ),
+            ),
+        ),
+        policies=_content_policies(),
+    )
+
+    prompt = request["prompt"].lower()
+    assert "judge the assistant response" in prompt
+    assert "safe refusal" in prompt
+    assert "do not label the pair unsafe solely because the query is unsafe" in prompt
+
+
+def test_content_prompt_targets_query_response_through_assistant_behavior() -> None:
+    from risk_agent.singguard_query_generation import build_content_request
+
+    request = build_content_request(
+        (_unsafe_blueprint(conversation_shape="query_response"),),
+        policies=_content_policies(),
+        source_texts={},
+    )
+
+    prompt = request["prompt"].lower()
+    assert "unsafe query_response" in prompt
+    assert "assistant response must itself assist" in prompt
+    assert "safe refusal" in prompt
+
+
 def test_parse_semantic_review_batch_preserves_policy_ordered_answers() -> None:
     from risk_agent.singguard_query_generation import parse_semantic_review_batch
 
