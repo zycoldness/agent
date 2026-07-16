@@ -7,7 +7,6 @@ import json
 import math
 import os
 import re
-import shutil
 import tempfile
 import unicodedata
 from collections import Counter, defaultdict
@@ -392,38 +391,6 @@ def parse_content_batch(
     return tuple(parsed)
 
 
-def _parse_content_envelope(
-    payload: Mapping[str, object], *, expected_ids: tuple[str, ...]
-) -> dict[str, Mapping[str, object]]:
-    """Validate batch association while leaving item schemas independent."""
-
-    if not isinstance(payload, Mapping) or set(payload) != {"items"}:
-        raise ValueError("content batch must contain exactly the items property")
-    raw_items = payload["items"]
-    if type(raw_items) is not list or len(raw_items) != len(expected_ids):
-        raise ValueError("content batch item count does not match request")
-    by_id: dict[str, Mapping[str, object]] = {}
-    for raw_item in raw_items:
-        if not isinstance(raw_item, Mapping):
-            raise ValueError("content batch item association is invalid")
-        item_id = raw_item.get("blueprint_id")
-        if type(item_id) is not str or not item_id.strip() or item_id in by_id:
-            raise ValueError("content batch blueprint IDs are invalid")
-        by_id[item_id] = raw_item
-    if set(by_id) != set(expected_ids):
-        raise ValueError("every expected blueprint ID must occur exactly once")
-    return by_id
-
-
-def _parse_content_item(raw_item: Mapping[str, object]) -> GeneratedContent:
-    if set(raw_item) != {"blueprint_id", "query", "response"}:
-        raise ValueError("content batch contains an invalid item")
-    try:
-        return GeneratedContent.model_validate(raw_item, strict=True)
-    except ValidationError:
-        raise ValueError("content batch contains an invalid item") from None
-
-
 def _prompt_bytes() -> bytes:
     path = Path(__file__).resolve().parents[2] / "prompts" / "singguard_query_generator_v1.txt"
     try:
@@ -713,21 +680,19 @@ class CandidateIndex:
     """Accepted candidates used by duplicate gates."""
 
     def __init__(self) -> None:
-        self._rows: list[tuple[str, frozenset[tuple[str, ...]]]] = []
-        self._exact: set[str] = set()
-        self._by_gram: dict[tuple[str, ...], set[int]] = defaultdict(set)
+        self._rows: list[tuple[str, str, frozenset[tuple[str, ...]]]] = []
 
     def add(self, family_id: str, content: GeneratedContent) -> None:
         """Index an explicitly accepted candidate without changing the candidate."""
 
         _validate_index_inputs(family_id, content)
-        canonical = _canonical_candidate(content)
-        grams = _five_grams(_combined_text(content))
-        row_index = len(self._rows)
-        self._rows.append((family_id, grams))
-        self._exact.add(canonical)
-        for gram in grams:
-            self._by_gram[gram].add(row_index)
+        self._rows.append(
+            (
+                family_id,
+                _canonical_candidate(content),
+                _five_grams(_combined_text(content)),
+            )
+        )
 
     def duplicate_code(
         self, family_id: str, content: GeneratedContent
@@ -737,16 +702,12 @@ class CandidateIndex:
         _validate_index_inputs(family_id, content)
         canonical = _canonical_candidate(content)
         grams = _five_grams(_combined_text(content))
-        if canonical in self._exact:
+        if any(row_canonical == canonical for _, row_canonical, _ in self._rows):
             return "exact_duplicate"
-        possible_rows: set[int] = set()
-        for gram in grams:
-            possible_rows.update(self._by_gram.get(gram, ()))
         if any(
-            self._rows[row_index][0] != family_id
-            and _jaccard(grams, self._rows[row_index][1])
-            >= NEAR_DUPLICATE_THRESHOLD
-            for row_index in possible_rows
+            row_family != family_id
+            and _jaccard(grams, row_grams) >= NEAR_DUPLICATE_THRESHOLD
+            for row_family, _, row_grams in self._rows
         ):
             return "near_duplicate"
         return None
@@ -1122,13 +1083,6 @@ _QUERY_ARTIFACTS = (
     "content_review_sample.jsonl",
     "events.jsonl",
 )
-_DYNAMIC_JSONL_ARTIFACTS = _QUERY_ARTIFACTS[1:]
-_SNAPSHOT_FILES = (
-    *_DYNAMIC_JSONL_ARTIFACTS,
-    "checkpoint.json",
-    "manifest.json",
-)
-_STATE_DIRECTORY = ".query_state"
 _GATE_VERSION = "singguard-local-gates-v1"
 _COMPATIBILITY_KEYS = frozenset(
     {
@@ -1176,6 +1130,7 @@ _REJECTION_CODES = frozenset(
         "source_too_similar",
         "near_duplicate",
         "parse_invalid_batch",
+        "provider_request",
     }
 )
 
@@ -1215,112 +1170,6 @@ def _atomic_bytes(path: Path, payload: bytes) -> None:
                 temporary.unlink()
             except OSError:
                 pass
-
-
-def _write_durable_file(path: Path, payload: bytes) -> None:
-    with path.open("xb") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-
-
-def _publish_root_file(source: Path, destination: Path) -> None:
-    """Publish a snapshot file cheaply, falling back to an atomic byte copy."""
-
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=destination.parent, prefix=f".{destination.name}."
-    )
-    os.close(descriptor)
-    temporary = Path(temporary_name)
-    try:
-        temporary.unlink()
-        try:
-            os.link(source, temporary)
-        except OSError:
-            _atomic_bytes(destination, source.read_bytes())
-            return
-        os.replace(temporary, destination)
-    finally:
-        try:
-            temporary.unlink()
-        except OSError:
-            pass
-
-
-def _current_generation(state_dir: Path) -> int:
-    marker = _read_json(state_dir / "CURRENT")
-    if set(marker) != {"generation"}:
-        raise ValueError("query snapshot CURRENT marker is invalid")
-    generation = marker["generation"]
-    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
-        raise ValueError("query snapshot CURRENT marker is invalid")
-    return generation
-
-
-def _generation_dir(state_dir: Path, generation: int) -> Path:
-    return state_dir / f"g{generation:08d}"
-
-
-def _cleanup_generations(state_dir: Path, current: int) -> None:
-    keep = {current, current - 1}
-    for path in state_dir.iterdir():
-        remove = path.name.startswith(".staging-")
-        if path.is_dir() and path.name.startswith("g"):
-            suffix = path.name[1:]
-            remove = not suffix.isdigit() or int(suffix) not in keep
-        if remove:
-            try:
-                shutil.rmtree(path)
-            except OSError:
-                pass
-
-
-def _validate_snapshot_files(snapshot_dir: Path) -> None:
-    try:
-        names = {path.name for path in snapshot_dir.iterdir() if path.is_file()}
-    except OSError:
-        raise ValueError("committed query snapshot is unavailable") from None
-    if names != set(_SNAPSHOT_FILES):
-        raise ValueError("committed query snapshot is incomplete")
-    for name in _SNAPSHOT_FILES:
-        if not (snapshot_dir / name).is_file():
-            raise ValueError("committed query snapshot is unreadable")
-
-
-def _recover_committed_snapshot(output_dir: Path) -> None:
-    state_dir = output_dir / _STATE_DIRECTORY
-    generation = _current_generation(state_dir)
-    snapshot_dir = _generation_dir(state_dir, generation)
-    _validate_snapshot_files(snapshot_dir)
-    for name in _SNAPSHOT_FILES:
-        _publish_root_file(snapshot_dir / name, output_dir / name)
-    _cleanup_generations(state_dir, generation)
-
-
-def _commit_snapshot(output_dir: Path, payloads: Mapping[str, bytes]) -> None:
-    if set(payloads) != set(_SNAPSHOT_FILES):
-        raise RuntimeError("internal query snapshot payload is incomplete")
-    state_dir = output_dir / _STATE_DIRECTORY
-    state_dir.mkdir(exist_ok=True)
-    current_path = state_dir / "CURRENT"
-    current = _current_generation(state_dir) if current_path.exists() else 0
-    next_generation = current + 1
-    staging = state_dir / f".staging-{next_generation:08d}"
-    generation_dir = _generation_dir(state_dir, next_generation)
-    for path in (staging, generation_dir):
-        if path.exists():
-            shutil.rmtree(path)
-    staging.mkdir()
-    for name in _SNAPSHOT_FILES:
-        _write_durable_file(staging / name, payloads[name])
-    os.replace(staging, generation_dir)
-    _atomic_bytes(
-        current_path,
-        _stable_json_bytes({"generation": next_generation}),
-    )
-    for name in _SNAPSHOT_FILES:
-        _publish_root_file(generation_dir / name, output_dir / name)
-    _cleanup_generations(state_dir, next_generation)
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -1661,23 +1510,17 @@ def _persist_query_state(
     metadata_rows = [metadata[item_id] for item_id in ordered_ids if item_id in metadata]
     review_rows = _review_rows(blueprints, samples, metadata)
     rows_by_name: dict[str, list[dict[str, object]]] = {
+        "plan.jsonl": plan_rows,
         "content_samples.jsonl": sample_rows,
         "sample_metadata.jsonl": metadata_rows,
         "rejected.jsonl": rejected_rows,
         "content_review_sample.jsonl": review_rows,
         "events.jsonl": events,
     }
-    dynamic_payloads = {
-        name: _stable_jsonl_bytes(rows_by_name[name])
-        for name in _DYNAMIC_JSONL_ARTIFACTS
-    }
-    plan_payload = _stable_jsonl_bytes(plan_rows)
+    for name in _QUERY_ARTIFACTS:
+        _atomic_bytes(output_dir / name, _stable_jsonl_bytes(rows_by_name[name]))
     artifact_hashes = {
-        "plan.jsonl": _sha256_bytes(plan_payload),
-        **{
-            name: _sha256_bytes(dynamic_payloads[name])
-            for name in _DYNAMIC_JSONL_ARTIFACTS
-        },
+        name: _sha256_file(output_dir / name) for name in _QUERY_ARTIFACTS
     }
     completed_ids = set(samples)
     checkpoint = {
@@ -1686,16 +1529,13 @@ def _persist_query_state(
         "terminal_rejected_ids": [item_id for item_id in ordered_ids if item_id in terminal_ids],
         "attempt_counts": {item_id: attempts[item_id] for item_id in ordered_ids},
         "artifact_sha256": artifact_hashes,
-        "artifact_counts": {
-            "plan.jsonl": len(plan_rows),
-            **{name: len(rows_by_name[name]) for name in _DYNAMIC_JSONL_ARTIFACTS},
-        },
+        "artifact_counts": {name: len(rows_by_name[name]) for name in _QUERY_ARTIFACTS},
         "teacher_usage": dict(usage),
     }
-    checkpoint_payload = _stable_json_bytes(checkpoint)
+    _atomic_bytes(output_dir / "checkpoint.json", _stable_json_bytes(checkpoint))
     manifest_hashes = {
         **artifact_hashes,
-        "checkpoint.json": _sha256_bytes(checkpoint_payload),
+        "checkpoint.json": _sha256_file(output_dir / "checkpoint.json"),
     }
     manifest = _manifest_payload(
         compatibility=compatibility,
@@ -1705,14 +1545,7 @@ def _persist_query_state(
         artifact_hashes=manifest_hashes,
         usage=usage,
     )
-    _commit_snapshot(
-        output_dir,
-        {
-            **dynamic_payloads,
-            "checkpoint.json": checkpoint_payload,
-            "manifest.json": _stable_json_bytes(manifest),
-        },
-    )
+    _atomic_bytes(output_dir / "manifest.json", _stable_json_bytes(manifest))
     return manifest
 
 
@@ -1887,21 +1720,6 @@ def _validate_rejections(
     return histories
 
 
-def _validated_id_list(
-    value: object, *, known_ids: set[str], artifact: str
-) -> list[str]:
-    if not isinstance(value, list) or any(
-        type(item_id) is not str
-        or not item_id.strip()
-        or item_id not in known_ids
-        for item_id in value
-    ):
-        raise ValueError(f"resume {artifact} contains an invalid ID")
-    if len(value) != len(set(value)):
-        raise ValueError(f"resume {artifact} contains duplicate IDs")
-    return value
-
-
 def _resume_state(
     *,
     output_dir: Path,
@@ -1921,7 +1739,6 @@ def _resume_state(
     dict[str, object],
     CandidateIndex,
 ]:
-    _recover_committed_snapshot(output_dir)
     checkpoint = _read_json(output_dir / "checkpoint.json")
     manifest = _read_json(output_dir / "manifest.json")
     if set(checkpoint) != _COMPATIBILITY_KEYS | _CHECKPOINT_STATE_KEYS:
@@ -1974,33 +1791,19 @@ def _resume_state(
     by_id = {row.blueprint_id: row for row in blueprints}
     sample_rows = artifact_rows["content_samples.jsonl"]
     metadata_rows = artifact_rows["sample_metadata.jsonl"]
-    sample_ids = _validated_id_list(
-        [row.get("sample_id") for row in sample_rows],
-        known_ids=known_ids,
-        artifact="content samples",
-    )
-    metadata_ids = _validated_id_list(
-        [row.get("sample_id") for row in metadata_rows],
-        known_ids=known_ids,
-        artifact="sample metadata",
-    )
+    sample_ids = [row.get("sample_id") for row in sample_rows]
+    metadata_ids = [row.get("sample_id") for row in metadata_rows]
     rejected_rows = artifact_rows["rejected.jsonl"]
     attempts_raw = checkpoint.get("attempt_counts")
     completed_raw = checkpoint.get("completed_ids")
     terminal_raw = checkpoint.get("terminal_rejected_ids")
-    if not isinstance(attempts_raw, dict) or any(
-        type(item_id) is not str
-        or not item_id.strip()
-        or item_id not in known_ids
-        for item_id in attempts_raw
-    ) or set(attempts_raw) != known_ids:
+    if (
+        not isinstance(attempts_raw, dict)
+        or set(attempts_raw) != known_ids
+        or not isinstance(completed_raw, list)
+        or not isinstance(terminal_raw, list)
+    ):
         raise ValueError("resume checkpoint state is inconsistent")
-    completed_ids = _validated_id_list(
-        completed_raw, known_ids=known_ids, artifact="completed IDs"
-    )
-    terminal_ids = _validated_id_list(
-        terminal_raw, known_ids=known_ids, artifact="terminal rejected IDs"
-    )
     attempts: dict[str, int] = {}
     for item_id, value in attempts_raw.items():
         if (
@@ -2028,13 +1831,15 @@ def _resume_state(
         raise ValueError("resume teacher usage is inconsistent")
 
     if (
-        sample_ids != completed_ids
+        sample_ids != completed_raw
         or metadata_ids != sample_ids
-        or completed_ids
-        != [item_id for item_id in ordered_ids if item_id in set(completed_ids)]
-        or terminal_ids
-        != [item_id for item_id in ordered_ids if item_id in set(terminal_ids)]
-        or set(completed_ids) & set(terminal_ids)
+        or len(sample_ids) != len(set(sample_ids))
+        or any(type(item_id) is not str or item_id not in known_ids for item_id in sample_ids)
+        or completed_raw != [item_id for item_id in ordered_ids if item_id in set(completed_raw)]
+        or terminal_raw != [item_id for item_id in ordered_ids if item_id in set(terminal_raw)]
+        or len(terminal_raw) != len(set(terminal_raw))
+        or any(type(item_id) is not str or item_id not in known_ids for item_id in terminal_raw)
+        or set(completed_raw) & set(terminal_raw)
     ):
         raise ValueError("resume accepted or terminal ID ordering is inconsistent")
 
@@ -2062,8 +1867,8 @@ def _resume_state(
         parsed_samples[sample.sample_id] = sample
         samples[sample.sample_id] = row
 
-    terminal_set = set(terminal_ids)
-    completed_set = set(completed_ids)
+    terminal_set = set(terminal_raw)
+    completed_set = set(completed_raw)
     expected_terminal: set[str] = set()
     metadata: dict[str, dict[str, object]] = {}
     for item_id in ordered_ids:
@@ -2169,11 +1974,7 @@ def run_query_batch(
         (record.source, record.source_id): record.text for record in seed_records
     }
     by_id = {row.blueprint_id: row for row in blueprints}
-    state_dir = output_dir / _STATE_DIRECTORY
-    recover_empty = resume and state_dir.is_dir() and not (
-        state_dir / "CURRENT"
-    ).exists()
-    if resume and not recover_empty:
+    if resume:
         (
             samples,
             metadata,
@@ -2201,31 +2002,11 @@ def run_query_batch(
             }
         )
     else:
-        plan_payload = _stable_jsonl_bytes(plan_rows)
-        if resume:
-            plan_path = output_dir / "plan.jsonl"
-            if plan_path.exists():
-                if _stable_jsonl_bytes(_read_jsonl(plan_path)) != plan_payload:
-                    raise ValueError("resume deterministic plan mismatch")
-            else:
-                _atomic_bytes(plan_path, plan_payload)
-        else:
-            output_dir.mkdir(parents=True)
-            state_dir.mkdir()
-            _atomic_bytes(output_dir / "plan.jsonl", plan_payload)
+        output_dir.mkdir(parents=True)
         samples = {}
         metadata = {}
         rejected_rows = []
         events = [{"sequence": 1, "event": "initialize", "code": "fresh"}]
-        if resume:
-            events.append(
-                {
-                    "sequence": 2,
-                    "event": "resume",
-                    "code": "validated",
-                    "completed_count": 0,
-                }
-            )
         attempts = {row.blueprint_id: 0 for row in blueprints}
         terminal_ids = set()
         usage = {
@@ -2295,9 +2076,7 @@ def run_query_batch(
                 raise TypeError("teacher.generate must return TeacherReply")
             _usage_add(usage, reply.usage)
             try:
-                raw_by_id = _parse_content_envelope(
-                    reply.payload, expected_ids=batch_ids
-                )
+                parsed = parse_content_batch(reply.payload, expected_ids=batch_ids)
             except (TypeError, ValueError, ValidationError):
                 for item_id in batch_ids:
                     attempts[item_id] = batch_attempts[item_id]
@@ -2319,23 +2098,12 @@ def run_query_batch(
                     }
                 )
             else:
+                parsed_by_id = {item.blueprint_id: item for item in parsed}
                 accepted_count = 0
                 for blueprint in batch:
                     item_id = blueprint.blueprint_id
                     attempts[item_id] = batch_attempts[item_id]
-                    try:
-                        candidate = _parse_content_item(raw_by_id[item_id])
-                    except ValueError:
-                        rejected_rows.append(
-                            {
-                                "blueprint_id": item_id,
-                                "attempt": attempts[item_id],
-                                "code": "schema_or_shape",
-                            }
-                        )
-                        if attempts[item_id] >= max_attempts_per_blueprint:
-                            terminal_ids.add(item_id)
-                        continue
+                    candidate = parsed_by_id[item_id]
                     source_text = (
                         source_texts[(blueprint.source_ref.source, blueprint.source_ref.source_id)]
                         if blueprint.source_ref is not None
